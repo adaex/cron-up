@@ -69,6 +69,38 @@ class ConfigTests(unittest.TestCase):
                 ["/abs/path"])
 
 
+class ValidationTests(unittest.TestCase):
+    def test_unknown_provider_exits_cleanly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            d.get_provider({"provider": "nope"})
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_lead_smaller_than_interval_warns(self):
+        warnings = d.validate_config(
+            {"intervalSeconds": 300, "leadSeconds": 60, "roots": []}, announce=lambda _: None)
+        self.assertTrue(any("leadSeconds" in w for w in warnings))
+
+    def test_missing_root_warns(self):
+        warnings = d.validate_config(
+            {"intervalSeconds": 300, "leadSeconds": 600,
+             "roots": ["/nonexistent/path/xyz"]}, announce=lambda _: None)
+        self.assertTrue(any("不存在" in w for w in warnings))
+
+    def test_clean_config_has_no_warnings(self):
+        warnings = d.validate_config(
+            {"intervalSeconds": 300, "leadSeconds": 600, "roots": ["/tmp"]})
+        self.assertEqual(warnings, [])
+
+    def test_string_roots_falls_back_to_default(self):
+        import json as _json
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            _json.dump({"roots": "~/single-string"}, f)
+            path = f.name
+        cfg = d.load_config(path)
+        self.assertIsInstance(cfg["roots"], list)
+        self.assertNotIn("~", "".join(cfg["roots"]))
+
+
 class WantedTests(unittest.TestCase):
     LEAD = datetime.timedelta(minutes=10)
 

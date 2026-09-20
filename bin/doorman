@@ -276,7 +276,14 @@ def load_config(path=CONFIG_PATH):
         cfg = json.load(f)
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg)
-    merged["roots"] = normalize_roots(merged.get("roots", []))
+    # Type-coerce hand-edited configs: a string roots would otherwise be
+    # iterated character by character, and a non-int maxDepth would crash
+    # os.walk depth comparison.
+    if not isinstance(merged.get("roots"), list):
+        merged["roots"] = DEFAULT_CONFIG["roots"]
+    merged["roots"] = normalize_roots(merged["roots"])
+    if not isinstance(merged.get("maxDepth"), int) or merged["maxDepth"] < 0:
+        merged["maxDepth"] = DEFAULT_CONFIG["maxDepth"]
     return merged
 
 
@@ -372,7 +379,11 @@ def cmd_run(args):
         log("another patrol in progress, skipping")
         return
     cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
-    provider = PROVIDERS[cfg["provider"]]()
+    provider = get_provider(cfg)
+    if not isinstance(cfg.get("leadSeconds"), int) or cfg["leadSeconds"] < 0:
+        print(f"配置错误：leadSeconds 必须是非负整数秒，当前为 "
+              f"{cfg.get('leadSeconds')!r}", file=sys.stderr)
+        sys.exit(2)
     now = datetime.datetime.now()
     lead = datetime.timedelta(seconds=cfg["leadSeconds"])
     state = load_state()
@@ -449,8 +460,38 @@ def render_plist(interval):
 
 
 def launchctl(*args, check=True):
-    return subprocess.run(["launchctl", *args], capture_output=True,
+    return subprocess.run(["/bin/launchctl", *args], capture_output=True,
                           text=True, check=check)
+
+
+def get_provider(cfg):
+    """Resolve the configured provider, failing legibly instead of KeyError."""
+    name = cfg.get("provider", "claude")
+    cls = PROVIDERS.get(name)
+    if cls is None:
+        print(f"配置错误：未知的 provider '{name}'，当前可用："
+              f"{', '.join(sorted(PROVIDERS))}。请修改 config.json。",
+              file=sys.stderr)
+        sys.exit(2)
+    return cls()
+
+
+def validate_config(cfg, announce=print):
+    """Soft checks (non-fatal): prints and returns warning strings."""
+    warnings = []
+    interval = cfg.get("intervalSeconds")
+    lead = cfg.get("leadSeconds")
+    if isinstance(interval, int) and isinstance(lead, int) \
+            and interval > 0 and 0 <= lead < interval:
+        warnings.append(
+            f"leadSeconds={lead} 小于 intervalSeconds={interval}：任务可能在"
+            f"两轮巡检之间到期而来不及提前启动会话，建议 lead ≥ interval")
+    for root in cfg.get("roots", []):
+        if not os.path.isdir(root):
+            warnings.append(f"扫描目录不存在，巡检不会覆盖它：{root}")
+    for w in warnings:
+        announce(f"警告：{w}")
+    return warnings
 
 
 def gui_target():
@@ -493,6 +534,18 @@ def cmd_install(args):
             json.dump(cfg, f, indent=2)
         print(f"wrote config: {CONFIG_PATH} "
               f"(updated: {', '.join(overrides) or 'defaults'})")
+
+    # Validate the effective config before touching the system: illegal
+    # values abort; soft problems (small lead, missing dirs) only warn.
+    iv = cfg.get("intervalSeconds")
+    lv = cfg.get("leadSeconds")
+    if not isinstance(iv, int) or iv <= 0:
+        print(f"intervalSeconds 必须是正整数秒，当前为 {iv!r}", file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(lv, int) or lv < 0:
+        print(f"leadSeconds 必须是非负整数秒，当前为 {lv!r}", file=sys.stderr)
+        sys.exit(1)
+    validate_config(cfg)
 
     # Self-copy: the repo is a source, the installed binary stands alone.
     src = os.path.realpath(__file__)
@@ -572,6 +625,9 @@ def launchctl_info():
         m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.+)$", r.stdout, re.M)
         if m:
             info[key] = m.group(1).strip()
+    m = re.search(r"^\s*run interval\s*=\s*(\d+)\s*seconds", r.stdout, re.M)
+    if m:
+        info["interval"] = int(m.group(1))
     return info
 
 
@@ -595,7 +651,16 @@ def cmd_status(args):
     if cfg:
         print(f"provider: {cfg['provider']}")
         print(f"roots: {', '.join(cfg['roots'])}  (maxDepth={cfg['maxDepth']})")
-        print(f"interval: {cfg['intervalSeconds']}s  lead: {cfg['leadSeconds']}s")
+        actual_iv = info.get("interval") if info else None
+        if actual_iv is not None:
+            mismatch = "" if actual_iv == cfg["intervalSeconds"] else \
+                f"  (config 写 {cfg['intervalSeconds']}s，需重新 install 生效)"
+            print(f"interval: {actual_iv}s{mismatch}  "
+                  f"lead: {cfg['leadSeconds']}s")
+        else:
+            print(f"interval: {cfg['intervalSeconds']}s (服务未加载)  "
+                  f"lead: {cfg['leadSeconds']}s")
+        validate_config(cfg, announce=lambda m: print(m))
 
     state = load_state()
     if not state:
@@ -617,7 +682,7 @@ def cmd_status(args):
 
 def cmd_list(args):
     cfg = load_config(args.config or CONFIG_PATH)
-    provider = PROVIDERS[cfg["provider"]]()
+    provider = get_provider(cfg)
     now = datetime.datetime.now()
     rows = []
     files_seen = 0
@@ -649,23 +714,30 @@ def cmd_list(args):
         else:
             print("no scheduled task files found under configured roots")
         return
-    print(f"{'WORKSPACE':<48} {'NEXT':<12} {'TASKS':>5}  CONSUMER")
+    width = 48
+    print(f"{'WORKSPACE':<{width}} {'NEXT':<12} {'TASKS':>5}  CONSUMER")
     for ws, when, n, consumer in rows:
-        print(f"{ws:<48} {when:<12} {n:>5}  {consumer}")
+        shown = ws if len(ws) <= width else "…" + ws[-(width - 1):]
+        print(f"{shown:<{width}} {when:<12} {n:>5}  {consumer}")
 
 
 def cmd_logs(args):
     if args.workspace:
-        path = None
         if os.path.isabs(args.workspace):
             path = session_log_path(os.path.realpath(args.workspace))
+            if not os.path.exists(path):
+                path = None
         else:
-            match = args.workspace
-            for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*")):
-                if match in os.path.basename(f):
-                    path = f
-                    break
-        if not path or not os.path.exists(path):
+            matches = [f for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*"))
+                       if args.workspace in os.path.basename(f)]
+            if len(matches) > 1:
+                print(f"'{args.workspace}' 匹配到多个会话日志，请给出更长的片段：",
+                      file=sys.stderr)
+                for f in sorted(matches):
+                    print(f"  {os.path.basename(f)}", file=sys.stderr)
+                sys.exit(1)
+            path = matches[0] if matches else None
+        if not path:
             print(f"no session log matching '{args.workspace}' in "
                   f"{SESSION_LOG_DIR}", file=sys.stderr)
             sys.exit(1)

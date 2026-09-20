@@ -99,6 +99,8 @@ claude --resume <会话ID>      # 或 claude -r 在列表中选择
 - **修改扫描范围**：直接编辑配置文件的 `roots`、`maxDepth`，最多 5 分钟后的下一轮巡检自动生效，无需重新加载服务。
 - **修改巡检间隔或提前量**：重新运行 `doorman install --force --interval 600`，会重新生成 launchd 配置。`--force` 只更新命令行里显式给出的字段，其余配置（如 `roots`）保留；路径参数建议都加引号书写，例如 `--roots "$HOME/code,$HOME/work"`，避免 shell 对逗号后的波浪号不展开。
 - **升级**：`git pull` 后重新运行一次 `doorman install`，程序和 launchd 配置会被覆盖更新，配置文件保留。
+- **配置校验**：安装时会校验配置——间隔或提前量不是合法数字会中止安装；提前量小于间隔（可能来不及在任务前启动会话）、扫描目录不存在会给出明确警告。`doorman status` 随时也会显示这些问题；其中 interval 显示的是 launchd **实际生效**的间隔，手动改过 config 但与实际不一致时会提示需要重新 install。
+- **提前量与间隔的关系**：请保持 `leadSeconds ≥ intervalSeconds`，否则极端情况下任务会在两轮巡检之间到期而来不及启动。默认 600 ≥ 300 有一倍余量。
 - **连续失败自动暂停**：doorman 能区分「自己启动的后台会话」和「你本人打开的会话」，只跟踪前者。如果某个目录的后台会话在任务尚未执行时连续退出 3 次（通常是 shell 环境损坏或目录未信任），该目录会暂停重试 30 分钟，避免每 5 分钟无效启动一次，`doorman status` 会显示 `COOLDOWN`；会话只要成功执行过一次任务，失败计数就清零；暂停结束后会给一次全新的重试机会，不会无限期停摆。
 - **日志大小**：后台会话的界面输出是持续的全屏渲染流。单次运行产生的日志超过 10MB 时，会在下次启动该目录会话时轮转成 `.log.1`；而 `script(1)` 每次启动会清空旧日志，所以反复重启不会造成堆积。只有一个连续运行数天、从不重启的会话无法在运行中切割日志（受 macOS `script(1)` 能力限制），实际量级约为每周几十 MB。
 
@@ -135,6 +137,7 @@ PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provide
 | `status` 显示 `COOLDOWN` | 运行 `doorman logs <目录名>` 查看启动界面，绝大多数情况是停在信任确认，或 shell 环境缺少命令 |
 | 任务到点没有执行 | `doorman list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.doorman` 查看 last exit code |
 | 手动 `doorman run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错 |
+| 报「未知的 provider」或 `last exit code=2` | config.json 里 provider 名写错或字段类型不对，`doorman status` 会指出具体问题 |
 
 ## 测试
 
