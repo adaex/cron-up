@@ -55,7 +55,7 @@ git clone git@github.com:adaex/doorman.git ~/space/doorman
 | launchd 配置 | `~/Library/LaunchAgents/local.doorman.plist` |
 | 配置文件 | `~/Library/Application Support/doorman/config.json` |
 | 运行状态 | 同目录下的 `state.json` |
-| 日志 | `~/Library/Logs/doorman/`（巡检日志与各后台会话的界面记录，目录权限 700、文件 600） |
+| 日志 | `~/Library/Logs/doorman/`（巡检日志；各后台会话的界面记录在 `sessions/` 子目录下，该目录权限 700、日志文件 600） |
 
 安装不需要 sudo，也不安装 npm 包。
 
@@ -100,8 +100,8 @@ claude --resume <会话ID>      # 或 claude -r 在列表中选择
 - **修改巡检间隔或提前量**：重新运行 `doorman install --force --interval 600`，会重新生成 launchd 配置。`--force` 只更新命令行里显式给出的字段，其余配置（如 `roots`）保留；路径参数建议都加引号书写，例如 `--roots "$HOME/code,$HOME/work"`，避免 shell 对逗号后的波浪号不展开。
 - **升级**：`git pull` 后重新运行一次 `doorman install`，程序和 launchd 配置会被覆盖更新，配置文件保留。
 - **配置校验**：安装时会校验配置——间隔或提前量不是合法数字会中止安装；提前量小于间隔（可能来不及在任务前启动会话）、扫描目录不存在会给出明确警告。`doorman status` 随时也会显示这些问题；其中 interval 显示的是 launchd **实际生效**的间隔，手动改过 config 但与实际不一致时会提示需要重新 install。
-- **提前量与间隔的关系**：请保持 `leadSeconds ≥ intervalSeconds`，否则极端情况下任务会在两轮巡检之间到期而来不及启动。默认 600 ≥ 300 有一倍余量。
-- **连续失败自动暂停**：doorman 能区分「自己启动的后台会话」和「你本人打开的会话」，只跟踪前者。如果某个目录的后台会话在任务尚未执行时连续退出 3 次（通常是 shell 环境损坏或目录未信任），该目录会暂停重试 30 分钟，避免每 5 分钟无效启动一次，`doorman status` 会显示 `COOLDOWN`；会话只要成功执行过一次任务，失败计数就清零；暂停结束后会给一次全新的重试机会，不会无限期停摆。
+- **提前量与间隔的关系**：请保持 `leadSeconds ≥ intervalSeconds`，否则极端情况下任务会在两轮巡检之间到期而来不及启动。默认 600 ≥ 300 有一倍余量。`--lead 0` 是合法取值（表示不提前，只靠错过补执行兜底），会如实写入配置；`--interval 0` 非法，安装时直接报错中止。
+- **连续失败自动暂停**：doorman 能区分「自己启动的后台会话」和「你本人打开的会话」，只跟踪前者。后台会话有两种失败会被计入：**启动后立即退出**（通常是 shell 环境损坏），以及**进程活着但 3 分钟内始终没有登记成会话**（停在信任确认或工具授权提问上——这种进程不会自己退出，会被 doorman 主动终止）。同一目录连续失败 3 次后暂停重试 30 分钟，`doorman status` 显示 `COOLDOWN`；会话只要成功登记过一次，失败计数就清零；暂停结束后会给一次全新的重试机会，不会无限期停摆。健康会话实测约 1 秒完成登记，距 3 分钟的判定线有充足余量。
 - **日志大小**：后台会话的界面输出是持续的全屏渲染流。单次运行产生的日志超过 10MB 时，会在下次启动该目录会话时轮转成 `.log.1`；而 `script(1)` 每次启动会清空旧日志，所以反复重启不会造成堆积。只有一个连续运行数天、从不重启的会话无法在运行中切割日志（受 macOS `script(1)` 能力限制），实际量级约为每周几十 MB。
 
 ## 支持其他 agent 工具
@@ -120,7 +120,7 @@ PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provide
 
 ## 安全说明
 
-- 后台会话拥有你在 Claude Code 中的全部权限（bypass permissions 模式下执行任何操作都无需确认）。**请只把 `roots` 指向你本人信任的工作目录**；doorman 不会访问这些目录之外的任何位置。
+- 后台会话拥有你在 Claude Code 中的全部权限（bypass permissions 模式下执行任何操作都无需确认）。**请只把 `roots` 指向你本人信任的工作目录**；除扫描 `roots` 外，doorman 只读取 `~/.claude/sessions/`（判断目录里是否已有会话）并写入自己的配置、状态与日志目录。
 - 会话日志可能包含任务执行过程和输出，默认仅本人可读（600），对外分享或截图前请留意内容。
 - 本工具自身不发起任何网络请求；唯一的外部通信来自被启动的 agent 会话。
 
@@ -134,7 +134,9 @@ PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provide
 
 | 现象 | 排查方法 |
 |---|---|
-| `status` 显示 `COOLDOWN` | 运行 `doorman logs <目录名>` 查看启动界面，绝大多数情况是停在信任确认，或 shell 环境缺少命令 |
+| `status` 显示 `COOLDOWN` | 运行 `doorman logs <目录名>` 查看启动界面：要么停在信任确认或工具授权提问（日志里能看到提问界面），要么 shell 环境缺少命令（日志里是 `command not found`） |
+| 日志里出现 `STUCK` | 会话进程起来了但没能变成可用会话，绝大多数是停在信任确认或授权提问。先手动 `cd <目录> && claude` 走完确认，再等下一轮巡检 |
+| 日志里出现 `ERROR <目录>` | 该目录的任务文件读不出来（格式损坏等），只跳过这一个目录，其余照常巡检。检查 `<目录>/.claude/scheduled_tasks.json` |
 | 任务到点没有执行 | `doorman list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.doorman` 查看 last exit code |
 | 手动 `doorman run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错 |
 | 报「未知的 provider」或 `last exit code=2` | config.json 里 provider 名写错或字段类型不对，`doorman status` 会指出具体问题 |
@@ -145,7 +147,7 @@ PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provide
 /usr/bin/python3 -m unittest discover -s tests
 ```
 
-测试覆盖：cron 下次执行时间的计算（含标准 cron 在「日期与星期同时指定」时取并集的规则）、一次性与周期任务的提前启动判定和错过补执行规则、后台会话状态机的完整路径（启动、成功后清零、连续失败暂停、暂停后恢复、用户自开会话时不干预）。
+测试覆盖：cron 下次执行时间的计算（含标准 cron 在「日期与星期同时指定」时取并集的规则、值域无解表达式的短路）、一次性与周期任务的提前启动判定和错过补执行规则、畸形任务文件与畸形任务条目不会中断巡检、后台会话状态机的完整路径（启动、成功后清零、连续失败暂停、暂停后恢复、用户自开会话时不干预、卡死会话超时终止、PID 复用不误认不误杀）、安装参数处理与二进制原子安装。
 
 ## License
 

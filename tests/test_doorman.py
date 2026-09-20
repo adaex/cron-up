@@ -142,6 +142,67 @@ class WantedTests(unittest.TestCase):
         self.assertFalse(
             d.task_wanted({"cron": "not a cron"}, NOW, self.LEAD))
 
+    def test_malformed_tasks_never_raise(self):
+        # Every one of these has been seen or is one typo away: the task file
+        # is written by another program, so a bad entry must read as "not
+        # wanted" rather than abort the patrol.
+        for task in ({"cron": 123}, {"cron": None}, {"cron": []},
+                     {"prompt": "no cron"}, {},
+                     {"cron": "*/5 * * * *", "createdAt": "yesterday"},
+                     {"cron": "*/5 * * * *", "createdAt": None},
+                     {"cron": "0 0 1 1 *", "createdAt": 10 ** 18}):
+            with self.subTest(task=task):
+                self.assertIsInstance(
+                    d.task_wanted(task, NOW, self.LEAD), bool)
+
+    def test_unsatisfiable_cron_returns_none_fast(self):
+        # Out-of-range fields used to walk four years of candidate minutes.
+        for expr in ("99 * * * *", "0 99 * * *", "0 0 * 13 *", "0 0 99 * *"):
+            with self.subTest(expr=expr):
+                started = time.time()
+                self.assertIsNone(d.Cron(expr).next_after(NOW))
+                self.assertLess(time.time() - started, 0.05)
+
+    def test_satisfiable_crons_still_resolve(self):
+        # The short-circuit must not swallow legal expressions, including the
+        # DoM/DoW OR case where one side alone is out of range.
+        self.assertEqual(d.Cron("0 12 99 * 1").next_after(NOW),
+                         datetime.datetime(2026, 9, 21, 12, 0))
+        self.assertEqual(d.Cron("0 0 29 2 *").next_after(NOW),
+                         datetime.datetime(2028, 2, 29, 0, 0))
+
+
+class TaskFileTests(unittest.TestCase):
+    """read_tasks validates shape: the file is another program's output."""
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.ws, ".claude"))
+        self.provider = d.ClaudeProvider()
+
+    def write(self, text):
+        with open(os.path.join(self.ws, ".claude",
+                               "scheduled_tasks.json"), "w") as f:
+            f.write(text)
+
+    def test_shapes_that_used_to_crash_the_patrol(self):
+        for text in ("[]", "null", '"a string"', "42",
+                     '{"tasks": {"a": 1}}', '{"tasks": "nope"}',
+                     '{"no_tasks_key": 1}', "{ truncated"):
+            with self.subTest(text=text):
+                self.write(text)
+                result = self.provider.read_tasks(self.ws)
+                self.assertIn(result, (None, []))
+
+    def test_non_dict_entries_are_dropped(self):
+        self.write('{"tasks": [{"cron": "0 9 * * *"}, "junk", null, 7]}')
+        self.assertEqual(self.provider.read_tasks(self.ws),
+                         [{"cron": "0 9 * * *"}])
+
+    def test_missing_file_reads_as_none(self):
+        self.assertIsNone(d.ClaudeProvider().read_tasks(
+            os.path.join(self.ws, "nonexistent")))
+
 
 class StateMachineTests(unittest.TestCase):
     def setUp(self):
@@ -173,14 +234,21 @@ class StateMachineTests(unittest.TestCase):
         d.PROVIDERS["fake"] = FakeProvider
         self.FakeProvider.consumer = False
         d.alive = lambda pid: pid in self.alive_pids
+        # Identity fingerprints are faked as "start-<pid>": a pid that is
+        # alive in the fake table reports the same value spawn recorded, and
+        # a recycled pid can be simulated by rewriting state.
+        d.proc_started_at = lambda pid: (
+            f"start-{pid}" if pid in self.alive_pids else None)
 
         def fake_spawn(provider, ws):
             pid = self.next_pid
             self.next_pid += 1
             self.alive_pids.add(pid)
-            return pid
+            return pid, f"start-{pid}"
 
         d.spawn_session = fake_spawn
+        d.stop_session = lambda ent, label="": self.alive_pids.discard(
+            ent.get("pid")) or True
         d.acquire_run_lock = lambda: 1
         self.args = argparse.Namespace(config=self.cfg_path)
 
@@ -248,6 +316,150 @@ class StateMachineTests(unittest.TestCase):
         self.FakeProvider.consumer = False
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["fails"], 0)
+
+    def test_stuck_session_is_retired_and_counted(self):
+        """Alive but never registering — parked on a trust/permission prompt.
+
+        This is the common real-world failure, and liveness alone reports it
+        as healthy forever. The warm-up deadline is what turns it into a
+        failure that eventually reaches COOLDOWN.
+        """
+        self.patrol()
+        stuck_pid = self.state()[WS_PATH]["pid"]
+
+        # Within the grace period it is left alone: this is what a normal
+        # ~10s startup looks like.
+        self.patrol()
+        self.assertEqual(self.state()[WS_PATH]["pid"], stuck_pid)
+        self.assertEqual(self.state()[WS_PATH]["fails"], 0)
+
+        # Past the deadline, still unregistered → killed and replaced.
+        s = self.state()
+        s[WS_PATH]["startedAt"] -= d.WARMUP_GRACE_SECONDS + 1
+        json.dump(s, open(d.STATE_PATH, "w"))
+        self.patrol()
+        ent = self.state()[WS_PATH]
+        self.assertNotEqual(ent["pid"], stuck_pid)
+        self.assertNotIn(stuck_pid, self.alive_pids)  # actually terminated
+        self.assertEqual(ent["fails"], 1)
+
+        # Repeated stuck spawns must reach COOLDOWN rather than loop forever.
+        for _ in range(2):
+            s = self.state()
+            s[WS_PATH]["startedAt"] -= d.WARMUP_GRACE_SECONDS + 1
+            json.dump(s, open(d.STATE_PATH, "w"))
+            self.patrol()
+        self.assertGreater(self.state()[WS_PATH].get("cooldownUntil", 0),
+                           time.time())
+
+    def test_recycled_pid_is_not_mistaken_for_our_session(self):
+        """A pid alone is not an identity; macOS recycles them within hours."""
+        self.patrol()
+        ent = self.state()[WS_PATH]
+        pid = ent["pid"]
+
+        # Same pid, different process: still "alive", but not ours. It must
+        # not be treated as a live standby session, and must not be signalled.
+        s = self.state()
+        s[WS_PATH]["procStart"] = "start-some-other-process"
+        json.dump(s, open(d.STATE_PATH, "w"))
+        self.assertFalse(d.tracked_alive(self.state()[WS_PATH]))
+
+        self.patrol()
+        self.assertNotEqual(self.state()[WS_PATH]["pid"], pid)
+        self.assertIn(pid, self.alive_pids)  # the impostor was left running
+
+    def test_one_broken_workspace_does_not_stop_the_patrol(self):
+        """discover() is a generator: an exception would skip the rest."""
+        visited = []
+
+        class TwoWorkspaces:
+            def discover(self, roots, depth):
+                yield ("/broken", "x")
+                yield (WS_PATH, "x")
+
+            def read_tasks(self, ws):
+                visited.append(ws)
+                if ws == "/broken":
+                    raise RuntimeError("corrupt beyond read_tasks")
+                return [{"cron": "*/5 * * * *", "createdAt": 0}]
+
+            def has_consumer(self, ws):
+                return False
+
+            def argv(self, ws, log):
+                return []
+
+        d.PROVIDERS["two"] = TwoWorkspaces
+        json.dump({"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
+                   "leadSeconds": 600, "provider": "two"},
+                  open(self.cfg_path, "w"))
+        self.patrol()
+        self.assertEqual(visited, ["/broken", WS_PATH])
+        self.assertIn(WS_PATH, self.state())
+
+
+class InstallArgTests(unittest.TestCase):
+    """cmd_install with the system-touching parts stubbed out."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        for attr in ("APP_SUPPORT", "SESSION_LOG_DIR", "CONFIG_PATH",
+                     "STATE_PATH", "BIN_PATH", "PLIST_PATH"):
+            self.addCleanup(setattr, d, attr, getattr(d, attr))
+        d.APP_SUPPORT = self.tmp
+        d.SESSION_LOG_DIR = os.path.join(self.tmp, "sessions")
+        d.CONFIG_PATH = os.path.join(self.tmp, "config.json")
+        d.STATE_PATH = os.path.join(self.tmp, "state.json")
+        d.BIN_PATH = os.path.join(self.tmp, "bin", "doorman")
+        d.PLIST_PATH = os.path.join(self.tmp, "doorman.plist")
+        for name in ("launchctl", "cmd_run"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.launchctl = lambda *a, **k: mock.Mock(returncode=0, stderr="")
+        d.cmd_run = lambda *a, **k: None
+
+    def install(self, **kw):
+        args = argparse.Namespace(roots=self.tmp, interval=None, lead=None,
+                                  force=True)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        with mock.patch("sys.stdout"):
+            d.cmd_install(args)
+        with open(d.CONFIG_PATH) as f:
+            return json.load(f)
+
+    def test_zero_lead_is_an_explicit_choice_not_a_missing_flag(self):
+        # `if args.lead:` dropped --lead 0 silently; 0 means "no lead time"
+        # and is legal, so it must survive into the config.
+        self.assertEqual(self.install(lead=0)["leadSeconds"], 0)
+
+    def test_zero_interval_is_rejected_loudly(self):
+        with self.assertRaises(SystemExit) as ctx:
+            self.install(interval=0)
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_omitted_flags_preserve_existing_values(self):
+        self.install(lead=45)
+        cfg = self.install(interval=120)
+        self.assertEqual(cfg["leadSeconds"], 45)
+        self.assertEqual(cfg["intervalSeconds"], 120)
+
+    def test_binary_is_installed_atomically(self):
+        # The installed binary is launchd's entry point and is overwritten
+        # while patrols may be starting: no truncated intermediate state.
+        real_replace = os.replace
+        seen = []
+
+        def spy(src, dst):
+            if dst == d.BIN_PATH:
+                seen.append((os.path.exists(dst), os.path.getsize(src)))
+            return real_replace(src, dst)
+
+        with mock.patch("os.replace", side_effect=spy):
+            self.install()
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0][1], os.path.getsize(os.path.abspath(BIN)))
+        self.assertTrue(os.access(d.BIN_PATH, os.X_OK))
 
 
 if __name__ == "__main__":
