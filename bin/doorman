@@ -471,11 +471,11 @@ def reap(pid):
     """
     try:
         os.waitpid(pid, os.WNOHANG)
-    except (OSError, ChildProcessError):
+    except OSError:
         pass  # not our child (e.g. `uninstall` in a fresh process)
 
 
-def stop_session(ent, label=""):
+def stop_session(ent):
     """Terminate a session we spawned, by process group.
 
     Verifies identity first: state entries outlive the processes they name,
@@ -569,7 +569,6 @@ def patrol_workspace(provider, ws, state, now, lead, cur):
         stop_session(ent)
         log(f"STUCK {ws} pid={ent['pid']}: alive {age}s without registering "
             f"a session, terminating (check: doorman logs {os.path.basename(ws)})")
-        mine_alive = False
 
     if cooling:
         return

@@ -8,6 +8,7 @@ import argparse
 import datetime
 import json
 import os
+import shutil
 import tempfile
 import time
 import unittest
@@ -19,6 +20,16 @@ d = SourceFileLoader("doorman", os.path.abspath(BIN)).load_module()
 
 NOW = datetime.datetime(2026, 9, 20, 15, 47)  # Sunday
 WS_PATH = "/x"
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
 
 
 class CronTests(unittest.TestCase):
@@ -96,15 +107,17 @@ class ValidationTests(unittest.TestCase):
                                          delete=False) as f:
             f.write("{ not valid json")
             path = f.name
+        self.addCleanup(os.unlink, path)
         with self.assertRaises(SystemExit) as ctx:
             d.load_config(path)
         self.assertEqual(ctx.exception.code, 2)
 
     def test_string_roots_falls_back_to_default(self):
-        import json as _json
-        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-            _json.dump({"roots": "~/single-string"}, f)
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"roots": "~/single-string"}, f)
             path = f.name
+        self.addCleanup(os.unlink, path)
         cfg = d.load_config(path)
         self.assertIsInstance(cfg["roots"], list)
         self.assertNotIn("~", "".join(cfg["roots"]))
@@ -177,6 +190,7 @@ class TaskFileTests(unittest.TestCase):
 
     def setUp(self):
         self.ws = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
         os.makedirs(os.path.join(self.ws, ".claude"))
         self.provider = d.ClaudeProvider()
 
@@ -207,11 +221,17 @@ class TaskFileTests(unittest.TestCase):
 class StateMachineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.cfg_path = os.path.join(self.tmp, "config.json")
+        # Module globals are patched wholesale below; restore them so test
+        # order never matters.
+        for name in ("STATE_PATH", "alive", "proc_started_at",
+                     "spawn_session", "stop_session", "acquire_run_lock"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
         d.STATE_PATH = os.path.join(self.tmp, "state.json")
-        json.dump({"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
-                   "leadSeconds": 600, "provider": "fake"},
-                  open(self.cfg_path, "w"))
+        write_json(self.cfg_path,
+                   {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
+                    "leadSeconds": 600, "provider": "fake"})
         self.alive_pids = set()
         self.next_pid = 100
 
@@ -247,7 +267,7 @@ class StateMachineTests(unittest.TestCase):
             return pid, f"start-{pid}"
 
         d.spawn_session = fake_spawn
-        d.stop_session = lambda ent, label="": self.alive_pids.discard(
+        d.stop_session = lambda ent: self.alive_pids.discard(
             ent.get("pid")) or True
         d.acquire_run_lock = lambda: 1
         self.args = argparse.Namespace(config=self.cfg_path)
@@ -255,7 +275,7 @@ class StateMachineTests(unittest.TestCase):
     def state(self):
         if not os.path.exists(d.STATE_PATH):
             return {}
-        return json.load(open(d.STATE_PATH))
+        return read_json(d.STATE_PATH)
 
     def patrol(self):
         d.cmd_run(self.args)
@@ -270,7 +290,7 @@ class StateMachineTests(unittest.TestCase):
 
         # 2: registered and healthy → still tracked, streak reset
         self.state()[WS_PATH]["fails"] = 1
-        json.dump(self.state(), open(d.STATE_PATH, "w"))
+        write_json(d.STATE_PATH, self.state())
         self.FakeProvider.consumer = True
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["pid"], pid1)
@@ -300,7 +320,7 @@ class StateMachineTests(unittest.TestCase):
         # 6: cooldown elapsed → one clean probationary spawn
         s = self.state()
         s[WS_PATH]["cooldownUntil"] = int(time.time()) - 1
-        json.dump(s, open(d.STATE_PATH, "w"))
+        write_json(d.STATE_PATH, s)
         self.patrol()
         ent = self.state()[WS_PATH]
         self.assertEqual(ent["fails"], 0)
@@ -336,7 +356,7 @@ class StateMachineTests(unittest.TestCase):
         # Past the deadline, still unregistered → killed and replaced.
         s = self.state()
         s[WS_PATH]["startedAt"] -= d.WARMUP_GRACE_SECONDS + 1
-        json.dump(s, open(d.STATE_PATH, "w"))
+        write_json(d.STATE_PATH, s)
         self.patrol()
         ent = self.state()[WS_PATH]
         self.assertNotEqual(ent["pid"], stuck_pid)
@@ -347,7 +367,7 @@ class StateMachineTests(unittest.TestCase):
         for _ in range(2):
             s = self.state()
             s[WS_PATH]["startedAt"] -= d.WARMUP_GRACE_SECONDS + 1
-            json.dump(s, open(d.STATE_PATH, "w"))
+            write_json(d.STATE_PATH, s)
             self.patrol()
         self.assertGreater(self.state()[WS_PATH].get("cooldownUntil", 0),
                            time.time())
@@ -362,7 +382,7 @@ class StateMachineTests(unittest.TestCase):
         # not be treated as a live standby session, and must not be signalled.
         s = self.state()
         s[WS_PATH]["procStart"] = "start-some-other-process"
-        json.dump(s, open(d.STATE_PATH, "w"))
+        write_json(d.STATE_PATH, s)
         self.assertFalse(d.tracked_alive(self.state()[WS_PATH]))
 
         self.patrol()
@@ -391,9 +411,9 @@ class StateMachineTests(unittest.TestCase):
                 return []
 
         d.PROVIDERS["two"] = TwoWorkspaces
-        json.dump({"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
-                   "leadSeconds": 600, "provider": "two"},
-                  open(self.cfg_path, "w"))
+        write_json(self.cfg_path,
+                   {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
+                    "leadSeconds": 600, "provider": "two"})
         self.patrol()
         self.assertEqual(visited, ["/broken", WS_PATH])
         self.assertIn(WS_PATH, self.state())
@@ -404,6 +424,7 @@ class InstallArgTests(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         for attr in ("APP_SUPPORT", "SESSION_LOG_DIR", "CONFIG_PATH",
                      "STATE_PATH", "BIN_PATH", "PLIST_PATH"):
             self.addCleanup(setattr, d, attr, getattr(d, attr))
@@ -425,8 +446,7 @@ class InstallArgTests(unittest.TestCase):
             setattr(args, k, v)
         with mock.patch("sys.stdout"):
             d.cmd_install(args)
-        with open(d.CONFIG_PATH) as f:
-            return json.load(f)
+        return read_json(d.CONFIG_PATH)
 
     def test_zero_lead_is_an_explicit_choice_not_a_missing_flag(self):
         # `if args.lead:` dropped --lead 0 silently; 0 means "no lead time"
