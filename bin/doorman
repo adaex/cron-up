@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""doorman — keep a warm interactive session for scheduled agent tasks.
+
+A launchd-driven concierge. Every interval it scans provider task files
+(e.g. .claude/scheduled_tasks.json), computes which tasks fire within the
+lead window, and makes sure an interactive consumer session is alive in that
+workspace. It never executes tasks itself — it only opens the door.
+
+Subcommands:
+  install     install binary, config and LaunchAgent
+  uninstall   remove LaunchAgent (optionally purge everything)
+  status      show launchd registration, config and standby sessions
+  list        list discovered tasks with next fire time and consumer state
+  run         one patrol round (invoked by launchd every interval)
+  logs        tail doorman or a session's TUI log
+"""
+
+import argparse
+import datetime
+import fcntl
+import glob
+import json
+import os
+import plistlib
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+LABEL = "local.doorman"
+
+HOME = os.path.expanduser("~")
+APP_SUPPORT = os.path.join(HOME, "Library", "Application Support", "doorman")
+LOG_DIR = os.path.join(HOME, "Library", "Logs", "doorman")
+SESSION_LOG_DIR = os.path.join(LOG_DIR, "sessions")
+CONFIG_PATH = os.path.join(APP_SUPPORT, "config.json")
+STATE_PATH = os.path.join(APP_SUPPORT, "state.json")
+BIN_PATH = os.path.join(HOME, ".local", "bin", "doorman")
+PLIST_PATH = os.path.join(HOME, "Library", "LaunchAgents", LABEL + ".plist")
+
+DEFAULT_CONFIG = {
+    "version": 1,
+    # Home by default (two levels deep covers ~/<root>/<workspace>); tighten
+    # with explicit roots at install time.
+    "roots": ["~"],
+    "maxDepth": 2,
+    "intervalSeconds": 300,
+    "leadSeconds": 600,
+    "provider": "claude",
+}
+
+# A warm session that dies while still needed, three times in a row, is
+# probably broken (bad env, missing trust…). Back off instead of relaunching
+# every 5 minutes forever.
+FAIL_LIMIT = 3
+COOLDOWN_SECONDS = 1800
+# TUI typescripts are full-screen render streams and grow unboundedly while a
+# long-lived warm session runs. Rotate at spawn time (script(1) truncates on
+# open, so rotation granularity is one warm-session life).
+LOG_ROTATE_BYTES = 10 * 1024 * 1024
+
+# Never descend into VCS/dependency internals, or standard macOS home-system
+# folders — an agent workspace never lives there, and ~/Library alone would
+# make a home-directory scan enormous.
+PRUNE_DIRS = {
+    ".git", "node_modules",
+    "Library", "Applications", "Desktop", "Documents", "Downloads",
+    "Movies", "Music", "Pictures", "Public", ".Trash",
+    ".cache", ".npm", ".local", ".config",
+}
+
+
+# ---------------------------------------------------------------- cron ------
+
+def parse_cron_field(expr, lo, hi):
+    values = set()
+    for token in expr.split(","):
+        if "/" in token:
+            rng, step_s = token.split("/", 1)
+            step = int(step_s)
+        else:
+            rng, step = token, 1
+        if rng == "*":
+            start, end = lo, hi
+        elif "-" in rng:
+            a, b = rng.split("-", 1)
+            start, end = int(a), int(b)
+        else:
+            start = end = int(rng)
+            if "/" in token:  # vixie: "5/10" means 5,15,25,… up to hi
+                end = hi
+        values.update(range(start, end + 1, step))
+    return values
+
+
+class Cron:
+    """Minute-resolution cron; vixie OR semantics when both DoM and DoW set."""
+
+    def __init__(self, expr):
+        m, h, dom, mon, dow = expr.split()
+        self.minutes = parse_cron_field(m, 0, 59)
+        self.hours = parse_cron_field(h, 0, 23)
+        self.doms = parse_cron_field(dom, 1, 31)
+        self.months = parse_cron_field(mon, 1, 12)
+        self.dows = parse_cron_field(dow.replace("7", "0"), 0, 6)
+        self.dom_restricted = dom != "*"
+        self.dow_restricted = dow != "*"
+
+    def _day_ok(self, t):
+        cron_dow = (t.weekday() + 1) % 7  # python Mon=0 → cron Sun=0
+        if self.dom_restricted and self.dow_restricted:
+            return t.day in self.doms or cron_dow in self.dows
+        return t.day in self.doms and cron_dow in self.dows
+
+    def next_after(self, after):
+        t = (after + datetime.timedelta(minutes=1)).replace(
+            second=0, microsecond=0)
+        deadline = after + datetime.timedelta(days=366 * 4)
+        while t <= deadline:
+            if t.month not in self.months:
+                t = t.replace(
+                    year=t.year + (1 if t.month == 12 else 0),
+                    month=1 if t.month == 12 else t.month + 1,
+                    day=1, hour=0, minute=0)
+            elif not self._day_ok(t):
+                t = (t + datetime.timedelta(days=1)).replace(hour=0, minute=0)
+            elif t.hour not in self.hours:
+                t = (t + datetime.timedelta(hours=1)).replace(minute=0)
+            elif t.minute not in self.minutes:
+                t += datetime.timedelta(minutes=1)
+            else:
+                return t
+        return None
+
+
+def cron_looks_oneshot(expr):
+    """Fallback heuristic: CronCreate one-shots look like 'M H DoM Mon *'."""
+    parts = expr.split()
+    return len(parts) == 5 and parts[4] == "*" and all(
+        p.isdigit() for p in parts[:4])
+
+
+def task_is_oneshot(task):
+    # The scheduler writes an explicit "recurring" flag; trust it when present
+    # and fall back to cron-shape detection for hand-authored task files.
+    if "recurring" in task:
+        return not bool(task["recurring"])
+    try:
+        return cron_looks_oneshot(task["cron"])
+    except (KeyError, AttributeError):
+        return False
+
+
+def task_wanted(task, now, lead):
+    """True if a consumer session must already be warm for this task."""
+    try:
+        cron = Cron(task["cron"])
+    except (ValueError, IndexError, KeyError):
+        return False
+    nxt = cron.next_after(now)
+    if nxt and nxt <= now + lead:
+        return True
+    # Still on file though its first fire is past: for a one-shot that means
+    # it was missed while no REPL was running (reboot/sleep). The native
+    # mechanism catch-up-fires it on session start and then deletes it.
+    if task_is_oneshot(task) and task.get("createdAt"):
+        created = datetime.datetime.fromtimestamp(task["createdAt"] / 1000)
+        first = cron.next_after(created - datetime.timedelta(minutes=1))
+        if first and first <= now:
+            return True
+    return False
+
+
+# -------------------------------------------------------------- providers ---
+
+def alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+class ClaudeProvider:
+    """Claude Code: native durable cron + interactive TUI as consumer."""
+
+    name = "claude"
+    task_rel = os.path.join(".claude", "scheduled_tasks.json")
+
+    def __init__(self, home=HOME):
+        self.session_dir = os.path.join(home, ".claude", "sessions")
+
+    def discover(self, roots, max_depth):
+        seen = set()
+        for root in roots:
+            root = os.path.realpath(os.path.expanduser(root)).rstrip("/")
+            if not os.path.isdir(root):
+                continue
+            base = root.count(os.sep)
+            for dirpath, dirnames, _ in os.walk(root):
+                depth = dirpath.count(os.sep) - base
+                if depth >= max_depth:
+                    dirnames[:] = []
+                else:
+                    dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+                candidate = os.path.join(dirpath, self.task_rel)
+                ws = os.path.realpath(dirpath)
+                if os.path.isfile(candidate) and ws not in seen:
+                    seen.add(ws)
+                    yield ws, candidate
+
+    def read_tasks(self, ws):
+        try:
+            with open(os.path.join(ws, self.task_rel)) as f:
+                return json.load(f).get("tasks", [])
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _pid_is_claude(pid):
+        # kill -0 alone can be fooled by a recycled PID; confirm the process
+        # actually is a Claude Code instance.
+        if not alive(pid):
+            return False
+        try:
+            r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="],
+                               capture_output=True, text=True, timeout=5)
+            return "claude" in os.path.basename(r.stdout.strip()).lower()
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def has_consumer(self, ws):
+        ws = os.path.realpath(ws)
+        for f in glob.glob(os.path.join(self.session_dir, "*.json")):
+            try:
+                with open(f) as fh:
+                    s = json.load(fh)
+            except (OSError, ValueError):
+                continue
+            if (s.get("kind") == "interactive"
+                    and os.path.realpath(s.get("cwd", "")) == ws
+                    and self._pid_is_claude(s.get("pid", -1))):
+                return True
+        return False
+
+    def argv(self, ws, log_path):
+        # -l -i are both mandatory. -i loads the interactive rc where the
+        # private endpoint/model routing (claude shell function) lives;
+        # -l loads /etc/zprofile → path_helper, which is the only thing that
+        # puts homebrew (hence fnm/node) on PATH in launchd's minimal
+        # environment. A bare -ic works from a terminal only by inheriting a
+        # ready PATH, and dies with "fnm: command not found" under launchd.
+        return ["/usr/bin/script", "-q", log_path,
+                "/bin/zsh", "-lic", f"cd {shlex.quote(ws)} && claude"]
+
+
+PROVIDERS = {"claude": ClaudeProvider}
+
+
+# ---------------------------------------------------------------- config ----
+
+def load_config(path=CONFIG_PATH):
+    with open(path) as f:
+        cfg = json.load(f)
+    merged = dict(DEFAULT_CONFIG)
+    merged.update(cfg)
+    return merged
+
+
+def load_state():
+    try:
+        with open(STATE_PATH) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    os.makedirs(APP_SUPPORT, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2)
+    os.replace(tmp, STATE_PATH)
+
+
+def log(msg):
+    print(f"{datetime.datetime.now():%Y-%m-%d %H:%M:%S} {msg}", flush=True)
+
+
+def session_log_path(ws):
+    slug = ws.strip("/").replace("/", "_")
+    return os.path.join(SESSION_LOG_DIR, slug + ".log")
+
+
+def spawn_session(provider, ws):
+    """Fork a detached pty-wrapped TUI. Returns the script(1) pid."""
+    log_path = session_log_path(ws)
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    try:
+        os.chmod(os.path.dirname(log_path), 0o700)
+    except OSError:
+        pass
+    # script(1) opens the typescript without O_APPEND, so it truncates on the
+    # next spawn; rotate only the oversized tail of a still-growing session.
+    try:
+        if (os.path.exists(log_path)
+                and os.path.getsize(log_path) > LOG_ROTATE_BYTES):
+            old = log_path + ".1"
+            if os.path.exists(old):
+                os.remove(old)
+            os.rename(log_path, old)
+    except OSError:
+        pass
+    argv = provider.argv(ws, log_path)
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.umask(0o077)  # typescript may contain task output: 0600
+            # Strip any injected Claude Code session markers so the spawned
+            # TUI always starts as a standalone top-level session (launchd has
+            # none of these; a manual `doorman run` from inside another CC
+            # session otherwise inherits CLAUDE_CODE_CHILD_SESSION and gets no
+            # transcript / session registration).
+            for key in [k for k in os.environ if k.startswith("CLAUDE_CODE_")]:
+                del os.environ[key]
+            os.setsid()
+            os.chdir(ws)
+            null_in = os.open("/dev/null", os.O_RDONLY)
+            null_out = os.open("/dev/null", os.O_WRONLY)
+            os.dup2(null_in, 0)
+            os.dup2(null_out, 1)  # script writes its typescript to log_path
+            os.dup2(null_out, 2)
+            os.execv(argv[0], argv)
+        except Exception:
+            os._exit(127)
+    return pid
+
+
+# ----------------------------------------------------------------- run ------
+
+def acquire_run_lock():
+    """Serialise patrols: a manual `run` overlapping the launchd round must
+    exit quietly instead of double-spawning. The fd stays open (and locked)
+    for the process lifetime."""
+    os.makedirs(APP_SUPPORT, exist_ok=True)
+    lock_path = os.path.join(APP_SUPPORT, "run.lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
+def cmd_run(args):
+    lock_fd = acquire_run_lock()
+    if lock_fd is None:
+        log("another patrol in progress, skipping")
+        return
+    cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
+    provider = PROVIDERS[cfg["provider"]]()
+    now = datetime.datetime.now()
+    lead = datetime.timedelta(seconds=cfg["leadSeconds"])
+    state = load_state()
+
+    cur = int(time.time())
+
+    for ws, _taskfile in provider.discover(cfg["roots"], cfg["maxDepth"]):
+        tasks = provider.read_tasks(ws)
+        if not tasks or not any(task_wanted(t, now, lead) for t in tasks):
+            continue
+
+        ent = state.get(ws)
+        mine_alive = bool(ent and ent.get("pid") and alive(ent["pid"]))
+        cooling = bool(ent and ent.get("cooldownUntil", 0) > cur)
+
+        if provider.has_consumer(ws):
+            # The task is being consumed. Distinguish our own warm session
+            # from the user's interactive session: keep tracking the former
+            # (a live consumer proves health → reset the failure streak), and
+            # completely let go of the latter.
+            if ent is not None:
+                if mine_alive:
+                    ent["fails"] = 0
+                    state[ws] = ent
+                elif not cooling:
+                    state.pop(ws, None)
+            continue
+
+        if mine_alive:
+            continue  # our session is up but hasn't registered yet (warming)
+        if cooling:
+            continue
+
+        # No consumer, and our tracked session (if any) is dead.
+        if ent and ent.get("cooldownUntil"):
+            # Cooldown just elapsed: grant one clean probationary spawn
+            # instead of immediately re-tripping the limit.
+            fails = 0
+        else:
+            fails = (ent or {}).get("fails", 0) + (1 if ent else 0)
+
+        if fails >= FAIL_LIMIT:
+            state[ws] = {"pid": None, "fails": fails,
+                         "cooldownUntil": cur + COOLDOWN_SECONDS}
+            log(f"COOLDOWN {ws}: standby session died {fails}x while still "
+                f"needed, backing off {COOLDOWN_SECONDS // 60}m")
+            continue
+
+        pid = spawn_session(provider, ws)
+        state[ws] = {"pid": pid, "startedAt": cur,
+                     "fails": fails, "log": session_log_path(ws)}
+        log(f"SPAWNED {ws} pid={pid} (fails={fails})")
+
+    # Drop dead entries with no cooldown; keep cooldowns and live sessions.
+    state = {
+        ws: ent for ws, ent in state.items()
+        if (ent.get("pid") and alive(ent["pid"]))
+        or ent.get("cooldownUntil", 0) > cur
+    }
+    save_state(state)
+
+
+# --------------------------------------------------------------- install ----
+
+def render_plist(interval):
+    return {
+        "Label": LABEL,
+        "ProgramArguments": [BIN_PATH, "run"],
+        "StartInterval": interval,
+        "RunAtLoad": True,
+        "StandardOutPath": os.path.join(LOG_DIR, "launchd.out.log"),
+        "StandardErrorPath": os.path.join(LOG_DIR, "launchd.err.log"),
+    }
+
+
+def launchctl(*args, check=True):
+    return subprocess.run(["launchctl", *args], capture_output=True,
+                          text=True, check=check)
+
+
+def gui_target():
+    return f"gui/{os.getuid()}"
+
+
+def cmd_install(args):
+    os.makedirs(APP_SUPPORT, exist_ok=True)
+    os.makedirs(SESSION_LOG_DIR, exist_ok=True)
+    try:
+        os.chmod(SESSION_LOG_DIR, 0o700)
+    except OSError:
+        pass
+
+    if os.path.exists(CONFIG_PATH) and not args.force:
+        with open(CONFIG_PATH) as f:
+            cfg = json.load(f)
+        print(f"keep existing config: {CONFIG_PATH} (--force to rewrite)")
+    else:
+        cfg = dict(DEFAULT_CONFIG)
+        if args.roots:
+            cfg["roots"] = args.roots.split(",")
+        if args.interval:
+            cfg["intervalSeconds"] = args.interval
+        if args.lead:
+            cfg["leadSeconds"] = args.lead
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"wrote config: {CONFIG_PATH}")
+
+    # Self-copy: the repo is a source, the installed binary stands alone.
+    src = os.path.realpath(__file__)
+    os.makedirs(os.path.dirname(BIN_PATH), exist_ok=True)
+    if os.path.realpath(BIN_PATH) != src:
+        with open(src, "rb") as fsrc, open(BIN_PATH, "wb") as fdst:
+            fdst.write(fsrc.read())
+        os.chmod(BIN_PATH, 0o755)
+        print(f"installed binary: {BIN_PATH}")
+
+    with open(PLIST_PATH, "wb") as f:
+        plistlib.dump(render_plist(cfg["intervalSeconds"]), f,
+                      fmt=plistlib.FMT_XML)
+    print(f"wrote LaunchAgent: {PLIST_PATH}")
+
+    launchctl("bootout", f"{gui_target()}/{LABEL}", check=False)
+    r = launchctl("bootstrap", gui_target(), PLIST_PATH, check=False)
+    if r.returncode != 0:
+        print(f"bootstrap failed:\n{r.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+    launchctl("enable", f"{gui_target()}/{LABEL}", check=False)
+    print("loaded in launchd")
+
+    cmd_run(argparse.Namespace(config=None))
+    print("first patrol done. status: doorman status")
+
+
+def cmd_uninstall(args):
+    r = launchctl("bootout", f"{gui_target()}/{LABEL}", check=False)
+    if r.returncode == 0:
+        print("unloaded from launchd")
+
+    if args.stop_sessions:
+        for ws, ent in load_state().items():
+            pid = ent.get("pid")
+            if pid and alive(pid):
+                print(f"stopping standby session {ws} pid={pid}")
+                try:
+                    os.killpg(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+        time.sleep(2)
+        for ent in load_state().values():
+            pid = ent.get("pid")
+            if pid and alive(pid):
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+
+    if os.path.exists(PLIST_PATH):
+        os.remove(PLIST_PATH)
+        print(f"removed {PLIST_PATH}")
+
+    if args.purge:
+        import shutil
+        for path in (APP_SUPPORT, LOG_DIR):
+            if os.path.isdir(path):
+                shutil.rmtree(path)
+                print(f"removed {path}")
+        if os.path.exists(BIN_PATH):
+            os.remove(BIN_PATH)
+            print(f"removed {BIN_PATH}")
+    else:
+        print("config and logs kept (--purge removes all, "
+              "--stop-sessions stops standby sessions)")
+
+
+# ---------------------------------------------------------------- status ----
+
+def launchctl_info():
+    r = launchctl("print", f"{gui_target()}/{LABEL}", check=False)
+    if r.returncode != 0:
+        return None
+    info = {}
+    for key in ("state", "last exit code"):
+        m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(.+)$", r.stdout, re.M)
+        if m:
+            info[key] = m.group(1).strip()
+    return info
+
+
+def cmd_status(args):
+    print(f"doorman {VERSION}")
+    cfg = None
+    try:
+        cfg = load_config(args.config or CONFIG_PATH)
+    except OSError:
+        print("config: missing (run: doorman install)")
+
+    print(f"plist: {PLIST_PATH} "
+          f"({'present' if os.path.exists(PLIST_PATH) else 'missing'})")
+    info = launchctl_info()
+    if info:
+        print(f"launchd: loaded, state={info.get('state', '?')}, "
+              f"last exit={info.get('last exit code', '?')}")
+    else:
+        print("launchd: not loaded")
+
+    if cfg:
+        print(f"provider: {cfg['provider']}")
+        print(f"roots: {', '.join(cfg['roots'])}  (maxDepth={cfg['maxDepth']})")
+        print(f"interval: {cfg['intervalSeconds']}s  lead: {cfg['leadSeconds']}s")
+
+    state = load_state()
+    if not state:
+        print("standby sessions: 0")
+        return
+    print(f"standby sessions: {len(state)}")
+    now = int(time.time())
+    for ws, ent in sorted(state.items()):
+        if ent.get("cooldownUntil", 0) > now:
+            eta = ent["cooldownUntil"] - now
+            print(f"  COOLDOWN {ws} (retry in {eta // 60}m, "
+                  f"fails={ent.get('fails')})")
+        elif ent.get("pid") and alive(ent["pid"]):
+            up = now - ent.get("startedAt", now)
+            print(f"  {ws}  pid={ent['pid']}  up={up // 60}m")
+        else:
+            print(f"  STALE {ws}  pid={ent.get('pid')}")
+
+
+def cmd_list(args):
+    cfg = load_config(args.config or CONFIG_PATH)
+    provider = PROVIDERS[cfg["provider"]]()
+    now = datetime.datetime.now()
+    rows = []
+    files_seen = 0
+    for ws, _ in provider.discover(cfg["roots"], cfg["maxDepth"]):
+        files_seen += 1
+        tasks = provider.read_tasks(ws) or []
+        if not tasks:
+            continue
+        earliest = None
+        missed = False
+        for t in tasks:
+            try:
+                cron = Cron(t["cron"])
+            except (ValueError, IndexError):
+                continue
+            nxt = cron.next_after(now)
+            if nxt and (earliest is None or nxt < earliest):
+                earliest = nxt
+            if task_is_oneshot(t) and (nxt is None or nxt < now):
+                missed = True
+        when = "MISSED" if missed else (
+            earliest.strftime("%m-%d %H:%M") if earliest else "-")
+        rows.append((ws, when, len(tasks),
+                     "yes" if provider.has_consumer(ws) else "NO"))
+
+    if not rows:
+        if files_seen:
+            print(f"found {files_seen} task file(s), all with empty task lists")
+        else:
+            print("no scheduled task files found under configured roots")
+        return
+    print(f"{'WORKSPACE':<48} {'NEXT':<12} {'TASKS':>5}  CONSUMER")
+    for ws, when, n, consumer in rows:
+        print(f"{ws:<48} {when:<12} {n:>5}  {consumer}")
+
+
+def cmd_logs(args):
+    if args.workspace:
+        path = None
+        if os.path.isabs(args.workspace):
+            path = session_log_path(os.path.realpath(args.workspace))
+        else:
+            match = args.workspace
+            for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*")):
+                if match in os.path.basename(f):
+                    path = f
+                    break
+        if not path or not os.path.exists(path):
+            print(f"no session log matching '{args.workspace}' in "
+                  f"{SESSION_LOG_DIR}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        path = os.path.join(LOG_DIR, "launchd.err.log")
+        if not os.path.exists(path):
+            path = os.path.join(LOG_DIR, "launchd.out.log")
+    argv = ["/usr/bin/tail"]
+    if getattr(args, "follow", False):
+        argv.append("-f")
+    else:
+        argv += ["-n", "100"]
+    argv.append(path)
+    os.execv(argv[0], argv)
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="doorman",
+                                     description="Warm-session concierge for "
+                                                 "scheduled agent tasks.")
+    parser.add_argument("--config", help=argparse.SUPPRESS)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("install", help="install binary, config, LaunchAgent")
+    p.add_argument("--roots", help="comma-separated workspace roots")
+    p.add_argument("--interval", type=int, help="patrol interval seconds")
+    p.add_argument("--lead", type=int, help="lead time in seconds for starting a session")
+    p.add_argument("--force", action="store_true",
+                   help="overwrite existing config")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("uninstall", help="remove LaunchAgent")
+    p.add_argument("--purge", action="store_true",
+                   help="also delete binary, config, logs")
+    p.add_argument("--stop-sessions", action="store_true",
+                   help="also terminate doorman-spawned sessions")
+    p.set_defaults(func=cmd_uninstall)
+
+    sub.add_parser("status", help="show registration and warm sessions"
+                   ).set_defaults(func=cmd_status)
+    sub.add_parser("list", help="list tasks and consumer state"
+                   ).set_defaults(func=cmd_list)
+    sub.add_parser("run", help="one patrol round (launchd entry point)"
+                   ).set_defaults(func=cmd_run)
+    p = sub.add_parser("logs", help="tail doorman or session TUI logs")
+    p.add_argument("-f", "--follow", action="store_true")
+    p.add_argument("workspace", nargs="?", help="workspace path or name "
+                                                 "fragment (default: doorman)")
+    p.set_defaults(func=cmd_logs)
+
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

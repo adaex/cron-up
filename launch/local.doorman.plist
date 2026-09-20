@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Reference shape only — `doorman install` renders the real file (with your
+  absolute $HOME paths) to ~/Library/LaunchAgents/local.doorman.plist.
+  Editing this copy has no effect on an installed service.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.doorman</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/yourname/.local/bin/doorman</string>
+		<string>run</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>StandardErrorPath</key>
+	<string>/Users/yourname/Library/Logs/doorman/launchd.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/yourname/Library/Logs/doorman/launchd.out.log</string>
+</dict>
+</plist>
