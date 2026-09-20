@@ -262,11 +262,21 @@ PROVIDERS = {"claude": ClaudeProvider}
 
 # ---------------------------------------------------------------- config ----
 
+def normalize_roots(roots):
+    # Shell tilde expansion only fires at the start of a word, so an argument
+    # like "--roots ~/a,~/b" arrives as "/home/u/a,~/b" — the second entry
+    # keeps its tilde. Normalise on both read and write so config always stores
+    # plain absolute paths regardless of how the shell mangled the input.
+    return [os.path.abspath(os.path.expanduser(r.strip()))
+            for r in roots if r and r.strip()]
+
+
 def load_config(path=CONFIG_PATH):
     with open(path) as f:
         cfg = json.load(f)
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg)
+    merged["roots"] = normalize_roots(merged.get("roots", []))
     return merged
 
 
@@ -456,20 +466,33 @@ def cmd_install(args):
         pass
 
     if os.path.exists(CONFIG_PATH) and not args.force:
-        with open(CONFIG_PATH) as f:
-            cfg = json.load(f)
-        print(f"keep existing config: {CONFIG_PATH} (--force to rewrite)")
+        cfg = load_config()
+        print(f"keep existing config: {CONFIG_PATH} (--force to update)")
     else:
+        # Even with --force, start from the existing config (or defaults on a
+        # fresh install) and only override fields given on the command line —
+        # otherwise `install --force --interval 600` would silently reset
+        # roots to the default.
         cfg = dict(DEFAULT_CONFIG)
+        if os.path.exists(CONFIG_PATH):
+            try:
+                with open(CONFIG_PATH) as f:
+                    cfg.update(json.load(f))
+            except ValueError:
+                pass
+        overrides = {}
         if args.roots:
-            cfg["roots"] = args.roots.split(",")
+            overrides["roots"] = normalize_roots(args.roots.split(","))
         if args.interval:
-            cfg["intervalSeconds"] = args.interval
+            overrides["intervalSeconds"] = args.interval
         if args.lead:
-            cfg["leadSeconds"] = args.lead
+            overrides["leadSeconds"] = args.lead
+        cfg.update(overrides)
+        cfg["roots"] = normalize_roots(cfg.get("roots", []))
         with open(CONFIG_PATH, "w") as f:
             json.dump(cfg, f, indent=2)
-        print(f"wrote config: {CONFIG_PATH}")
+        print(f"wrote config: {CONFIG_PATH} "
+              f"(updated: {', '.join(overrides) or 'defaults'})")
 
     # Self-copy: the repo is a source, the installed binary stands alone.
     src = os.path.realpath(__file__)

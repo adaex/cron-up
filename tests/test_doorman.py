@@ -11,6 +11,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 from importlib.machinery import SourceFileLoader
 
 BIN = os.path.join(os.path.dirname(__file__), "..", "bin", "doorman")
@@ -49,6 +50,23 @@ class CronTests(unittest.TestCase):
 
     def test_vixie_start_step(self):
         self.assertEqual(d.parse_cron_field("5/15", 0, 59), {5, 20, 35, 50})
+
+
+class ConfigTests(unittest.TestCase):
+    def test_roots_normalised_despite_shell_tilde_quirks(self):
+        # After "--roots ~/a,~/b" passes through the shell, only the first
+        # tilde was expanded; the program must still normalise both.
+        with mock.patch.dict(os.environ, {"HOME": "/home/u"}):
+            self.assertEqual(
+                d.normalize_roots(["/home/u/a", "~/b"]),
+                ["/home/u/a", "/home/u/b"])
+            # blanks are dropped; non-tilde entries survive unchanged
+            self.assertEqual(
+                d.normalize_roots(["~/x", "", "  "]),
+                ["/home/u/x"])
+            self.assertEqual(
+                d.normalize_roots(["/abs/path/"]),
+                ["/abs/path"])
 
 
 class WantedTests(unittest.TestCase):
