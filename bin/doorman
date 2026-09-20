@@ -272,8 +272,12 @@ def normalize_roots(roots):
 
 
 def load_config(path=CONFIG_PATH):
-    with open(path) as f:
-        cfg = json.load(f)
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except ValueError as e:
+        print(f"配置文件不是合法 JSON：{path}\n  {e}", file=sys.stderr)
+        sys.exit(2)
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg)
     # Type-coerce hand-edited configs: a string roots would otherwise be
@@ -301,6 +305,16 @@ def save_state(state):
     with open(tmp, "w") as f:
         json.dump(state, f, indent=2)
     os.replace(tmp, STATE_PATH)
+
+
+def save_config(cfg):
+    # Atomic, same as state.json: a crashed/partial write must never leave a
+    # corrupt config that the launchd entry point then cannot parse.
+    os.makedirs(APP_SUPPORT, exist_ok=True)
+    tmp = CONFIG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(tmp, CONFIG_PATH)
 
 
 def log(msg):
@@ -530,8 +544,7 @@ def cmd_install(args):
             overrides["leadSeconds"] = args.lead
         cfg.update(overrides)
         cfg["roots"] = normalize_roots(cfg.get("roots", []))
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(cfg, f, indent=2)
+        save_config(cfg)
         print(f"wrote config: {CONFIG_PATH} "
               f"(updated: {', '.join(overrides) or 'defaults'})")
 

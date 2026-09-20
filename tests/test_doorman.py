@@ -91,6 +91,15 @@ class ValidationTests(unittest.TestCase):
             {"intervalSeconds": 300, "leadSeconds": 600, "roots": ["/tmp"]})
         self.assertEqual(warnings, [])
 
+    def test_corrupt_json_exits_cleanly(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            f.write("{ not valid json")
+            path = f.name
+        with self.assertRaises(SystemExit) as ctx:
+            d.load_config(path)
+        self.assertEqual(ctx.exception.code, 2)
+
     def test_string_roots_falls_back_to_default(self):
         import json as _json
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
