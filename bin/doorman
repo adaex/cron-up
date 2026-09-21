@@ -468,13 +468,14 @@ def normalize_roots(roots):
             for r in roots if r and r.strip()]
 
 
-def load_config(path=CONFIG_PATH, missing_ok=False):
+def load_config(path=CONFIG_PATH, missing_ok=False, corrupt_ok=False):
     """Load config, exiting legibly on damage.
 
-    `missing_ok` lets `status` report an absent file as part of its report
-    (by raising OSError to its caller); every other entry point — launchd's
-    `run` above all — should die with a one-line reason instead of a
-    traceback nobody reads.
+    `missing_ok` lets the human-facing pages report an absent file as part
+    of their output (by raising OSError); `corrupt_ok` does the same for a
+    file that exists but is not valid JSON (raises ValueError). Every other
+    entry point — launchd's `run` above all — should die with a one-line
+    reason instead of a traceback nobody reads.
     """
     try:
         with open(path) as f:
@@ -486,6 +487,8 @@ def load_config(path=CONFIG_PATH, missing_ok=False):
               f"或用 --config 指定路径", file=sys.stderr)
         sys.exit(2)
     except ValueError as e:
+        if corrupt_ok:
+            raise
         print(f"配置文件不是合法 JSON：{path}\n  {e}", file=sys.stderr)
         sys.exit(2)
     merged = dict(DEFAULT_CONFIG)
@@ -920,10 +923,14 @@ def launchd_state_zh(state):
 def cmd_status(args):
     print(f"doorman {VERSION}")
     cfg = None
+    cfg_path = args.config or CONFIG_PATH
     try:
-        cfg = load_config(args.config or CONFIG_PATH, missing_ok=True)
+        cfg = load_config(cfg_path, missing_ok=True, corrupt_ok=True)
     except OSError:
         print("配置：缺失（运行 doorman install 生成）")
+    except ValueError as e:
+        # 损坏不致命于 status：页面其余部分（launchd、保活会话）照常显示。
+        print(f"配置：文件损坏，不是合法 JSON（{cfg_path}）\n  {e}")
 
     plist_state = "存在" if os.path.exists(PLIST_PATH) else "缺失"
     print(f"plist 文件：{PLIST_PATH}（{plist_state}）")
@@ -979,12 +986,15 @@ def cmd_overview(args):
     cols = terminal_width()
     print(f"doorman {VERSION} —— 为定时任务提前备好交互会话")
 
+    cfg_path = getattr(args, "config", None) or CONFIG_PATH
     cfg = None
+    cfg_error = None
     try:
-        cfg = load_config(getattr(args, "config", None) or CONFIG_PATH,
-                          missing_ok=True)
+        cfg = load_config(cfg_path, missing_ok=True, corrupt_ok=True)
     except OSError:
         pass
+    except ValueError as e:
+        cfg_error = e
 
     info = launchctl_info()
     if info:
@@ -996,7 +1006,14 @@ def cmd_overview(args):
         print("服务：未安装，运行 doorman install 安装")
 
     alerts = []
-    if cfg is None:
+    if cfg_error is not None:
+        # 页面不能死在半路：损坏配置是「需要留意」的一种，巡检本身
+        # （launchd 入口）仍会以退出码 2 失败，错误详情见 doorman logs。
+        print(f"配置：文件损坏，不是合法 JSON：{cfg_path}")
+        alerts.append(f"配置损坏，当前每轮巡检都会失败退出；"
+                      f"修复 {cfg_path} 或重新运行 doorman install。"
+                      f"解析错误：{cfg_error}")
+    elif cfg is None:
         print("配置：缺失，运行 doorman install 生成")
     else:
         actual_iv = info.get("interval") if info else None
@@ -1019,7 +1036,11 @@ def cmd_overview(args):
         alerts.extend(validate_config(
             cfg, announce=lambda _: None))
         print()
-        alerts.extend(_scan_overview(cfg, cols))
+        alerts.extend(_overview_tasks(cfg, cols))
+
+    # 会话状态来自 state.json，与配置无关：未安装或配置损坏时也可能有
+    # 残留的保活会话，照常展示。
+    alerts.extend(_overview_sessions(cols))
 
     if alerts:
         print("需要留意：")
@@ -1040,12 +1061,11 @@ def cmd_overview(args):
         print(f"  doorman {pad(name, name_w)}  {desc}")
 
 
-def _scan_overview(cfg, cols):
-    """总览页的任务/会话部分，返回需要在「需要留意」里显示的告警。"""
+def _overview_tasks(cfg, cols):
+    """总览页的任务盘点部分，返回相关告警。"""
     alerts = []
     now = datetime.datetime.now()
     lead = datetime.timedelta(seconds=cfg["leadSeconds"])
-    cur = int(time.time())
 
     n_ws = n_tasks = 0
     soonest = None
@@ -1072,7 +1092,7 @@ def _scan_overview(cfg, cols):
             alerts.append(f"{ws} 有 {bad} 个任务的 cron 无法解析，"
                           f"巡检会跳过{'它们' if bad > 1 else '它'}")
         if wanted and not has_consumer(ws):
-            alerts.append(f"{ws} 有任务已进入提前启动窗口，"
+            alerts.append(f"{ws} 有任务即将执行（或错过待补执行），"
                           f"但当前没有交互会话，下轮巡检会自动启动")
 
     print(f"任务：{n_tasks} 个，分布在 {n_ws} 个工作区"
@@ -1082,7 +1102,13 @@ def _scan_overview(cfg, cols):
         line = (f"最近：{nxt:%m-%d %H:%M}（{human_delta(nxt - now)}） "
                 f"{os.path.basename(ws)} · {summary}")
         print(clip(line, cols))
+    return alerts
 
+
+def _overview_sessions(cols):
+    """总览页的保活会话部分，数据来自 state.json，与配置状态无关。"""
+    alerts = []
+    cur = int(time.time())
     live, cooling = [], []
     for ws, ent in sorted(load_state().items()):
         if ent.get("cooldownUntil", 0) > cur:

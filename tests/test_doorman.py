@@ -145,6 +145,16 @@ class ValidationTests(unittest.TestCase):
             d.load_config(path)
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_corrupt_json_can_be_raised_for_human_pages(self):
+        # launchd 入口走默认的 exit(2)；总览/status 选择接住后继续渲染。
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            f.write("{ not valid json")
+            path = f.name
+        self.addCleanup(os.unlink, path)
+        with self.assertRaises(ValueError):
+            d.load_config(path, corrupt_ok=True)
+
     def test_missing_config_exits_cleanly_for_launchd(self):
         # `run` is launchd's entry point: a deleted config must produce a
         # one-line reason, not a traceback with exit code 0.
@@ -607,7 +617,7 @@ class OverviewTests(unittest.TestCase):
             "createdAt": int(time.time() * 1000),
             "prompt": "马上要跑的一次性任务"}])
         self.assertIn("需要留意", out)
-        self.assertIn("已进入提前启动窗口", out)
+        self.assertIn("即将执行（或错过待补执行）", out)
 
     def test_bad_cron_and_cooldown_become_alerts(self):
         out = self.render(
@@ -616,6 +626,23 @@ class OverviewTests(unittest.TestCase):
                              "cooldownUntil": int(time.time()) + 900}})
         self.assertIn("cron 无法解析", out)
         self.assertIn("冷却中", out)
+
+    def test_corrupt_config_renders_the_whole_page(self):
+        # 损坏配置不能让总览死在半路：服务、会话、命令都还得显示。
+        with open(self.cfg_path, "w") as f:
+            f.write("{ not valid json")
+        out = self.render()
+        self.assertIn("文件损坏", out)
+        self.assertIn("会话：无保活会话", out)
+        self.assertIn("常用命令", out)
+
+    def test_missing_config_still_shows_sessions(self):
+        # 会话信息来自 state.json，配置缺失时也要出现。
+        os.remove(self.cfg_path)
+        out = self.render(state={WS_PATH: {"pid": None, "fails": 3,
+                                           "cooldownUntil": time.time() + 900}})
+        self.assertIn("配置：缺失", out)
+        self.assertIn("冷却 1 个", out)
 
 
 class StateFileTests(unittest.TestCase):
