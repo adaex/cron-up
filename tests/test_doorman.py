@@ -109,6 +109,19 @@ class ValidationTests(unittest.TestCase):
             d.load_config(path)
         self.assertEqual(ctx.exception.code, 2)
 
+    def test_missing_config_exits_cleanly_for_launchd(self):
+        # `run` is launchd's entry point: a deleted config must produce a
+        # one-line reason, not a traceback with exit code 0.
+        with self.assertRaises(SystemExit) as ctx:
+            d.load_config("/nonexistent/doorman-config.json")
+        self.assertEqual(ctx.exception.code, 2)
+
+    def test_status_still_sees_a_missing_config_as_absent(self):
+        # `status` reports absence as part of its output, so it opts out.
+        with self.assertRaises(OSError):
+            d.load_config("/nonexistent/doorman-config.json",
+                          missing_ok=True)
+
     def test_string_roots_falls_back_to_default(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json",
                                          delete=False) as f:
@@ -460,6 +473,88 @@ class ListTests(unittest.TestCase):
             "createdAt": int(time.time() * 1000), "recurring": False}])
         self.assertNotIn("MISSED", out)
         self.assertIn("-", out)
+
+
+class StateFileTests(unittest.TestCase):
+    """load_state must survive a damaged file: it feeds the launchd path."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(setattr, d, "STATE_PATH", d.STATE_PATH)
+        d.STATE_PATH = os.path.join(self.tmp, "state.json")
+
+    def write(self, text):
+        with open(d.STATE_PATH, "w") as f:
+            f.write(text)
+
+    def test_damaged_shapes_read_as_empty(self):
+        for text in ("[]", "null", "42", '"text"', "{ truncated"):
+            with self.subTest(text=text):
+                self.write(text)
+                self.assertEqual(d.load_state(), {})
+
+    def test_non_dict_entries_are_dropped(self):
+        self.write('{"/a": {"pid": 1}, "/b": "junk", "/c": null}')
+        self.assertEqual(d.load_state(), {"/a": {"pid": 1}})
+
+    def test_missing_file_reads_as_empty(self):
+        self.assertEqual(d.load_state(), {})
+
+
+class LogPathTests(unittest.TestCase):
+    """`doorman logs` picks the patrol log, not whatever crashed once."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for name in ("LOG_DIR", "SESSION_LOG_DIR"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.LOG_DIR = self.tmp
+        d.SESSION_LOG_DIR = os.path.join(self.tmp, "sessions")
+        os.makedirs(d.SESSION_LOG_DIR)
+        self.out = os.path.join(self.tmp, "launchd.out.log")
+        self.err = os.path.join(self.tmp, "launchd.err.log")
+        self.notes = []
+
+    def resolve(self, workspace=None):
+        return d.resolve_log_path(workspace, announce=self.notes.append)
+
+    def test_stale_error_does_not_hide_the_patrol_log(self):
+        # The real regression: one old crash used to mask every later round.
+        with open(self.out, "w") as f:
+            f.write("patrol ok\n")
+        with open(self.err, "w") as f:
+            f.write("SyntaxError from days ago\n")
+        self.assertEqual(self.resolve(), self.out)
+        self.assertTrue(any("巡检若异常先看它" in n for n in self.notes))
+
+    def test_empty_error_log_is_not_mentioned(self):
+        with open(self.out, "w") as f:
+            f.write("patrol ok\n")
+        open(self.err, "w").close()
+        self.assertEqual(self.resolve(), self.out)
+        self.assertEqual(self.notes, [])
+
+    def test_falls_back_to_stderr_before_the_first_patrol(self):
+        with open(self.err, "w") as f:
+            f.write("boom\n")
+        self.assertEqual(self.resolve(), self.err)
+
+    def test_workspace_fragment_matches_one_session_log(self):
+        path = os.path.join(d.SESSION_LOG_DIR, "Users_me_team-space.log")
+        open(path, "w").close()
+        self.assertEqual(self.resolve("team"), path)
+
+    def test_unmatched_fragment_returns_none(self):
+        self.assertIsNone(self.resolve("nothing-here"))
+
+    def test_ambiguous_fragment_exits_with_the_candidates(self):
+        for name in ("Users_me_a-space.log", "Users_me_b-space.log"):
+            open(os.path.join(d.SESSION_LOG_DIR, name), "w").close()
+        with self.assertRaises(SystemExit):
+            self.resolve("space")
+        self.assertTrue(any("a-space" in n for n in self.notes))
 
 
 class InstallArgTests(unittest.TestCase):

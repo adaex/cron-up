@@ -345,10 +345,23 @@ def normalize_roots(roots):
             for r in roots if r and r.strip()]
 
 
-def load_config(path=CONFIG_PATH):
+def load_config(path=CONFIG_PATH, missing_ok=False):
+    """Load config, exiting legibly on damage.
+
+    `missing_ok` lets `status` report an absent file as part of its report
+    (by raising OSError to its caller); every other entry point — launchd's
+    `run` above all — should die with a one-line reason instead of a
+    traceback nobody reads.
+    """
     try:
         with open(path) as f:
             cfg = json.load(f)
+    except OSError:
+        if missing_ok:
+            raise
+        print(f"配置文件读不到：{path}\n  运行 doorman install 生成，"
+              f"或用 --config 指定路径", file=sys.stderr)
+        sys.exit(2)
     except ValueError as e:
         print(f"配置文件不是合法 JSON：{path}\n  {e}", file=sys.stderr)
         sys.exit(2)
@@ -366,11 +379,16 @@ def load_config(path=CONFIG_PATH):
 
 
 def load_state():
+    # Our own file, but a hand-edited or truncated one must not take the
+    # launchd entry point down — anything but an object reads as "no state".
     try:
         with open(STATE_PATH) as f:
-            return json.load(f)
+            state = json.load(f)
     except (OSError, ValueError):
         return {}
+    if not isinstance(state, dict):
+        return {}
+    return {k: v for k, v in state.items() if isinstance(v, dict)}
 
 
 def save_state(state):
@@ -770,7 +788,7 @@ def cmd_status(args):
     print(f"doorman {VERSION}")
     cfg = None
     try:
-        cfg = load_config(args.config or CONFIG_PATH)
+        cfg = load_config(args.config or CONFIG_PATH, missing_ok=True)
     except OSError:
         print("config: missing (run: doorman install)")
 
@@ -859,30 +877,46 @@ def cmd_list(args):
         print(f"{shown:<{width}} {when:<12} {n:>5}  {consumer}")
 
 
-def cmd_logs(args):
-    if args.workspace:
-        if os.path.isabs(args.workspace):
-            path = session_log_path(os.path.realpath(args.workspace))
-            if not os.path.exists(path):
-                path = None
-        else:
-            matches = [f for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*"))
-                       if args.workspace in os.path.basename(f)]
-            if len(matches) > 1:
-                print(f"'{args.workspace}' 匹配到多个会话日志，请给出更长的片段：",
-                      file=sys.stderr)
-                for f in sorted(matches):
-                    print(f"  {os.path.basename(f)}", file=sys.stderr)
-                sys.exit(1)
-            path = matches[0] if matches else None
-        if not path:
-            print(f"no session log matching '{args.workspace}' in "
-                  f"{SESSION_LOG_DIR}", file=sys.stderr)
+def resolve_log_path(workspace, announce=lambda m: print(m, file=sys.stderr)):
+    """Pick which log `doorman logs` should tail. Returns None if a named
+    workspace matched nothing (caller exits), otherwise a path."""
+    if workspace:
+        if os.path.isabs(workspace):
+            path = session_log_path(os.path.realpath(workspace))
+            return path if os.path.exists(path) else None
+        matches = [f for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*"))
+                   if workspace in os.path.basename(f)]
+        if len(matches) > 1:
+            announce(f"'{workspace}' 匹配到多个会话日志，请给出更长的片段：")
+            for f in sorted(matches):
+                announce(f"  {os.path.basename(f)}")
             sys.exit(1)
-    else:
-        path = os.path.join(LOG_DIR, "launchd.err.log")
-        if not os.path.exists(path):
-            path = os.path.join(LOG_DIR, "launchd.out.log")
+        return matches[0] if matches else None
+
+    # The patrol log is what "how is doorman doing" means; stderr only
+    # collects crashes. Showing stderr whenever it merely exists means a
+    # single old failure hides every later healthy round — so lead with the
+    # patrol log and point at the errors instead of substituting them.
+    out = os.path.join(LOG_DIR, "launchd.out.log")
+    err = os.path.join(LOG_DIR, "launchd.err.log")
+    if not os.path.exists(out):
+        return err
+    try:
+        if os.path.getsize(err) > 0:
+            mtime = datetime.datetime.fromtimestamp(os.path.getmtime(err))
+            announce(f"注：{err} 有内容（最后写入 {mtime:%m-%d %H:%M}），"
+                     f"巡检若异常先看它")
+    except OSError:
+        pass
+    return out
+
+
+def cmd_logs(args):
+    path = resolve_log_path(args.workspace)
+    if not path:
+        print(f"no session log matching '{args.workspace}' in "
+              f"{SESSION_LOG_DIR}", file=sys.stderr)
+        sys.exit(1)
     argv = ["/usr/bin/tail"]
     if getattr(args, "follow", False):
         argv.append("-f")

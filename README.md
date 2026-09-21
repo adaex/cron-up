@@ -71,7 +71,7 @@ git clone git@github.com:adaex/doorman.git ~/space/doorman
 doorman status                 # 查看 launchd 注册状态、配置、当前保活的会话
 doorman list                   # 列出所有任务：下次执行时间、当前是否有会话可执行
 doorman run                    # 立即手动巡检一次（与定时巡检互斥，同时运行时后到者自动退出）
-doorman logs                   # 查看巡检脚本自身的日志
+doorman logs                   # 查看巡检日志（stderr 有内容时在开头提示一行）
 doorman logs <目录名片段> -f    # 实时查看某个后台会话的界面输出
 doorman uninstall              # 停止并卸载服务，保留配置和日志
 doorman uninstall --stop-sessions --purge   # 停止后台会话并删除全部安装产物
@@ -133,7 +133,7 @@ claude --resume <会话ID>      # 或 claude -r 在列表中选择
 /usr/bin/python3 -m unittest discover -s tests
 ```
 
-测试覆盖：cron 下次执行时间的计算（含标准 cron 在「日期与星期同时指定」时取并集的规则、超出查找窗口与永不匹配的表达式）、一次性与周期任务的提前启动判定和错过补执行规则、畸形任务文件与畸形任务条目不会中断巡检、后台会话状态机的完整路径（启动、成功后清零、连续失败暂停、暂停后恢复、用户自开会话时不干预、卡死会话超时终止、PID 复用不误认不误杀）、安装参数处理与二进制原子安装。
+测试覆盖：cron 下次执行时间的计算（含标准 cron 在「日期与星期同时指定」时取并集的规则、超出查找窗口与永不匹配的表达式）、一次性与周期任务的提前启动判定和错过补执行规则、畸形任务文件与畸形状态文件不会中断巡检、配置缺失或损坏时给出一行原因而非 traceback、`logs` 的日志选取（陈旧 stderr 不遮蔽巡检日志）、后台会话状态机的完整路径（启动、成功后清零、连续失败暂停、暂停后恢复、用户自开会话时不干预、卡死会话超时终止、PID 复用不误认不误杀）、安装参数处理与二进制原子安装。
 
 ## License
 
