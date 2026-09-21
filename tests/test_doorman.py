@@ -65,6 +65,42 @@ class CronTests(unittest.TestCase):
         self.assertEqual(d.parse_cron_field("5/15", 0, 59), {5, 20, 35, 50})
 
 
+class CronHumanizeTests(unittest.TestCase):
+    def h(self, expr):
+        return d.humanize_cron(d.Cron(expr), expr)
+
+    def test_common_shapes(self):
+        self.assertEqual(self.h("5 0 * * *"), "每天 00:05")
+        self.assertEqual(self.h("*/5 * * * *"), "每 5 分钟")
+        self.assertEqual(self.h("0 10 * * 0"), "每周日 10:00")
+        self.assertEqual(self.h("0 9 * * 1-5"),
+                         "每周一、周二、周三、周四、周五 09:00")
+        self.assertEqual(self.h("30 4 1,15 * *"), "每月 1、15 日 04:30")
+        self.assertEqual(self.h("7 * * * *"), "每小时第 7 分")
+
+    def test_complex_or_ambiguous_shapes_are_quoted_raw(self):
+        # DoM 与 DoW 同时受限是 OR 语义，人话必然有歧义，照抄原表达式。
+        self.assertEqual(self.h("0 18 20 * 1"), "cron 0 18 20 * 1")
+        self.assertEqual(self.h("0 0 1 1 *"), "cron 0 0 1 1 *")
+
+    def test_minute_hour_shortcuts_require_unrestricted_dates(self):
+        # 日期/星期/月份受限时，「每 N 分钟」「每小时第 N 分」会丢掉
+        # 日期限定，必须照抄原表达式。
+        self.assertEqual(self.h("*/5 * 1 * *"), "cron */5 * 1 * *")
+        self.assertEqual(self.h("7 * * * 1"), "cron 7 * * * 1")
+        # 非等步长、也不是单点的分钟集合同样照抄。
+        self.assertEqual(self.h("3,33 * * * *"), "cron 3,33 * * * *")
+
+    def test_display_width_handles_cjk_and_punctuation(self):
+        self.assertEqual(d.disp_width("中文："), 6)
+        self.assertEqual(d.disp_width("ab"), 2)
+        # 省略号 U+2026 是 East Asian Ambiguous，按 1 列计（多数终端如此）
+        self.assertEqual(d.clip("中文测试", 5), "中…")
+        self.assertEqual(d.disp_width(d.clip("中文测试", 5)), 3)
+        self.assertEqual(d.clip("abcdef", 5), "abc…")
+        self.assertEqual(d.pad("中文", 6), "中文  ")
+
+
 class ConfigTests(unittest.TestCase):
     def test_roots_normalised_despite_shell_tilde_quirks(self):
         # After "--roots ~/a,~/b" passes through the shell, only the first
@@ -458,10 +494,11 @@ class ListTests(unittest.TestCase):
     def test_missed_one_shot_is_flagged(self):
         past = datetime.datetime.now() - datetime.timedelta(days=1)
         created = past - datetime.timedelta(hours=1)
-        self.assertIn("MISSED", self.render([{
+        out = self.render([{
             "cron": f"{past.minute} {past.hour} {past.day} {past.month} *",
             "createdAt": int(created.timestamp() * 1000),
-            "recurring": False}]))
+            "recurring": False}])
+        self.assertIn("已错过", out)
 
     def test_one_shot_beyond_the_window_is_not_missed(self):
         # Fires in ~60 days: outside the search window, so next_after is None
@@ -471,8 +508,114 @@ class ListTests(unittest.TestCase):
             "cron": f"{future.minute} {future.hour} {future.day} "
                     f"{future.month} *",
             "createdAt": int(time.time() * 1000), "recurring": False}])
-        self.assertNotIn("MISSED", out)
-        self.assertIn("-", out)
+        self.assertNotIn("已错过", out)
+        self.assertIn("无安排", out)
+
+    def test_each_task_gets_its_own_row_with_summary_and_cadence(self):
+        out = self.render([
+            {"cron": "5 0 * * *", "recurring": True,
+             "prompt": "群人数每日定时任务：执行某脚本\n第二行细节不出现"},
+            {"cron": "0 10 * * 0", "recurring": True,
+             "prompt": "  周报任务：\n   做一些事"},
+        ])
+        self.assertIn("共 1 个工作区、2 个定时任务", out)
+        self.assertIn("群人数每日定时任务：执行某脚本", out)
+        self.assertIn("周报任务：", out)  # 只取首个非空行，剥掉首尾空白
+        self.assertNotIn("第二行细节不出现", out)
+        self.assertIn("每天 00:05", out)
+        self.assertIn("每周日 10:00", out)
+        self.assertIn("周期", out)
+        self.assertIn("交互会话：无", out)
+
+    def test_malformed_task_is_shown_not_dropped(self):
+        out = self.render([{"cron": "not a cron", "prompt": "坏任务"}])
+        self.assertIn("cron 无效", out)
+        self.assertIn("坏任务", out)
+
+    def test_task_without_prompt_gets_a_placeholder(self):
+        out = self.render([{"cron": "5 0 * * *", "recurring": True}])
+        self.assertIn("（无任务描述）", out)
+
+    def test_rows_never_overflow_the_terminal_width(self):
+        orig_terminal_width = d.terminal_width
+        for width in (60, 80, 100, 200):
+            d.terminal_width = lambda w=width: w
+            self.addCleanup(setattr, d, "terminal_width", orig_terminal_width)
+            out = self.render([
+                {"cron": "5 0 * * *", "recurring": True,
+                 "prompt": "短任务"},
+                {"cron": "0 10 * * 0", "recurring": True,
+                 "prompt": "很" * 300},
+            ])
+            for line in out.splitlines():
+                self.assertLessEqual(
+                    d.disp_width(line), width,
+                    f"{width} 列下溢出：{line!r}")
+
+
+class OverviewTests(unittest.TestCase):
+    """The bare `doorman` overview: inventory plus actionable alerts."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cfg_path = os.path.join(self.tmp, "config.json")
+        write_json(self.cfg_path,
+                   {"roots": [self.tmp], "maxDepth": 3,
+                    "intervalSeconds": 300, "leadSeconds": 600})
+        for name in ("discover", "read_tasks", "has_consumer",
+                     "launchctl_info", "STATE_PATH", "PLIST_PATH"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.discover = lambda roots, depth: iter([(WS_PATH, "x")])
+        d.has_consumer = lambda ws: False
+        d.launchctl_info = lambda: {
+            "state": "running", "last exit code": "0", "interval": 300}
+        d.STATE_PATH = os.path.join(self.tmp, "state.json")
+        d.PLIST_PATH = os.path.join(self.tmp, "missing.plist")
+        self.args = argparse.Namespace(config=self.cfg_path)
+
+    def render(self, tasks=None, state=None):
+        d.read_tasks = lambda ws: tasks or []
+        if state is not None:
+            write_json(d.STATE_PATH, state)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_overview(self.args)
+        return buf.getvalue()
+
+    def test_empty_world_renders_cleanly(self):
+        out = self.render()
+        self.assertIn("doorman", out)
+        self.assertIn("launchd 已加载", out)
+        self.assertIn("任务：暂无", out)
+        self.assertIn("无保活会话", out)
+        self.assertIn("常用命令", out)
+
+    def test_task_inventory_and_soonest_line(self):
+        out = self.render([{
+            "cron": "59 23 * * *", "recurring": True,
+            "prompt": "晚间任务：收尾工作"}])
+        self.assertIn("任务：1 个，分布在 1 个工作区", out)
+        self.assertIn("晚间任务：收尾工作", out)
+        self.assertIn("最近：", out)
+
+    def test_wanted_without_consumer_is_an_alert(self):
+        fire = datetime.datetime.now() + datetime.timedelta(minutes=2)
+        out = self.render([{
+            "cron": f"{fire.minute} {fire.hour} {fire.day} {fire.month} *",
+            "recurring": False,
+            "createdAt": int(time.time() * 1000),
+            "prompt": "马上要跑的一次性任务"}])
+        self.assertIn("需要留意", out)
+        self.assertIn("已进入提前启动窗口", out)
+
+    def test_bad_cron_and_cooldown_become_alerts(self):
+        out = self.render(
+            tasks=[{"cron": "broken", "prompt": "坏任务"}],
+            state={WS_PATH: {"pid": None, "fails": 3,
+                             "cooldownUntil": int(time.time()) + 900}})
+        self.assertIn("cron 无法解析", out)
+        self.assertIn("冷却中", out)
 
 
 class StateFileTests(unittest.TestCase):
