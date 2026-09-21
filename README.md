@@ -104,20 +104,6 @@ claude --resume <会话ID>      # 或 claude -r 在列表中选择
 - **连续失败自动暂停**：doorman 能区分「自己启动的后台会话」和「你本人打开的会话」，只跟踪前者。后台会话有两种失败会被计入：**启动后立即退出**（通常是 shell 环境损坏），以及**进程活着但 3 分钟内始终没有登记成会话**（停在信任确认或工具授权提问上——这种进程不会自己退出，会被 doorman 主动终止）。同一目录连续失败 3 次后暂停重试 30 分钟，`doorman status` 显示 `COOLDOWN`；会话只要成功登记过一次，失败计数就清零；暂停结束后会给一次全新的重试机会，不会无限期停摆。健康会话实测约 1 秒完成登记，距 3 分钟的判定线有充足余量。
 - **日志大小**：后台会话的界面输出是持续的全屏渲染流。单次运行产生的日志超过 10MB 时，会在下次启动该目录会话时轮转成 `.log.1`；而 `script(1)` 每次启动会清空旧日志，所以反复重启不会造成堆积。只有一个连续运行数天、从不重启的会话无法在运行中切割日志（受 macOS `script(1)` 能力限制），实际量级约为每周几十 MB。
 
-## 支持其他 agent 工具
-
-任务执行端（provider）设计为可插拔。新增一种工具时，在 `bin/doorman` 中实现下面这个类并注册即可，巡检、定时计算、失败暂停、launchd 安装等主体逻辑都不需要改动：
-
-```python
-class FooProvider:
-    name = "foo"
-    def discover(self, roots, max_depth): ...   # 产出 (工作目录, 任务文件路径)
-    def read_tasks(self, ws): ...               # 返回 [{"cron","prompt","createdAt","recurring"?}]
-    def has_consumer(self, ws): ...             # 该目录是否已有运行中的交互会话
-    def argv(self, ws, log_path): ...           # 后台启动交互会话的命令
-PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provider 改为 "foo"
-```
-
 ## 安全说明
 
 - 后台会话拥有你在 Claude Code 中的全部权限（bypass permissions 模式下执行任何操作都无需确认）。**请只把 `roots` 指向你本人信任的工作目录**；除扫描 `roots` 外，doorman 只读取 `~/.claude/sessions/`（判断目录里是否已有会话）并写入自己的配置、状态与日志目录。
@@ -139,7 +125,7 @@ PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provide
 | 日志里出现 `ERROR <目录>` | 该目录的任务文件读不出来（格式损坏等），只跳过这一个目录，其余照常巡检。检查 `<目录>/.claude/scheduled_tasks.json` |
 | 任务到点没有执行 | `doorman list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.doorman` 查看 last exit code |
 | 手动 `doorman run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错 |
-| 报「未知的 provider」或 `last exit code=2` | config.json 里 provider 名写错或字段类型不对，`doorman status` 会指出具体问题 |
+| `last exit code=2` | config.json 字段类型不对（如 `leadSeconds` 写成字符串），`doorman status` 会指出具体问题 |
 
 ## 测试
 
@@ -147,7 +133,7 @@ PROVIDERS["foo"] = FooProvider                  # 在 config.json 中把 provide
 /usr/bin/python3 -m unittest discover -s tests
 ```
 
-测试覆盖：cron 下次执行时间的计算（含标准 cron 在「日期与星期同时指定」时取并集的规则、值域无解表达式的短路）、一次性与周期任务的提前启动判定和错过补执行规则、畸形任务文件与畸形任务条目不会中断巡检、后台会话状态机的完整路径（启动、成功后清零、连续失败暂停、暂停后恢复、用户自开会话时不干预、卡死会话超时终止、PID 复用不误认不误杀）、安装参数处理与二进制原子安装。
+测试覆盖：cron 下次执行时间的计算（含标准 cron 在「日期与星期同时指定」时取并集的规则、超出查找窗口与永不匹配的表达式）、一次性与周期任务的提前启动判定和错过补执行规则、畸形任务文件与畸形任务条目不会中断巡检、后台会话状态机的完整路径（启动、成功后清零、连续失败暂停、暂停后恢复、用户自开会话时不干预、卡死会话超时终止、PID 复用不误认不误杀）、安装参数处理与二进制原子安装。
 
 ## License
 

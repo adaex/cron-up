@@ -5,7 +5,9 @@ it is loaded explicitly via SourceFileLoader.
 """
 
 import argparse
+import contextlib
 import datetime
+import io
 import json
 import os
 import shutil
@@ -81,11 +83,6 @@ class ConfigTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
-    def test_unknown_provider_exits_cleanly(self):
-        with self.assertRaises(SystemExit) as ctx:
-            d.get_provider({"provider": "nope"})
-        self.assertEqual(ctx.exception.code, 2)
-
     def test_lead_smaller_than_interval_warns(self):
         warnings = d.validate_config(
             {"intervalSeconds": 300, "leadSeconds": 60, "roots": []}, announce=lambda _: None)
@@ -176,13 +173,43 @@ class WantedTests(unittest.TestCase):
                 self.assertIsNone(d.Cron(expr).next_after(NOW))
                 self.assertLess(time.time() - started, 0.05)
 
+    def test_beyond_the_window_reads_as_no_next_fire(self):
+        # The search only looks SEARCH_DAYS ahead, which is all a task can
+        # live for. A yearly expression therefore has no next fire "soon" —
+        # and must not be mistaken for one that fires imminently.
+        self.assertIsNone(d.Cron("0 0 29 2 *").next_after(NOW))
+        self.assertFalse(d.task_wanted(
+            {"cron": "0 0 29 2 *", "recurring": True}, NOW, self.LEAD))
+        # It still resolves when a caller explicitly asks to look further.
+        self.assertEqual(
+            d.Cron("0 0 29 2 *").next_after(NOW, within_days=900),
+            datetime.datetime(2028, 2, 29, 0, 0))
+
     def test_satisfiable_crons_still_resolve(self):
-        # The short-circuit must not swallow legal expressions, including the
-        # DoM/DoW OR case where one side alone is out of range.
+        # A DoM/DoW OR expression where one side alone is out of range.
         self.assertEqual(d.Cron("0 12 99 * 1").next_after(NOW),
                          datetime.datetime(2026, 9, 21, 12, 0))
-        self.assertEqual(d.Cron("0 0 29 2 *").next_after(NOW),
-                         datetime.datetime(2028, 2, 29, 0, 0))
+
+    def test_missed_one_shot_created_long_ago_is_still_wanted(self):
+        # Catch-up search runs forward from creation, so it must not be
+        # limited by the ordinary look-ahead window.
+        created = NOW - datetime.timedelta(days=10)
+        fire = NOW - datetime.timedelta(days=9)
+        task = {"cron": f"{fire.minute} {fire.hour} {fire.day} {fire.month} *",
+                "createdAt": int(created.timestamp() * 1000),
+                "recurring": False}
+        self.assertTrue(d.task_wanted(task, NOW, self.LEAD))
+
+    def test_ancient_unmatchable_one_shot_stays_cheap(self):
+        # A stale entry whose expression never matches must not scan every
+        # minute since it was written.
+        created = NOW - datetime.timedelta(days=3650)
+        task = {"cron": "0 0 30 2 *",  # Feb 30th: never
+                "createdAt": int(created.timestamp() * 1000),
+                "recurring": False}
+        started = time.time()
+        self.assertFalse(d.task_wanted(task, NOW, self.LEAD))
+        self.assertLess(time.time() - started, 0.2)
 
 
 class TaskFileTests(unittest.TestCase):
@@ -192,7 +219,6 @@ class TaskFileTests(unittest.TestCase):
         self.ws = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
         os.makedirs(os.path.join(self.ws, ".claude"))
-        self.provider = d.ClaudeProvider()
 
     def write(self, text):
         with open(os.path.join(self.ws, ".claude",
@@ -205,16 +231,16 @@ class TaskFileTests(unittest.TestCase):
                      '{"no_tasks_key": 1}', "{ truncated"):
             with self.subTest(text=text):
                 self.write(text)
-                result = self.provider.read_tasks(self.ws)
+                result = d.read_tasks(self.ws)
                 self.assertIn(result, (None, []))
 
     def test_non_dict_entries_are_dropped(self):
         self.write('{"tasks": [{"cron": "0 9 * * *"}, "junk", null, 7]}')
-        self.assertEqual(self.provider.read_tasks(self.ws),
+        self.assertEqual(d.read_tasks(self.ws),
                          [{"cron": "0 9 * * *"}])
 
     def test_missing_file_reads_as_none(self):
-        self.assertIsNone(d.ClaudeProvider().read_tasks(
+        self.assertIsNone(d.read_tasks(
             os.path.join(self.ws, "nonexistent")))
 
 
@@ -225,34 +251,21 @@ class StateMachineTests(unittest.TestCase):
         self.cfg_path = os.path.join(self.tmp, "config.json")
         # Module globals are patched wholesale below; restore them so test
         # order never matters.
-        for name in ("STATE_PATH", "alive", "proc_started_at",
-                     "spawn_session", "stop_session", "acquire_run_lock"):
+        for name in ("STATE_PATH", "alive", "proc_started_at", "discover",
+                     "read_tasks", "has_consumer", "spawn_session",
+                     "stop_session", "acquire_run_lock"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.STATE_PATH = os.path.join(self.tmp, "state.json")
         write_json(self.cfg_path,
                    {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
-                    "leadSeconds": 600, "provider": "fake"})
+                    "leadSeconds": 600})
         self.alive_pids = set()
         self.next_pid = 100
+        self.consumer = False
 
-        class FakeProvider:
-            consumer = False
-
-            def discover(self, roots, depth):
-                yield (WS_PATH, "x")
-
-            def read_tasks(self, ws):
-                return [{"cron": "*/5 * * * *", "createdAt": 0}]
-
-            def has_consumer(self, ws):
-                return FakeProvider.consumer
-
-            def argv(self, ws, log):
-                return []
-
-        self.FakeProvider = FakeProvider
-        d.PROVIDERS["fake"] = FakeProvider
-        self.FakeProvider.consumer = False
+        d.discover = lambda roots, depth: iter([(WS_PATH, "x")])
+        d.read_tasks = lambda ws: [{"cron": "*/5 * * * *", "createdAt": 0}]
+        d.has_consumer = lambda ws: self.consumer
         d.alive = lambda pid: pid in self.alive_pids
         # Identity fingerprints are faked as "start-<pid>": a pid that is
         # alive in the fake table reports the same value spawn recorded, and
@@ -260,7 +273,7 @@ class StateMachineTests(unittest.TestCase):
         d.proc_started_at = lambda pid: (
             f"start-{pid}" if pid in self.alive_pids else None)
 
-        def fake_spawn(provider, ws):
+        def fake_spawn(ws):
             pid = self.next_pid
             self.next_pid += 1
             self.alive_pids.add(pid)
@@ -291,13 +304,13 @@ class StateMachineTests(unittest.TestCase):
         # 2: registered and healthy → still tracked, streak reset
         self.state()[WS_PATH]["fails"] = 1
         write_json(d.STATE_PATH, self.state())
-        self.FakeProvider.consumer = True
+        self.consumer = True
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["pid"], pid1)
         self.assertEqual(self.state()[WS_PATH]["fails"], 0)
 
         # 3: dies while needed → fails=1, respawned
-        self.FakeProvider.consumer = False
+        self.consumer = False
         self.alive_pids.discard(pid1)
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["fails"], 1)
@@ -328,12 +341,12 @@ class StateMachineTests(unittest.TestCase):
 
         # 7: a pure user session (no state) is never tracked
         os.remove(d.STATE_PATH)
-        self.FakeProvider.consumer = True
+        self.consumer = True
         self.patrol()
         self.assertNotIn(WS_PATH, self.state())
 
         # 8: user session closes → clean spawn
-        self.FakeProvider.consumer = False
+        self.consumer = False
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["fails"], 0)
 
@@ -393,30 +406,60 @@ class StateMachineTests(unittest.TestCase):
         """discover() is a generator: an exception would skip the rest."""
         visited = []
 
-        class TwoWorkspaces:
-            def discover(self, roots, depth):
-                yield ("/broken", "x")
-                yield (WS_PATH, "x")
+        def read(ws):
+            visited.append(ws)
+            if ws == "/broken":
+                raise RuntimeError("corrupt beyond read_tasks")
+            return [{"cron": "*/5 * * * *", "createdAt": 0}]
 
-            def read_tasks(self, ws):
-                visited.append(ws)
-                if ws == "/broken":
-                    raise RuntimeError("corrupt beyond read_tasks")
-                return [{"cron": "*/5 * * * *", "createdAt": 0}]
-
-            def has_consumer(self, ws):
-                return False
-
-            def argv(self, ws, log):
-                return []
-
-        d.PROVIDERS["two"] = TwoWorkspaces
-        write_json(self.cfg_path,
-                   {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
-                    "leadSeconds": 600, "provider": "two"})
+        d.discover = lambda roots, depth: iter([("/broken", "x"),
+                                                (WS_PATH, "x")])
+        d.read_tasks = read
         self.patrol()
         self.assertEqual(visited, ["/broken", WS_PATH])
         self.assertIn(WS_PATH, self.state())
+
+
+class ListTests(unittest.TestCase):
+    """cmd_list's MISSED column."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cfg_path = os.path.join(self.tmp, "config.json")
+        write_json(self.cfg_path,
+                   {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
+                    "leadSeconds": 600})
+        for name in ("discover", "read_tasks", "has_consumer"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.discover = lambda roots, depth: iter([(WS_PATH, "x")])
+        d.has_consumer = lambda ws: False
+
+    def render(self, tasks):
+        d.read_tasks = lambda ws: tasks
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_list(argparse.Namespace(config=self.cfg_path))
+        return buf.getvalue()
+
+    def test_missed_one_shot_is_flagged(self):
+        past = datetime.datetime.now() - datetime.timedelta(days=1)
+        created = past - datetime.timedelta(hours=1)
+        self.assertIn("MISSED", self.render([{
+            "cron": f"{past.minute} {past.hour} {past.day} {past.month} *",
+            "createdAt": int(created.timestamp() * 1000),
+            "recurring": False}]))
+
+    def test_one_shot_beyond_the_window_is_not_missed(self):
+        # Fires in ~60 days: outside the search window, so next_after is None
+        # — but it has not been missed, and must not be reported as such.
+        future = datetime.datetime.now() + datetime.timedelta(days=60)
+        out = self.render([{
+            "cron": f"{future.minute} {future.hour} {future.day} "
+                    f"{future.month} *",
+            "createdAt": int(time.time() * 1000), "recurring": False}])
+        self.assertNotIn("MISSED", out)
+        self.assertIn("-", out)
 
 
 class InstallArgTests(unittest.TestCase):

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """doorman — keep a warm interactive session for scheduled agent tasks.
 
-A launchd-driven concierge. Every interval it scans provider task files
+A launchd-driven concierge. Every interval it scans workspace task files
 (e.g. .claude/scheduled_tasks.json), computes which tasks fire within the
 lead window, and makes sure an interactive consumer session is alive in that
 workspace. It never executes tasks itself — it only opens the door.
@@ -49,7 +49,6 @@ DEFAULT_CONFIG = {
     "maxDepth": 2,
     "intervalSeconds": 300,
     "leadSeconds": 600,
-    "provider": "claude",
 }
 
 # A warm session that dies while still needed, three times in a row, is
@@ -102,6 +101,20 @@ def parse_cron_field(expr, lo, hi):
     return values
 
 
+# Scheduled tasks expire after 7 days (recurring ones are dropped by the
+# scheduler; one-shots have fired long before). Nothing here needs to look
+# further ahead than that, which keeps the search a plain minute-by-minute
+# scan: no calendar skipping, no unsatisfiable-expression special case, and
+# no four-year worst case to guard against. A full miss costs ~3ms.
+SEARCH_DAYS = 7
+# Catch-up detection searches forward from a task's creation time instead,
+# so it needs its own bound — see task_wanted.
+MISSED_LOOKBACK_DAYS = 30
+# `list` asks "was this one-shot missed?" — the same catch-up question
+# task_wanted answers, minus any look-ahead.
+ZERO_LEAD = datetime.timedelta(0)
+
+
 class Cron:
     """Minute-resolution cron; vixie OR semantics when both DoM and DoW set."""
 
@@ -114,48 +127,27 @@ class Cron:
         self.dows = parse_cron_field(dow.replace("7", "0"), 0, 6)
         self.dom_restricted = dom != "*"
         self.dow_restricted = dow != "*"
-        # A field whose values all fall outside the legal range ("99 * * * *")
-        # can never match. Without this the search below walks four years of
-        # candidate minutes before giving up — a full second of CPU per task,
-        # every patrol. The day test mirrors _day_ok: OR when both day fields
-        # are restricted, AND otherwise.
-        doms_ok = bool(self.doms & set(range(1, 32)))
-        dows_ok = bool(self.dows & set(range(0, 7)))
-        day_ok = (doms_ok or dows_ok) if (
-            self.dom_restricted and self.dow_restricted) else (
-            doms_ok and dows_ok)
-        self.satisfiable = bool(
-            self.minutes & set(range(0, 60))
-            and self.hours & set(range(0, 24))
-            and self.months & set(range(1, 13))
-            and day_ok)
 
-    def _day_ok(self, t):
+    def _matches(self, t):
+        if t.minute not in self.minutes or t.hour not in self.hours:
+            return False
+        if t.month not in self.months:
+            return False
         cron_dow = (t.weekday() + 1) % 7  # python Mon=0 → cron Sun=0
         if self.dom_restricted and self.dow_restricted:
             return t.day in self.doms or cron_dow in self.dows
         return t.day in self.doms and cron_dow in self.dows
 
-    def next_after(self, after):
-        if not self.satisfiable:
-            return None
+    def next_after(self, after, within_days=SEARCH_DAYS):
+        """Next fire time strictly after `after`, or None if not within
+        `within_days`. None also covers expressions that can never match."""
         t = (after + datetime.timedelta(minutes=1)).replace(
             second=0, microsecond=0)
-        deadline = after + datetime.timedelta(days=366 * 4)
+        deadline = after + datetime.timedelta(days=within_days)
         while t <= deadline:
-            if t.month not in self.months:
-                t = t.replace(
-                    year=t.year + (1 if t.month == 12 else 0),
-                    month=1 if t.month == 12 else t.month + 1,
-                    day=1, hour=0, minute=0)
-            elif not self._day_ok(t):
-                t = (t + datetime.timedelta(days=1)).replace(hour=0, minute=0)
-            elif t.hour not in self.hours:
-                t = (t + datetime.timedelta(hours=1)).replace(minute=0)
-            elif t.minute not in self.minutes:
-                t += datetime.timedelta(minutes=1)
-            else:
+            if self._matches(t):
                 return t
+            t += datetime.timedelta(minutes=1)
         return None
 
 
@@ -200,13 +192,20 @@ def task_wanted(task, now, lead):
                 task["createdAt"] / 1000)
         except (TypeError, ValueError, OSError, OverflowError):
             return False
-        first = cron.next_after(created - datetime.timedelta(minutes=1))
+        # Searching forward from creation, not from now. Cap the span: a
+        # stale entry with an expression that never matches would otherwise
+        # scan every minute since it was written. One-shots are created
+        # shortly before they fire, so a bounded look-ahead loses nothing
+        # real, and anything older than the cap is long dead anyway.
+        span = min((now - created).days + 1, MISSED_LOOKBACK_DAYS)
+        first = cron.next_after(created - datetime.timedelta(minutes=1),
+                                within_days=span)
         if first and first <= now:
             return True
     return False
 
 
-# -------------------------------------------------------------- providers ---
+# --------------------------------------------------------------- process ---
 
 def alive(pid):
     try:
@@ -246,89 +245,93 @@ def tracked_alive(ent):
     return proc_started_at(ent["pid"]) == started
 
 
-class ClaudeProvider:
-    """Claude Code: native durable cron + interactive TUI as consumer."""
+# ----------------------------------------------------- claude code facts ----
+#
+# Everything below encodes how Claude Code stores tasks and registers
+# sessions. It is the one agent tool doorman drives; if a second one ever
+# needs supporting, generalise then, against two real implementations rather
+# than a guess at what the second one looks like.
 
-    name = "claude"
-    task_rel = os.path.join(".claude", "scheduled_tasks.json")
+TASK_REL = os.path.join(".claude", "scheduled_tasks.json")
+SESSION_DIR = os.path.join(HOME, ".claude", "sessions")
 
-    def __init__(self, home=HOME):
-        self.session_dir = os.path.join(home, ".claude", "sessions")
 
-    def discover(self, roots, max_depth):
-        seen = set()
-        for root in roots:
-            root = os.path.realpath(os.path.expanduser(root)).rstrip("/")
-            if not os.path.isdir(root):
-                continue
-            base = root.count(os.sep)
-            for dirpath, dirnames, _ in os.walk(root):
-                depth = dirpath.count(os.sep) - base
-                if depth >= max_depth:
-                    dirnames[:] = []
-                else:
-                    dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
-                candidate = os.path.join(dirpath, self.task_rel)
-                ws = os.path.realpath(dirpath)
-                if os.path.isfile(candidate) and ws not in seen:
-                    seen.add(ws)
-                    yield ws, candidate
+def discover(roots, max_depth):
+    """Yield (workspace, task file) for every workspace holding a task file."""
+    seen = set()
+    for root in roots:
+        root = os.path.realpath(os.path.expanduser(root)).rstrip("/")
+        if not os.path.isdir(root):
+            continue
+        base = root.count(os.sep)
+        for dirpath, dirnames, _ in os.walk(root):
+            depth = dirpath.count(os.sep) - base
+            if depth >= max_depth:
+                dirnames[:] = []
+            else:
+                dirnames[:] = [d for d in dirnames if d not in PRUNE_DIRS]
+            candidate = os.path.join(dirpath, TASK_REL)
+            ws = os.path.realpath(dirpath)
+            if os.path.isfile(candidate) and ws not in seen:
+                seen.add(ws)
+                yield ws, candidate
 
-    def read_tasks(self, ws):
-        # Task files are external input written by another program: validate
-        # the shape rather than trusting it. Anything unexpected reads as "no
-        # tasks here" instead of raising into the patrol loop.
-        try:
-            with open(os.path.join(ws, self.task_rel)) as f:
-                doc = json.load(f)
-        except (OSError, ValueError):
-            return None
-        if not isinstance(doc, dict):
-            return None
-        tasks = doc.get("tasks")
-        if not isinstance(tasks, list):
-            return None
-        return [t for t in tasks if isinstance(t, dict)]
 
-    @staticmethod
-    def _pid_is_claude(pid):
-        # kill -0 alone can be fooled by a recycled PID; confirm the process
-        # actually is a Claude Code instance.
-        if not alive(pid):
-            return False
-        try:
-            r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="],
-                               capture_output=True, text=True, timeout=5)
-            return "claude" in os.path.basename(r.stdout.strip()).lower()
-        except (OSError, subprocess.SubprocessError):
-            return False
+def read_tasks(ws):
+    # Task files are external input written by another program: validate
+    # the shape rather than trusting it. Anything unexpected reads as "no
+    # tasks here" instead of raising into the patrol loop.
+    try:
+        with open(os.path.join(ws, TASK_REL)) as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    tasks = doc.get("tasks")
+    if not isinstance(tasks, list):
+        return None
+    return [t for t in tasks if isinstance(t, dict)]
 
-    def has_consumer(self, ws):
-        ws = os.path.realpath(ws)
-        for f in glob.glob(os.path.join(self.session_dir, "*.json")):
-            try:
-                with open(f) as fh:
-                    s = json.load(fh)
-            except (OSError, ValueError):
-                continue
-            if (s.get("kind") == "interactive"
-                    and os.path.realpath(s.get("cwd", "")) == ws
-                    and self._pid_is_claude(s.get("pid", -1))):
-                return True
+
+def _pid_is_claude(pid):
+    # kill -0 alone can be fooled by a recycled PID; confirm the process
+    # actually is a Claude Code instance.
+    if not alive(pid):
+        return False
+    try:
+        r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="],
+                           capture_output=True, text=True, timeout=5)
+        return "claude" in os.path.basename(r.stdout.strip()).lower()
+    except (OSError, subprocess.SubprocessError):
         return False
 
-    def argv(self, ws, log_path):
-        # -l -i are both mandatory. -i loads the interactive rc where the
-        # private endpoint/model routing (claude shell function) lives;
-        # -l loads /etc/zprofile → path_helper, which is the only thing that
-        # puts homebrew (hence fnm/node) on PATH in launchd's minimal
-        # environment. A bare -ic works from a terminal only by inheriting a
-        # ready PATH, and dies with "fnm: command not found" under launchd.
-        return ["/usr/bin/script", "-q", log_path,
-                "/bin/zsh", "-lic", f"cd {shlex.quote(ws)} && claude"]
+
+def has_consumer(ws):
+    """True if an interactive session is already live in this workspace."""
+    ws = os.path.realpath(ws)
+    for f in glob.glob(os.path.join(SESSION_DIR, "*.json")):
+        try:
+            with open(f) as fh:
+                s = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        if (s.get("kind") == "interactive"
+                and os.path.realpath(s.get("cwd", "")) == ws
+                and _pid_is_claude(s.get("pid", -1))):
+            return True
+    return False
 
 
-PROVIDERS = {"claude": ClaudeProvider}
+def session_argv(ws, log_path):
+    # -l -i are both mandatory. -i loads the interactive rc where the
+    # private endpoint/model routing (claude shell function) lives;
+    # -l loads /etc/zprofile → path_helper, which is the only thing that
+    # puts homebrew (hence fnm/node) on PATH in launchd's minimal
+    # environment. A bare -ic works from a terminal only by inheriting a
+    # ready PATH, and dies with "fnm: command not found" under launchd.
+    return ["/usr/bin/script", "-q", log_path,
+            "/bin/zsh", "-lic", f"cd {shlex.quote(ws)} && claude"]
 
 
 # ---------------------------------------------------------------- config ----
@@ -397,7 +400,7 @@ def session_log_path(ws):
     return os.path.join(SESSION_LOG_DIR, slug + ".log")
 
 
-def spawn_session(provider, ws):
+def spawn_session(ws):
     """Fork a detached pty-wrapped TUI.
 
     Returns (pid, procStart) — the start time pins the pid to this specific
@@ -420,7 +423,7 @@ def spawn_session(provider, ws):
             os.rename(log_path, old)
     except OSError:
         pass
-    argv = provider.argv(ws, log_path)
+    argv = session_argv(ws, log_path)
     pid = os.fork()
     if pid == 0:
         try:
@@ -509,7 +512,6 @@ def cmd_run(args):
         log("another patrol in progress, skipping")
         return
     cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
-    provider = get_provider(cfg)
     if not isinstance(cfg.get("leadSeconds"), int) or cfg["leadSeconds"] < 0:
         print(f"配置错误：leadSeconds 必须是非负整数秒，当前为 "
               f"{cfg.get('leadSeconds')!r}", file=sys.stderr)
@@ -520,11 +522,11 @@ def cmd_run(args):
 
     cur = int(time.time())
 
-    for ws, _taskfile in provider.discover(cfg["roots"], cfg["maxDepth"]):
+    for ws, _taskfile in discover(cfg["roots"], cfg["maxDepth"]):
         # One unreadable workspace must not abort the patrol: discover() is a
         # generator, so an exception here would skip every workspace after it.
         try:
-            patrol_workspace(provider, ws, state, now, lead, cur)
+            patrol_workspace(ws, state, now, lead, cur)
         except Exception as e:  # noqa: BLE001 — last-resort per-workspace guard
             log(f"ERROR {ws}: {type(e).__name__}: {e}")
 
@@ -536,9 +538,9 @@ def cmd_run(args):
     save_state(state)
 
 
-def patrol_workspace(provider, ws, state, now, lead, cur):
+def patrol_workspace(ws, state, now, lead, cur):
     """Ensure a consumer is warm in one workspace. Mutates `state` in place."""
-    tasks = provider.read_tasks(ws)
+    tasks = read_tasks(ws)
     if not tasks or not any(task_wanted(t, now, lead) for t in tasks):
         return
 
@@ -546,7 +548,7 @@ def patrol_workspace(provider, ws, state, now, lead, cur):
     mine_alive = tracked_alive(ent)
     cooling = bool(ent and ent.get("cooldownUntil", 0) > cur)
 
-    if provider.has_consumer(ws):
+    if has_consumer(ws):
         # The task is being consumed. Distinguish our own warm session
         # from the user's interactive session: keep tracking the former
         # (a live consumer proves health → reset the failure streak), and
@@ -589,7 +591,7 @@ def patrol_workspace(provider, ws, state, now, lead, cur):
             f"needed, backing off {COOLDOWN_SECONDS // 60}m")
         return
 
-    pid, started = spawn_session(provider, ws)
+    pid, started = spawn_session(ws)
     state[ws] = {"pid": pid, "startedAt": cur, "procStart": started,
                  "fails": fails, "log": session_log_path(ws)}
     log(f"SPAWNED {ws} pid={pid} (fails={fails})")
@@ -611,18 +613,6 @@ def render_plist(interval):
 def launchctl(*args, check=True):
     return subprocess.run(["/bin/launchctl", *args], capture_output=True,
                           text=True, check=check)
-
-
-def get_provider(cfg):
-    """Resolve the configured provider, failing legibly instead of KeyError."""
-    name = cfg.get("provider", "claude")
-    cls = PROVIDERS.get(name)
-    if cls is None:
-        print(f"配置错误：未知的 provider '{name}'，当前可用："
-              f"{', '.join(sorted(PROVIDERS))}。请修改 config.json。",
-              file=sys.stderr)
-        sys.exit(2)
-    return cls()
 
 
 def validate_config(cfg, announce=print):
@@ -794,7 +784,6 @@ def cmd_status(args):
         print("launchd: not loaded")
 
     if cfg:
-        print(f"provider: {cfg['provider']}")
         print(f"roots: {', '.join(cfg['roots'])}  (maxDepth={cfg['maxDepth']})")
         actual_iv = info.get("interval") if info else None
         if actual_iv is not None:
@@ -827,13 +816,12 @@ def cmd_status(args):
 
 def cmd_list(args):
     cfg = load_config(args.config or CONFIG_PATH)
-    provider = get_provider(cfg)
     now = datetime.datetime.now()
     rows = []
     files_seen = 0
-    for ws, _ in provider.discover(cfg["roots"], cfg["maxDepth"]):
+    for ws, _ in discover(cfg["roots"], cfg["maxDepth"]):
         files_seen += 1
-        tasks = provider.read_tasks(ws) or []
+        tasks = read_tasks(ws) or []
         if not tasks:
             continue
         earliest = None
@@ -841,17 +829,22 @@ def cmd_list(args):
         for t in tasks:
             try:
                 cron = Cron(t["cron"])
-            except (ValueError, IndexError):
+            except (ValueError, IndexError, KeyError, AttributeError,
+                    TypeError):
                 continue
             nxt = cron.next_after(now)
             if nxt and (earliest is None or nxt < earliest):
                 earliest = nxt
-            if task_is_oneshot(t) and (nxt is None or nxt < now):
+            # "Missed" means the fire time is behind us, which is a different
+            # question from "no fire time within the search window" — a
+            # one-shot scheduled further out than that has a None nxt too.
+            if task_is_oneshot(t) and task_wanted(t, now, ZERO_LEAD) \
+                    and (nxt is None or nxt > now):
                 missed = True
         when = "MISSED" if missed else (
             earliest.strftime("%m-%d %H:%M") if earliest else "-")
         rows.append((ws, when, len(tasks),
-                     "yes" if provider.has_consumer(ws) else "NO"))
+                     "yes" if has_consumer(ws) else "NO"))
 
     if not rows:
         if files_seen:
