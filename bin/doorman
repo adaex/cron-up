@@ -579,6 +579,10 @@ def spawn_session(ws):
             # transcript / session registration).
             for key in [k for k in os.environ if k.startswith("CLAUDE_CODE_")]:
                 del os.environ[key]
+            # 自我标识为 doorman 预热会话，供外部观察工具（vscode-agents-explorer）
+            # 识别并自动归组。键名刻意不带 CLAUDE_CODE_ 前缀——那批在上一步刚被
+            # strip 掉；值必须严格为字符串 "1"（观察侧 === '1' 判定）。
+            os.environ["DOORMAN_SESSION"] = "1"
             os.setsid()
             os.chdir(ws)
             null_in = os.open("/dev/null", os.O_RDONLY)

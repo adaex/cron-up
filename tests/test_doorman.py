@@ -479,6 +479,47 @@ class StateMachineTests(unittest.TestCase):
         self.assertIn(WS_PATH, self.state())
 
 
+class SpawnEnvTest(unittest.TestCase):
+    """spawn_session 的 child 分支：打上预热标识、strip 掉 CC 标记。"""
+
+    def test_child_marked_and_claude_markers_stripped(self):
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        ws = os.path.join(tmp, "proj")
+        os.makedirs(ws)
+        log = os.path.join(tmp, "sessions", "x.log")
+        seen = {}
+
+        def fake_execv(prog, argv):
+            # 在 execv 调用瞬间快照环境——这是预热会话实际继承到的环境。
+            seen["prog"] = prog
+            seen["argv"] = argv
+            seen["env"] = dict(os.environ)
+
+        with mock.patch.dict(os.environ,
+                             {"CLAUDE_CODE_CHILD_SESSION": "parent-sid"},
+                             clear=False), \
+                mock.patch.object(d.os, "fork", return_value=0), \
+                mock.patch.object(d.os, "execv", side_effect=fake_execv), \
+                mock.patch.object(d.os, "umask"), \
+                mock.patch.object(d.os, "setsid"), \
+                mock.patch.object(d.os, "chdir"), \
+                mock.patch.object(d.os, "dup2"), \
+                mock.patch.object(d.os, "open", return_value=3), \
+                mock.patch.object(d, "session_log_path", return_value=log), \
+                mock.patch.object(d, "proc_started_at",
+                                  return_value="start"):
+            _pid, start = d.spawn_session(ws)
+        self.assertEqual(seen["env"].get("DOORMAN_SESSION"), "1")
+        self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", seen["env"])
+        self.assertFalse(any(k.startswith("CLAUDE_CODE_")
+                             for k in seen["env"]))
+        self.assertEqual(seen["prog"], "/usr/bin/script")
+        self.assertEqual(seen["argv"][:3],
+                         ["/usr/bin/script", "-q", log])
+        self.assertEqual(start, "start")
+
+
 class ListTests(unittest.TestCase):
     """cmd_list's MISSED column."""
 
