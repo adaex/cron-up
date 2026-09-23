@@ -71,6 +71,11 @@ WARMUP_GRACE_SECONDS = 180
 # long-lived warm session runs. Rotate at spawn time (script(1) truncates on
 # open, so rotation granularity is one warm-session life).
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
+# The patrol log is just a few lines per round, but a machine that runs for
+# years deserves a bound. launchd re-opens the path per spawn, so renaming at
+# the start of a round is safe: this round's fds keep writing the renamed
+# inode, the next round opens a fresh file.
+PATROL_LOG_ROTATE_BYTES = 1024 * 1024
 
 # Never descend into VCS/dependency internals, or standard macOS home-system
 # folders — an agent workspace never lives there, and ~/Library alone would
@@ -86,11 +91,18 @@ PRUNE_DIRS = {
 # ---------------------------------------------------------------- cron ------
 
 def parse_cron_field(expr, lo, hi):
+    """Parse one cron field into the set of in-range values it names.
+
+    Values outside the field's legal domain are dropped, not raised: a
+    typo like "99" then reads as "this field matches nothing" (surfaced
+    via Cron.satisfiable) instead of either crashing the parse or silently
+    matching a minute it should not.
+    """
     values = set()
     for token in expr.split(","):
         if "/" in token:
             rng, step_s = token.split("/", 1)
-            step = int(step_s)
+            step = int(step_s)  # "/0" raises ValueError, caught upstream
         else:
             rng, step = token, 1
         if rng == "*":
@@ -102,7 +114,8 @@ def parse_cron_field(expr, lo, hi):
             start = end = int(rng)
             if "/" in token:  # vixie: "5/10" means 5,15,25,… up to hi
                 end = hi
-        values.update(range(start, end + 1, step))
+        values.update(v for v in range(start, end + 1, step)
+                      if lo <= v <= hi)
     return values
 
 
@@ -129,9 +142,21 @@ class Cron:
         self.hours = parse_cron_field(h, 0, 23)
         self.doms = parse_cron_field(dom, 1, 31)
         self.months = parse_cron_field(mon, 1, 12)
-        self.dows = parse_cron_field(dow.replace("7", "0"), 0, 6)
+        # Parse on a 0..7 scale (both 0 and 7 name Sunday) then fold. The
+        # fold has to happen after set expansion: a textual replace("7","0")
+        # turns the perfectly ordinary range "1-7" (Mon…Sun) into "1-0",
+        # which parses to an empty set and silently never fires.
+        raw_dows = parse_cron_field(dow, 0, 7)
+        self.dows = {v % 7 for v in raw_dows}
         self.dom_restricted = dom != "*"
         self.dow_restricted = dow != "*"
+        # A non-empty set per field is necessary but not sufficient (Feb 30
+        # still never matches); this flags only expressions that cannot
+        # match ANY minute — those deserve a loud "cron 无效" instead of a
+        # quiet "无安排" that looks like a task with no upcoming fire.
+        self.satisfiable = bool(
+            self.minutes and self.hours and self.doms
+            and self.months and self.dows)
 
     def _matches(self, t):
         if t.minute not in self.minutes or t.hour not in self.hours:
@@ -146,6 +171,8 @@ class Cron:
     def next_after(self, after, within_days=SEARCH_DAYS):
         """Next fire time strictly after `after`, or None if not within
         `within_days`. None also covers expressions that can never match."""
+        if not self.satisfiable:
+            return None
         t = (after + datetime.timedelta(minutes=1)).replace(
             second=0, microsecond=0)
         deadline = after + datetime.timedelta(days=within_days)
@@ -315,6 +342,10 @@ def task_view(task, now):
         cron = Cron(expr)
     except (ValueError, IndexError, KeyError, AttributeError, TypeError):
         return {"valid": False, "expr": expr, "summary": task_summary(task)}
+    if not cron.satisfiable:
+        # Empty field set (out-of-range or backwards range): no minute can
+        # ever match. Distinct from "valid but no fire within 7 days".
+        return {"valid": False, "expr": expr, "summary": task_summary(task)}
     nxt = cron.next_after(now)
     oneshot = task_is_oneshot(task)
     missed = (oneshot and task_wanted(task, now, ZERO_LEAD)
@@ -346,9 +377,14 @@ def proc_started_at(pid):
     process later inherited its number. Start time pins it down — a recycled
     pid always has a later one.
     """
+    # Pin the locale: this string is compared for EXACT equality across
+    # invocations, and a manual `doorman run` (terminal LANG, possibly
+    # localised) would otherwise format the same process's start time
+    # differently from the launchd-driven patrol that spawned it.
     try:
         r = subprocess.run(["/bin/ps", "-p", str(int(pid)), "-o", "lstart="],
-                           capture_output=True, text=True, timeout=5)
+                           capture_output=True, text=True, timeout=5,
+                           env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     out = r.stdout.strip()
@@ -417,33 +453,63 @@ def read_tasks(ws):
     return [t for t in tasks if isinstance(t, dict)]
 
 
-def _pid_is_claude(pid):
-    # kill -0 alone can be fooled by a recycled PID; confirm the process
-    # actually is a Claude Code instance.
-    if not alive(pid):
-        return False
+def _pid_comm_is_claude(pid):
+    """Does the live pid's executable name contain "claude"? Caller checks
+    liveness first; this confirms a recycled PID did not inherit the number
+    from an unrelated process."""
     try:
         r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="],
                            capture_output=True, text=True, timeout=5)
-        return "claude" in os.path.basename(r.stdout.strip()).lower()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, subprocess.SubprocessError):
         return False
+    return "claude" in os.path.basename(r.stdout.strip()).lower()
 
 
-def has_consumer(ws):
-    """True if an interactive session is already live in this workspace."""
-    ws = os.path.realpath(ws)
-    for f in glob.glob(os.path.join(SESSION_DIR, "*.json")):
+def scan_sessions():
+    """Read the session registry once per patrol/page.
+
+    Returns (workspaces_with_a_live_consumer, registry_alert). The registry
+    is another program's undocumented output: if its shape changes we fail
+    SILENTLY — every session reads as "absent", so patrols kill and respawn
+    their warm sessions in a loop. The alert is the canary for that: files
+    exist but zero registrations look like a live interactive Claude Code.
+    """
+    files = glob.glob(os.path.join(SESSION_DIR, "*.json"))
+    interactive = []
+    for f in files:
         try:
             with open(f) as fh:
                 s = json.load(fh)
         except (OSError, ValueError):
             continue
-        if (s.get("kind") == "interactive"
-                and os.path.realpath(s.get("cwd", "")) == ws
-                and _pid_is_claude(s.get("pid", -1))):
-            return True
-    return False
+        if isinstance(s, dict) and s.get("kind") == "interactive":
+            interactive.append(s)
+
+    consumers = set()
+    comm_cache = {}
+    live_other = 0
+    for s in interactive:
+        pid = s.get("pid", -1)
+        if not alive(pid):
+            continue
+        if pid not in comm_cache:
+            comm_cache[pid] = _pid_comm_is_claude(pid)  # one ps per pid
+        if comm_cache[pid]:
+            cwd = os.path.realpath(s.get("cwd") or "")
+            if cwd:
+                consumers.add(cwd)
+        else:
+            live_other += 1
+
+    alert = None
+    if files and not interactive:
+        alert = (f"会话登记目录 {SESSION_DIR} 下有 {len(files)} 个登记文件，"
+                 "但没有一个是 interactive 会话；Claude Code 的会话登记"
+                 "格式可能已变更，doorman 将识别不到任何现有会话")
+    elif live_other and not consumers:
+        alert = ("会话登记中的存活进程都不是 claude 命令；Claude Code 的启动"
+                 "形态可能已变更，doorman 可能反复重拉会话")
+    return consumers, alert
 
 
 def session_argv(ws, log_path):
@@ -654,11 +720,28 @@ def stop_session(ent):
     return True
 
 
+def rotate_patrol_logs():
+    """Rename oversized launchd logs to .1 once per round (see the constant's
+    comment for why this is safe despite launchd holding fds)."""
+    for name in ("launchd.out.log", "launchd.err.log"):
+        path = os.path.join(LOG_DIR, name)
+        try:
+            if os.path.exists(path) \
+                    and os.path.getsize(path) > PATROL_LOG_ROTATE_BYTES:
+                old = path + ".1"
+                if os.path.exists(old):
+                    os.remove(old)
+                os.rename(path, old)
+        except OSError:
+            pass
+
+
 def cmd_run(args):
     lock_fd = acquire_run_lock()
     if lock_fd is None:
         log("已有一轮巡检在进行，本轮跳过")
         return
+    rotate_patrol_logs()
     cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
     if not isinstance(cfg.get("leadSeconds"), int) or cfg["leadSeconds"] < 0:
         print(f"配置错误：leadSeconds 必须是非负整数秒，当前为 "
@@ -669,12 +752,17 @@ def cmd_run(args):
     state = load_state()
 
     cur = int(time.time())
+    # Read the registry once: each workspace otherwise globs and forks a ps
+    # per registered pid, and the registry self-check belongs here too.
+    consumers, registry_alert = scan_sessions()
+    if registry_alert:
+        log(f"告警：{registry_alert}")
 
     for ws, _taskfile in discover(cfg["roots"], cfg["maxDepth"]):
         # One unreadable workspace must not abort the patrol: discover() is a
         # generator, so an exception here would skip every workspace after it.
         try:
-            patrol_workspace(ws, state, now, lead, cur)
+            patrol_workspace(ws, state, now, lead, cur, consumers)
         except Exception as e:  # noqa: BLE001 — last-resort per-workspace guard
             log(f"错误 {ws}：{type(e).__name__}：{e}")
 
@@ -686,17 +774,35 @@ def cmd_run(args):
     save_state(state)
 
 
-def patrol_workspace(ws, state, now, lead, cur):
+def patrol_workspace(ws, state, now, lead, cur, consumers):
     """Ensure a consumer is warm in one workspace. Mutates `state` in place."""
     tasks = read_tasks(ws)
-    if not tasks or not any(task_wanted(t, now, lead) for t in tasks):
+    ent = state.get(ws)
+
+    if tasks is None:
+        # Unreadable task file: never touch a session on evidence this weak.
+        return
+    if not tasks:
+        # The file is intact but holds no tasks any more — a one-shot fired
+        # and was deleted, a recurring task expired after 7 days, or the user
+        # removed them. A session WE spawned has no reason to stay; the
+        # /exit convention closes it promptly, this is the backstop for when
+        # that line was forgotten. User-opened sessions are not in `state`
+        # and are never touched.
+        if ent is not None:
+            if tracked_alive(ent):
+                stop_session(ent)
+                log(f"回收 {ws} pid={ent['pid']}：任务已全部清空，"
+                    f"结束保活会话")
+            state.pop(ws, None)
+        return
+    if not any(task_wanted(t, now, lead) for t in tasks):
         return
 
-    ent = state.get(ws)
     mine_alive = tracked_alive(ent)
     cooling = bool(ent and ent.get("cooldownUntil", 0) > cur)
 
-    if has_consumer(ws):
+    if ws in consumers:
         # The task is being consumed. Distinguish our own warm session
         # from the user's interactive session: keep tracking the former
         # (a live consumer proves health → reset the failure streak), and
@@ -924,6 +1030,16 @@ def launchd_state_zh(state):
     return LAUNCHD_STATES.get(state, state if state else "未知")
 
 
+def service_line(info, plist_exists):
+    """status 与总览共用的服务状态行，两边文案必须保持一致。"""
+    if info:
+        return (f"服务：launchd 已加载，{launchd_state_zh(info.get('state'))}，"
+                f"上次退出码 {info.get('last exit code', '?')}")
+    if plist_exists:
+        return "服务：plist 文件存在但未加载，运行 doorman install 重新加载"
+    return "服务：未安装，运行 doorman install 安装"
+
+
 def cmd_status(args):
     print(f"doorman {VERSION}")
     cfg = None
@@ -936,14 +1052,10 @@ def cmd_status(args):
         # 损坏不致命于 status：页面其余部分（launchd、保活会话）照常显示。
         print(f"配置：文件损坏，不是合法 JSON（{cfg_path}）\n  {e}")
 
-    plist_state = "存在" if os.path.exists(PLIST_PATH) else "缺失"
-    print(f"plist 文件：{PLIST_PATH}（{plist_state}）")
     info = launchctl_info()
-    if info:
-        print(f"launchd：已加载，状态 {launchd_state_zh(info.get('state'))}，"
-              f"上次退出码 {info.get('last exit code', '?')}")
-    else:
-        print("launchd：未加载")
+    plist_exists = os.path.exists(PLIST_PATH)
+    print(f"plist 文件：{PLIST_PATH}（{'存在' if plist_exists else '缺失'}）")
+    print(service_line(info, plist_exists))
 
     if cfg:
         print(f"扫描目录：{'、'.join(cfg['roots'])}"
@@ -1001,15 +1113,17 @@ def cmd_overview(args):
         cfg_error = e
 
     info = launchctl_info()
-    if info:
-        print(f"服务：launchd 已加载，{launchd_state_zh(info.get('state'))}，"
-              f"上次退出码 {info.get('last exit code', '?')}")
-    elif os.path.exists(PLIST_PATH):
-        print("服务：plist 文件存在但未加载，运行 doorman install 重新加载")
-    else:
-        print("服务：未安装，运行 doorman install 安装")
+    print(service_line(info, os.path.exists(PLIST_PATH)))
 
     alerts = []
+    # One registry scan for the whole page; it also feeds the self-check.
+    consumers, registry_alert = scan_sessions()
+    if registry_alert:
+        alerts.append(registry_alert)
+    state = load_state()
+    # Workspaces whose cooldown is reported in the task section with full
+    # context, so the session section does not add a blunter duplicate.
+    cooling_warned = set()
     if cfg_error is not None:
         # 页面不能死在半路：损坏配置是「需要留意」的一种，巡检本身
         # （launchd 入口）仍会以退出码 2 失败，错误详情见 doorman logs。
@@ -1040,11 +1154,13 @@ def cmd_overview(args):
         alerts.extend(validate_config(
             cfg, announce=lambda _: None))
         print()
-        alerts.extend(_overview_tasks(cfg, cols))
+        task_alerts, cooling_warned = _overview_tasks(
+            cfg, cols, consumers, state)
+        alerts.extend(task_alerts)
 
     # 会话状态来自 state.json，与配置无关：未安装或配置损坏时也可能有
     # 残留的保活会话，照常展示。
-    alerts.extend(_overview_sessions(cols))
+    alerts.extend(_overview_sessions(cols, state, cooling_warned))
 
     if alerts:
         print("需要留意：")
@@ -1065,10 +1181,12 @@ def cmd_overview(args):
         print(f"  doorman {pad(name, name_w)}  {desc}")
 
 
-def _overview_tasks(cfg, cols):
-    """总览页的任务盘点部分，返回相关告警。"""
+def _overview_tasks(cfg, cols, consumers, state):
+    """总览页的任务盘点部分，返回 (告警, 已在告警里说明冷却的工作区集合)。"""
     alerts = []
+    cooling_warned = set()
     now = datetime.datetime.now()
+    cur = int(now.timestamp())
     lead = datetime.timedelta(seconds=cfg["leadSeconds"])
 
     n_ws = n_tasks = 0
@@ -1095,9 +1213,22 @@ def _overview_tasks(cfg, cols):
         if bad:
             alerts.append(f"{ws} 有 {bad} 个任务的 cron 无法解析，"
                           f"巡检会跳过{'它们' if bad > 1 else '它'}")
-        if wanted and not has_consumer(ws):
-            alerts.append(f"{ws} 有任务即将执行（或错过待补执行），"
-                          f"但当前没有交互会话，下轮巡检会自动启动")
+        if wanted and ws not in consumers:
+            ent = state.get(ws) or {}
+            cooldown = ent.get("cooldownUntil", 0)
+            if cooldown > cur:
+                # 与「下轮巡检会自动启动」互斥：冷却中就是不会启动，
+                # 两条同时出现会自相矛盾，这里合并成一条。
+                eta = max(0, (cooldown - cur) // 60)
+                alerts.append(
+                    f"{ws} 有任务即将执行（或错过待补执行），但保活会话连续"
+                    f"失败 {ent.get('fails', '?')} 次正处冷却中，约 {eta} "
+                    f"分钟后才会重试；请运行 doorman logs "
+                    f"{os.path.basename(ws)} 排查")
+                cooling_warned.add(ws)
+            else:
+                alerts.append(f"{ws} 有任务即将执行（或错过待补执行），"
+                              f"但当前没有交互会话，下轮巡检会自动启动")
 
     print(f"任务：{n_tasks} 个，分布在 {n_ws} 个工作区"
           if n_tasks else "任务：暂无")
@@ -1106,15 +1237,15 @@ def _overview_tasks(cfg, cols):
         line = (f"最近：{nxt:%m-%d %H:%M}（{human_delta(nxt - now)}） "
                 f"{os.path.basename(ws)} · {summary}")
         print(clip(line, cols))
-    return alerts
+    return alerts, cooling_warned
 
 
-def _overview_sessions(cols):
+def _overview_sessions(cols, state, suppress_cooling=()):
     """总览页的保活会话部分，数据来自 state.json，与配置状态无关。"""
     alerts = []
     cur = int(time.time())
     live, cooling = [], []
-    for ws, ent in sorted(load_state().items()):
+    for ws, ent in sorted(state.items()):
         if ent.get("cooldownUntil", 0) > cur:
             cooling.append((ws, ent))
         elif tracked_alive(ent):
@@ -1131,6 +1262,8 @@ def _overview_sessions(cols):
     else:
         print(f"会话：无保活会话，冷却 {len(cooling)} 个")
     for ws, ent in cooling:
+        if ws in suppress_cooling:
+            continue  # 任务区已给过带上下文的合并告警
         eta = max(0, (ent["cooldownUntil"] - cur) // 60)
         alerts.append(f"{ws} 保活连续失败 {ent.get('fails', '?')} 次，"
                       f"冷却中，约 {eta} 分钟后重试")
@@ -1144,6 +1277,7 @@ def cmd_list(args):
     blocks = []
     total = 0
     files_seen = 0
+    consumers, _ = scan_sessions()
     for ws, _ in discover(cfg["roots"], cfg["maxDepth"]):
         files_seen += 1
         tasks = read_tasks(ws) or []
@@ -1155,7 +1289,7 @@ def cmd_list(args):
             3 if not v["valid"] else 0 if v["missed"]
             else 1 if v.get("nxt") else 2,
             v.get("nxt") or datetime.datetime.max))
-        blocks.append((ws, has_consumer(ws), views))
+        blocks.append((ws, ws in consumers, views))
         total += len(tasks)
 
     if not blocks:
@@ -1245,60 +1379,15 @@ def cmd_logs(args):
     os.execv(argv[0], argv)
 
 
-# argparse 的界面文案走 gettext，但 stdlib 不带中文翻译。它内部全部通过
-# argparse._ 取词，替换成一张小词表即可；Python 版本升级后没覆盖到的
-# 字符串会回退成英文原文，不影响功能。
-_ARGP_I18N = {
-    "usage: ": "用法：",
-    "positional arguments": "位置参数",
-    "optional arguments": "可选参数",
-    "show this help message and exit": "显示帮助信息并退出",
-    "unrecognized arguments: %s": "无法识别的参数：%s",
-    "the following arguments are required: %s": "以下参数为必填：%s",
-    "invalid choice: %(value)r (choose from %(choices)s)":
-        "无效选择：%(value)r（可选值：%(choices)s）",
-    "invalid choice: %(parser_name)r (choose from %(choices)s)":
-        "无效选择：%(parser_name)r（可选值：%(choices)s）",
-    "expected one argument": "需要一个参数值",
-    "expected at least one argument": "至少需要一个参数值",
-    "invalid %(type)s value: %(value)r":
-        "%(value)r 不是合法的 %(type)s 值",
-    "%(prog)s: error: %(message)s\n":
-        "%(prog)s：错误：%(message)s\n",
-}
-argparse._ = lambda s: _ARGP_I18N.get(s, s)
-
-
-# ArgumentError 的 "argument X: " 前缀是裸字符串，不走 gettext，只能覆写。
-def _argument_error_zh(self):
-    if self.argument_name is None:
-        return self.message
-    return f"参数 {self.argument_name}：{self.message}"
-
-
-argparse.ArgumentError.__str__ = _argument_error_zh
-
-
-class ZhHelpFormatter(argparse.HelpFormatter):
-    # argparse 在分组标题后硬编码 ASCII 冒号，中文排版换成全角冒号。
-    # 子 parser 不继承 formatter_class，add_parser 时都显式传它。
-    def format_help(self):
-        return super().format_help().replace(
-            "位置参数:", "位置参数：").replace(
-            "可选参数:", "可选参数：")
-
-
 def main():
     parser = argparse.ArgumentParser(
         prog="doorman",
-        description="定时任务门房：到点前为对应目录提前备好交互会话。",
-        formatter_class=ZhHelpFormatter)
+        description="定时任务门房：到点前为对应目录提前备好交互会话。")
     parser.add_argument("--config", help=argparse.SUPPRESS)
     # 不带子命令不是误用：走总览页，而不是抛一段 usage 错误。
     sub = parser.add_subparsers(dest="command")
 
-    p = sub.add_parser("install", help="安装命令行、配置与 LaunchAgent",
-                       formatter_class=ZhHelpFormatter)
+    p = sub.add_parser("install", help="安装命令行、配置与 LaunchAgent")
     p.add_argument("--roots", help="以逗号分隔的工作区根目录")
     p.add_argument("--interval", type=int, help="巡检间隔（秒）")
     p.add_argument("--lead", type=int, help="提前启动会话的时间（秒）")
@@ -1306,22 +1395,19 @@ def main():
                    help="覆盖已有配置")
     p.set_defaults(func=cmd_install)
 
-    p = sub.add_parser("uninstall", help="卸载 LaunchAgent",
-                       formatter_class=ZhHelpFormatter)
+    p = sub.add_parser("uninstall", help="卸载 LaunchAgent")
     p.add_argument("--purge", action="store_true",
                    help="同时删除命令行、配置与日志")
     p.add_argument("--stop-sessions", action="store_true",
                    help="同时结束 doorman 启动的后台会话")
     p.set_defaults(func=cmd_uninstall)
 
-    sub.add_parser("status", help="查看服务注册、配置与保活会话",
-                   formatter_class=ZhHelpFormatter).set_defaults(func=cmd_status)
-    sub.add_parser("list", help="逐个列出定时任务及其下次执行时间",
-                   formatter_class=ZhHelpFormatter).set_defaults(func=cmd_list)
-    sub.add_parser("run", help="执行一轮巡检（launchd 入口）",
-                   formatter_class=ZhHelpFormatter).set_defaults(func=cmd_run)
-    p = sub.add_parser("logs", help="查看巡检日志或后台会话记录",
-                       formatter_class=ZhHelpFormatter)
+    sub.add_parser("status",
+                   help="查看服务注册、配置与保活会话").set_defaults(func=cmd_status)
+    sub.add_parser("list",
+                   help="逐个列出定时任务及其下次执行时间").set_defaults(func=cmd_list)
+    sub.add_parser("run", help="执行一轮巡检（launchd 入口）").set_defaults(func=cmd_run)
+    p = sub.add_parser("logs", help="查看巡检日志或后台会话记录")
     p.add_argument("-f", "--follow", action="store_true",
                    help="实时跟踪日志")
     p.add_argument("workspace", nargs="?",

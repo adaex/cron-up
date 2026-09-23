@@ -64,6 +64,50 @@ class CronTests(unittest.TestCase):
     def test_vixie_start_step(self):
         self.assertEqual(d.parse_cron_field("5/15", 0, 59), {5, 20, 35, 50})
 
+    def test_dow_seven_is_sunday_inside_ranges(self):
+        # 7 names Sunday; the fold must happen AFTER range expansion. A
+        # textual replace("7","0") turns "1-7" into the backwards "1-0",
+        # which parses empty and the task silently never fires.
+        self.assertEqual(d.Cron("0 9 * * 1-7").next_after(NOW),
+                         datetime.datetime(2026, 9, 21, 9, 0))
+        self.assertEqual(d.Cron("0 9 * * 2-7").next_after(NOW),
+                         datetime.datetime(2026, 9, 22, 9, 0))
+        self.assertEqual(d.Cron("0 9 * * 7").next_after(NOW),
+                         datetime.datetime(2026, 9, 27, 9, 0))
+        self.assertEqual(d.Cron("0 9 * * 0,7").next_after(NOW),
+                         datetime.datetime(2026, 9, 27, 9, 0))
+
+    def test_out_of_range_dow_is_dropped_not_folded(self):
+        # 8 must not become Monday via 8 % 7 == 1.
+        self.assertFalse(d.Cron("0 9 * * 8").satisfiable)
+
+
+class CronSatisfiabilityTests(unittest.TestCase):
+    def test_empty_field_sets_are_unsatisfiable(self):
+        for expr in ("99 * * * *", "5-2 * * * *", "0 99 * * *",
+                     "0 0 * 13 *", "0 0 99 * *", "0 9 * * 8"):
+            with self.subTest(expr=expr):
+                self.assertFalse(d.Cron(expr).satisfiable)
+
+    def test_unsatisfiable_views_as_invalid(self):
+        v = d.task_view({"cron": "99 * * * *"}, NOW)
+        self.assertFalse(v["valid"])
+
+    def test_in_range_values_surrounding_a_typo_survive(self):
+        # vixie would reject the whole line; doorman only clips the bad
+        # value, so the typo does not silence the legal 5 past the hour.
+        cron = d.Cron("5,99 * * * *")
+        self.assertTrue(cron.satisfiable)
+        self.assertEqual(cron.next_after(NOW),
+                         datetime.datetime(2026, 9, 20, 16, 5))
+
+    def test_out_of_range_or_side_does_not_match_through(self):
+        # Old behaviour kept DoM=99 in the set and the DoW OR-side still
+        # matched Mondays. An illegal field must fail loudly instead.
+        cron = d.Cron("0 12 99 * 1")
+        self.assertFalse(cron.satisfiable)
+        self.assertIsNone(cron.next_after(NOW))
+
 
 class CronHumanizeTests(unittest.TestCase):
     def h(self, expr):
@@ -244,11 +288,6 @@ class WantedTests(unittest.TestCase):
             d.Cron("0 0 29 2 *").next_after(NOW, within_days=900),
             datetime.datetime(2028, 2, 29, 0, 0))
 
-    def test_satisfiable_crons_still_resolve(self):
-        # A DoM/DoW OR expression where one side alone is out of range.
-        self.assertEqual(d.Cron("0 12 99 * 1").next_after(NOW),
-                         datetime.datetime(2026, 9, 21, 12, 0))
-
     def test_missed_one_shot_created_long_ago_is_still_wanted(self):
         # Catch-up search runs forward from creation, so it must not be
         # limited by the ordinary look-ahead window.
@@ -311,7 +350,7 @@ class StateMachineTests(unittest.TestCase):
         # Module globals are patched wholesale below; restore them so test
         # order never matters.
         for name in ("STATE_PATH", "alive", "proc_started_at", "discover",
-                     "read_tasks", "has_consumer", "spawn_session",
+                     "read_tasks", "scan_sessions", "spawn_session",
                      "stop_session", "acquire_run_lock"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.STATE_PATH = os.path.join(self.tmp, "state.json")
@@ -324,7 +363,8 @@ class StateMachineTests(unittest.TestCase):
 
         d.discover = lambda roots, depth: iter([(WS_PATH, "x")])
         d.read_tasks = lambda ws: [{"cron": "*/5 * * * *", "createdAt": 0}]
-        d.has_consumer = lambda ws: self.consumer
+        d.scan_sessions = lambda: (
+            ({WS_PATH} if self.consumer else set(), None))
         d.alive = lambda pid: pid in self.alive_pids
         # Identity fingerprints are faked as "start-<pid>": a pid that is
         # alive in the fake table reports the same value spawn recorded, and
@@ -461,6 +501,41 @@ class StateMachineTests(unittest.TestCase):
         self.assertNotEqual(self.state()[WS_PATH]["pid"], pid)
         self.assertIn(pid, self.alive_pids)  # the impostor was left running
 
+    def test_empty_task_list_reaps_our_session(self):
+        """All tasks gone (fired one-shot deleted, expired, removed): the
+        warm session WE spawned has no reason to live for another week."""
+        self.patrol()
+        pid = self.state()[WS_PATH]["pid"]
+
+        d.read_tasks = lambda ws: []
+        self.patrol()
+        self.assertEqual(self.state(), {})
+        self.assertNotIn(pid, self.alive_pids)
+
+    def test_cooldown_entry_is_cleared_when_tasks_disappear(self):
+        # Three quick failures → cooldown; then the task file is emptied.
+        # Staying in cooldown for a directory that has no tasks is pointless.
+        self.patrol()
+        for _ in range(3):
+            self.alive_pids.discard(self.state()[WS_PATH]["pid"])
+            self.patrol()
+        self.assertIn("cooldownUntil", self.state()[WS_PATH])
+
+        d.read_tasks = lambda ws: []
+        self.patrol()
+        self.assertEqual(self.state(), {})
+
+    def test_unreadable_task_file_never_reaps(self):
+        # None means "the file could not be read" — never kill a tracked
+        # session on evidence that weak; wait for a readable empty list.
+        self.patrol()
+        pid = self.state()[WS_PATH]["pid"]
+
+        d.read_tasks = lambda ws: None
+        self.patrol()
+        self.assertIn(pid, self.alive_pids)
+        self.assertEqual(self.state()[WS_PATH]["pid"], pid)
+
     def test_one_broken_workspace_does_not_stop_the_patrol(self):
         """discover() is a generator: an exception would skip the rest."""
         visited = []
@@ -520,6 +595,106 @@ class SpawnEnvTest(unittest.TestCase):
         self.assertEqual(start, "start")
 
 
+class SessionScanTests(unittest.TestCase):
+    """scan_sessions: one registry pass → consumer set + shape self-check."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for name in ("SESSION_DIR", "alive", "_pid_comm_is_claude"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.SESSION_DIR = self.tmp
+        self.live, self.claude = set(), set()
+        d.alive = lambda pid: pid in self.live
+        d._pid_comm_is_claude = lambda pid: pid in self.claude
+
+    def write_reg(self, name, pid, cwd, kind="interactive"):
+        with open(os.path.join(self.tmp, name), "w") as f:
+            json.dump({"pid": pid, "cwd": cwd, "kind": kind}, f)
+
+    def test_live_claude_consumers_dead_and_other_kinds_ignored(self):
+        self.live, self.claude = {101, 202}, {101, 202}
+        self.write_reg("a.json", 101, os.path.realpath(self.tmp))
+        self.write_reg("dead.json", 999, "/nowhere/dead")
+        self.write_reg("other.json", 202, "/nowhere/x", kind="some-other")
+        consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, {os.path.realpath(self.tmp)})
+        self.assertIsNone(alert)
+
+    def test_empty_directory_is_quiet(self):
+        self.assertEqual(d.scan_sessions(), (set(), None))
+
+    def test_registry_shape_change_alerts(self):
+        # Files exist, none look interactive — the canary for an
+        # undocumented registry format changing under us.
+        self.write_reg("x.json", 1, "/a", kind="brand-new-kind")
+        consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, set())
+        self.assertIsNotNone(alert)
+
+    def test_all_corrupt_files_alert(self):
+        with open(os.path.join(self.tmp, "bad.json"), "w") as f:
+            f.write("{ truncated")
+        _, alert = d.scan_sessions()
+        self.assertIsNotNone(alert)
+
+    def test_live_non_claude_process_alerts(self):
+        # A recycled/other pid holding a registration: consumers must not
+        # claim the workspace, and a registry full of these is a signal
+        # that the launch shape changed.
+        self.live = {101}
+        self.write_reg("a.json", 101, os.path.realpath(self.tmp))
+        consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, set())
+        self.assertIsNotNone(alert)
+
+
+class PatrolLogRotateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.addCleanup(setattr, d, "LOG_DIR", d.LOG_DIR)
+        d.LOG_DIR = self.tmp
+
+    def touch(self, name, size=0):
+        path = os.path.join(self.tmp, name)
+        with open(path, "wb") as f:
+            f.write(b"x" * size)
+        return path
+
+    def test_oversized_logs_are_renamed(self):
+        out = self.touch("launchd.out.log", d.PATROL_LOG_ROTATE_BYTES + 1)
+        d.rotate_patrol_logs()
+        self.assertFalse(os.path.exists(out))
+        self.assertTrue(os.path.exists(out + ".1"))
+
+    def test_small_logs_are_left_alone(self):
+        err = self.touch("launchd.err.log", 10)
+        d.rotate_patrol_logs()
+        self.assertTrue(os.path.exists(err))
+        self.assertFalse(os.path.exists(err + ".1"))
+
+    def test_existing_dot1_is_replaced(self):
+        out = self.touch("launchd.out.log", d.PATROL_LOG_ROTATE_BYTES + 1)
+        self.touch("launchd.out.log.1", 5)
+        d.rotate_patrol_logs()
+        self.assertEqual(os.path.getsize(out + ".1"),
+                         d.PATROL_LOG_ROTATE_BYTES + 1)
+
+
+class ProcessFingerprintTests(unittest.TestCase):
+    def test_ps_start_time_runs_under_pinned_c_locale(self):
+        # The lstart string is compared for exact equality across
+        # launchd-driven and manual runs; localised ps output would make
+        # our own session look like a recycled pid.
+        with mock.patch.object(d.subprocess, "run",
+                               return_value=mock.Mock(stdout="x")) as rr:
+            d.proc_started_at(42)
+        env = rr.call_args.kwargs["env"]
+        self.assertEqual(env["LC_ALL"], "C")
+        self.assertEqual(env["LANG"], "C")
+
+
 class ListTests(unittest.TestCase):
     """cmd_list's MISSED column."""
 
@@ -530,13 +705,14 @@ class ListTests(unittest.TestCase):
         write_json(self.cfg_path,
                    {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
                     "leadSeconds": 600})
-        for name in ("discover", "read_tasks", "has_consumer"):
+        for name in ("discover", "read_tasks", "scan_sessions"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.discover = lambda roots, depth: iter([(WS_PATH, "x")])
-        d.has_consumer = lambda ws: False
+        d.scan_sessions = lambda: (set(), None)
 
-    def render(self, tasks):
+    def render(self, tasks, consumers=set()):
         d.read_tasks = lambda ws: tasks
+        d.scan_sessions = lambda: (consumers, None)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
             d.cmd_list(argparse.Namespace(config=self.cfg_path))
@@ -587,6 +763,12 @@ class ListTests(unittest.TestCase):
         out = self.render([{"cron": "5 0 * * *", "recurring": True}])
         self.assertIn("（无任务描述）", out)
 
+    def test_consumer_column_reflects_single_scan(self):
+        out = self.render(
+            [{"cron": "5 0 * * *", "recurring": True}],
+            consumers={WS_PATH})
+        self.assertIn("交互会话：有", out)
+
     def test_rows_never_overflow_the_terminal_width(self):
         orig_terminal_width = d.terminal_width
         for width in (60, 80, 100, 200):
@@ -614,11 +796,11 @@ class OverviewTests(unittest.TestCase):
         write_json(self.cfg_path,
                    {"roots": [self.tmp], "maxDepth": 3,
                     "intervalSeconds": 300, "leadSeconds": 600})
-        for name in ("discover", "read_tasks", "has_consumer",
+        for name in ("discover", "read_tasks", "scan_sessions",
                      "launchctl_info", "STATE_PATH", "PLIST_PATH"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.discover = lambda roots, depth: iter([(WS_PATH, "x")])
-        d.has_consumer = lambda ws: False
+        d.scan_sessions = lambda: (set(), None)
         d.launchctl_info = lambda: {
             "state": "running", "last exit code": "0", "interval": 300}
         d.STATE_PATH = os.path.join(self.tmp, "state.json")
@@ -659,6 +841,22 @@ class OverviewTests(unittest.TestCase):
             "prompt": "马上要跑的一次性任务"}])
         self.assertIn("需要留意", out)
         self.assertIn("即将执行（或错过待补执行）", out)
+        self.assertIn("下轮巡检会自动启动", out)
+
+    def test_pending_task_during_cooldown_gets_one_combined_alert(self):
+        # "下轮会自动启动" and "冷却中" used to appear together for the
+        # same workspace and contradict each other.
+        fire = datetime.datetime.now() + datetime.timedelta(minutes=2)
+        out = self.render(
+            tasks=[{
+                "cron": f"{fire.minute} {fire.hour} {fire.day} {fire.month} *",
+                "recurring": False,
+                "createdAt": int(time.time() * 1000),
+                "prompt": "马上要跑的一次性任务"}],
+            state={WS_PATH: {"pid": None, "fails": 3,
+                             "cooldownUntil": int(time.time()) + 900}})
+        self.assertIn("冷却中", out)
+        self.assertNotIn("下轮巡检会自动启动", out)
 
     def test_bad_cron_and_cooldown_become_alerts(self):
         out = self.render(
