@@ -152,7 +152,7 @@ doorman spawn 的预热会话进程环境里带 `DOORMAN_SESSION=1`（值严格�
 | 日志里出现「错误 \<目录\>」 | 该目录的任务文件读不出来（格式损坏等），只跳过这一个目录，其余照常巡检。检查 `<目录>/.claude/scheduled_tasks.json` |
 | 任务到点没有执行 | `doorman list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.doorman` 查看 last exit code |
 | 手动 `doorman run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错 |
-| `last exit code=2` | config.json 字段类型不对（如 `leadSeconds` 写成字符串），无参数 `doorman` 总览的「需要留意」会指出具体问题 |
+| `last exit code=2` | config.json 缺失、不是合法 JSON，或字段类型不对（如 `leadSeconds` 写成字符串）；无参数 `doorman` 总览的配置行或「需要留意」会给出具体原因 |
 
 ## 测试
 
