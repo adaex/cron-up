@@ -138,6 +138,10 @@ class ConfigTests(unittest.TestCase):
             self.assertEqual(
                 d.normalize_roots(["/abs/path/"]),
                 ["/abs/path"])
+            # 手改 config 混入的非字符串元素：跳过而不是在 .strip() 崩掉
+            self.assertEqual(
+                d.normalize_roots(["~/x", 5, None, ["y"]]),
+                ["/home/u/x"])
 
 
 class ValidationTests(unittest.TestCase):
@@ -634,7 +638,8 @@ class SessionScanTests(unittest.TestCase):
         # 必须用真实 alive 复现旧坑——pid=null 让 int(None) 抛 TypeError、
         # 超大整数让 os.kill 抛 OverflowError，都会炸掉整轮巡检
         # （scan_sessions 在 per-workspace 保护圈之外）；pid 缺失时兜底的
-        # -1 被 kill(-1, 0)（权限探测）读作存活。
+        # -1 被 kill(-1, 0)（权限探测）读作存活。cwd 非字符串同理，会在
+        # realpath 处抛 TypeError——活 pid 配畸形 cwd 也要安全跳过。
         d.alive = self.real_alive
         me = os.getpid()  # 一个确定存活的 pid：健康登记长这样
         d._pid_comm_is_claude = lambda pid: pid == me
@@ -643,6 +648,12 @@ class SessionScanTests(unittest.TestCase):
         self.write_reg("neg.json", -1, "/a")
         self.write_reg("junk.json", "abc", "/a")
         self.write_reg("huge.json", 10 ** 20, "/a")
+        self.write_reg("cwdnum.json", me, 5)
+        self.write_reg("cwdlist.json", me, ["/a"])
+        # 空串/相对路径 cwd：realpath 会解析到巡检进程自己的 cwd 下，
+        # 凭空造出一个「消费者」目录，可能令预热被静默跳过
+        self.write_reg("cwdempty.json", me, "")
+        self.write_reg("cwdrel.json", me, "some/relative/path")
         with open(os.path.join(self.tmp, "inf.json"), "w") as f:
             f.write('{"kind": "interactive", "pid": Infinity, "cwd": "/a"}')
         with open(os.path.join(self.tmp, "absent.json"), "w") as f:
@@ -898,6 +909,19 @@ class OverviewTests(unittest.TestCase):
                                            "cooldownUntil": time.time() + 900}})
         self.assertIn("配置：缺失", out)
         self.assertIn("冷却 1 个", out)
+
+    def test_non_int_numeric_fields_alert_instead_of_crashing(self):
+        # 手改 config 把 leadSeconds 写成字符串：launchd 入口以退出码 2
+        # 失败，总览不能在 timedelta(seconds=...) 处 traceback，要像损坏
+        # 配置一样给出「需要留意」，页面其余部分照常。
+        write_json(self.cfg_path,
+                   {"roots": [self.tmp], "maxDepth": 3,
+                    "intervalSeconds": 300, "leadSeconds": "600"})
+        out = self.render()
+        self.assertIn("leadSeconds", out)
+        self.assertIn("应为整数秒", out)
+        self.assertIn("需要留意", out)
+        self.assertIn("会话：", out)
 
     def test_live_sessions_show_pid_and_dead_entries_are_counted(self):
         # 会话明细行并入总览后，pid 与失效条目计数是它独有的信息。

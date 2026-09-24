@@ -416,7 +416,8 @@ def read_tasks(ws):
     # the shape rather than trusting it. Anything unexpected reads as "no
     # tasks here" instead of raising into the patrol loop.
     try:
-        with open(os.path.join(ws, TASK_REL)) as f:
+        # encoding 同 load_task_doc：不依赖 locale 的首选编码读中文 prompt
+        with open(os.path.join(ws, TASK_REL), encoding="utf-8") as f:
             doc = json.load(f)
     except (OSError, ValueError):
         return None
@@ -546,7 +547,8 @@ def scan_sessions():
     interactive = []
     for f in files:
         try:
-            with open(f) as fh:
+            # 登记是 Claude Code 以 UTF-8 写的，显式指定（同 load_task_doc）
+            with open(f, encoding="utf-8") as fh:
                 s = json.load(fh)
         except (OSError, ValueError):
             continue
@@ -572,9 +574,15 @@ def scan_sessions():
         if pid not in comm_cache:
             comm_cache[pid] = _pid_comm_is_claude(pid)  # one ps per pid
         if comm_cache[pid]:
-            cwd = os.path.realpath(s.get("cwd") or "")
-            if cwd:
-                consumers.add(cwd)
+            # cwd 同样不可信：非字符串（登记格式变更、文件损坏）当
+            # 「定位不到工作区」处理，不给 realpath 抛 TypeError 的机会；
+            # 空串与相对路径也不行——realpath 会拿巡检进程自己的 cwd
+            # 拼出一个不存在的「消费者」目录，可能令预热被静默跳过。
+            cwd = s.get("cwd")
+            if isinstance(cwd, str) and os.path.isabs(cwd):
+                cwd = os.path.realpath(cwd)
+                if cwd:
+                    consumers.add(cwd)
         else:
             live_other += 1
 
@@ -607,8 +615,9 @@ def normalize_roots(roots):
     # like "--roots ~/a,~/b" arrives as "/home/u/a,~/b" — the second entry
     # keeps its tilde. Normalise on both read and write so config always stores
     # plain absolute paths regardless of how the shell mangled the input.
+    # 非字符串元素（手改 config 混入数字等）跳过，不在 .strip() 上崩掉。
     return [os.path.abspath(os.path.expanduser(r.strip()))
-            for r in roots if r and r.strip()]
+            for r in roots if isinstance(r, str) and r.strip()]
 
 
 def load_config(path=CONFIG_PATH, missing_ok=False, corrupt_ok=False):
@@ -1203,6 +1212,17 @@ def cmd_overview(args):
         pass
     except ValueError as e:
         cfg_error = e
+    # 数值字段被手改成非整数（如 "600"）：巡检入口会以退出码 2 失败，
+    # 总览若不先挡下，自己会在 timedelta(seconds=...) 处 traceback。
+    # 判定式与 cmd_run 的守卫保持一致。
+    bad_fields = []
+    if cfg is not None:
+        if not isinstance(cfg.get("intervalSeconds"), int) \
+                or cfg["intervalSeconds"] <= 0:
+            bad_fields.append("intervalSeconds")
+        if not isinstance(cfg.get("leadSeconds"), int) \
+                or cfg["leadSeconds"] < 0:
+            bad_fields.append("leadSeconds")
 
     info = launchctl_info()
     print(service_line(info, os.path.exists(PLIST_PATH)))
@@ -1225,6 +1245,11 @@ def cmd_overview(args):
                       f"解析错误：{cfg_error}")
     elif cfg is None:
         print("配置：缺失，运行 doorman install 生成")
+    elif bad_fields:
+        vals = "、".join(f"{k}={cfg[k]!r}" for k in bad_fields)
+        print(f"配置：{'、'.join(bad_fields)} 应为整数秒，当前 {vals}")
+        alerts.append(f"配置字段类型不对（{vals}），请修复 {cfg_path}；"
+                      f"leadSeconds 不对时每轮巡检都会以退出码 2 失败")
     else:
         actual_iv = info.get("interval") if info else None
         renew_tag = "，自动续期开" if cfg.get("autoRenew") else "，自动续期关"
