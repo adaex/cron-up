@@ -11,6 +11,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import tempfile
 import time
 import unittest
@@ -785,6 +786,19 @@ class ListTests(unittest.TestCase):
                     d.disp_width(line), width,
                     f"{width} 列下溢出：{line!r}")
 
+    def test_permanent_recurring_is_labeled(self):
+        out = self.render([
+            {"cron": "5 0 * * *", "recurring": True, "permanent": True,
+             "prompt": "长期任务"},
+            {"cron": "0 10 * * 0", "recurring": True,
+             "prompt": "普通周期任务"},
+        ])
+        self.assertIn("周期·永久", out)
+        self.assertIn("普通周期任务", out)
+        # Widening the kind column to fit「周期·永久」must not overflow.
+        for line in out.splitlines():
+            self.assertLessEqual(d.disp_width(line), d.terminal_width())
+
 
 class OverviewTests(unittest.TestCase):
     """The bare `doorman` overview: inventory plus actionable alerts."""
@@ -1027,6 +1041,263 @@ class InstallArgTests(unittest.TestCase):
         self.assertEqual(len(seen), 1)
         self.assertEqual(seen[0][1], os.path.getsize(os.path.abspath(BIN)))
         self.assertTrue(os.access(d.BIN_PATH, os.X_OK))
+
+    def test_auto_renew_flags_set_the_value(self):
+        self.assertIs(self.install(auto_renew=True)["autoRenew"], True)
+        self.assertIs(self.install(auto_renew=False)["autoRenew"], False)
+
+    def test_omitted_auto_renew_flag_preserves_existing_value(self):
+        self.install(auto_renew=False)
+        self.assertIs(self.install()["autoRenew"], False)
+
+    def test_legacy_config_without_the_key_defaults_on(self):
+        # Upgrade path: a config written before autoRenew existed inherits the
+        # default, so the first post-upgrade patrol tags existing recurring
+        # tasks — the intended "renew on upgrade" behaviour.
+        write_json(d.CONFIG_PATH, {"roots": [self.tmp], "maxDepth": 2,
+                                   "intervalSeconds": 300, "leadSeconds": 600})
+        self.assertIs(d.load_config(d.CONFIG_PATH)["autoRenew"], True)
+
+    def test_non_bool_auto_renew_is_coerced_to_default(self):
+        write_json(d.CONFIG_PATH, {"roots": [self.tmp], "maxDepth": 2,
+                                   "intervalSeconds": 300, "leadSeconds": 600,
+                                   "autoRenew": "yes"})
+        self.assertIs(d.load_config(d.CONFIG_PATH)["autoRenew"], True)
+
+
+class RenewTests(unittest.TestCase):
+    """renew_workspace tags recurring tasks permanent: atomically, exactly
+    once, and without disturbing anything else in the file."""
+
+    RECURRING = {
+        "id": "abc", "cron": "0 5 * * *",
+        "prompt": "kaboo 上报，结果通过木偶发到群里",
+        "createdAt": 1790150238473, "recurring": True,
+        "createdBySessionId": "sess-1", "lastFiredAt": 1790166600547,
+    }
+
+    def setUp(self):
+        self.ws = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.ws, ignore_errors=True)
+        self.dir = os.path.join(self.ws, ".claude")
+        os.makedirs(self.dir)
+        self.path = os.path.join(self.dir, "scheduled_tasks.json")
+
+    def put(self, doc, mode=None):
+        with open(self.path, "w") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        if mode is not None:
+            os.chmod(self.path, mode)
+
+    def raw(self):
+        with open(self.path) as f:
+            return f.read()
+
+    def test_tags_recurring_and_preserves_everything_else(self):
+        self.put({"tasks": [dict(self.RECURRING)], "version": 7})
+        self.assertEqual(d.renew_workspace(self.path), 1)
+        doc = read_json(self.path)
+        task = doc["tasks"][0]
+        self.assertIs(task["permanent"], True)
+        for key, value in self.RECURRING.items():
+            self.assertEqual(task[key], value)  # no other field touched
+        self.assertEqual(doc["version"], 7)     # unknown top-level key kept
+
+    def test_chinese_prompt_is_written_literally(self):
+        self.put({"tasks": [dict(self.RECURRING)]})
+        d.renew_workspace(self.path)
+        text = self.raw()
+        self.assertIn("群里", text)
+        self.assertNotIn("\\u", text)
+
+    def test_second_run_is_a_byte_for_byte_noop(self):
+        self.put({"tasks": [dict(self.RECURRING)]})
+        self.assertEqual(d.renew_workspace(self.path), 1)
+        first = os.stat(self.path)
+        self.assertEqual(d.renew_workspace(self.path), 0)
+        second = os.stat(self.path)
+        # Returning 0 must not even open the file for writing: same inode and
+        # mtime prove the 5-minute patrol will not rewrite it for ever.
+        self.assertEqual((first.st_ino, first.st_mtime_ns),
+                         (second.st_ino, second.st_mtime_ns))
+
+    def test_only_explicit_recurring_tasks_are_eligible(self):
+        self.put({"tasks": [
+            dict(self.RECURRING),
+            {**dict(self.RECURRING), "id": "already", "permanent": True},
+            {"id": "oneshot", "cron": "0 9 1 1 *", "createdAt": 1,
+             "recurring": False},
+            {"id": "flagless", "cron": "0 9 * * *", "createdAt": 1},
+        ]})
+        self.assertEqual(d.renew_workspace(self.path), 1)
+        tasks = read_json(self.path)["tasks"]
+        self.assertIs(tasks[0]["permanent"], True)
+        self.assertIs(tasks[1]["permanent"], True)
+        self.assertNotIn("permanent", tasks[2])
+        self.assertNotIn("permanent", tasks[3])
+
+    def test_any_truthy_permanent_is_already_exempt(self):
+        for flag in (True, "yes", 1):
+            with self.subTest(flag=flag):
+                self.put({"tasks": [{**dict(self.RECURRING),
+                                     "permanent": flag}]})
+                before = self.raw()
+                self.assertEqual(d.renew_workspace(self.path), 0)
+                self.assertEqual(before, self.raw())
+
+    def test_malformed_documents_return_none_untouched(self):
+        for text in ("{ broken", '{"tasks": "x"}', "[]", "null"):
+            with self.subTest(text=text):
+                with open(self.path, "w") as f:
+                    f.write(text)
+                before = self.raw()
+                self.assertIsNone(d.renew_workspace(self.path))
+                self.assertEqual(before, self.raw())
+
+    def test_missing_file_returns_none(self):
+        # setUp creates the .claude dir but never the task file.
+        self.assertIsNone(d.renew_workspace(self.path))
+
+    def test_nondict_entries_and_unknown_keys_survive(self):
+        self.put({"tasks": [dict(self.RECURRING), "junk", None, 5],
+                  "extraTop": {"nested": True}})
+        d.renew_workspace(self.path)
+        doc = read_json(self.path)
+        self.assertEqual(doc["extraTop"], {"nested": True})
+        self.assertEqual(doc["tasks"][1:], ["junk", None, 5])
+
+    def test_file_mode_is_preserved(self):
+        for mode in (0o600, 0o640, 0o644):
+            with self.subTest(mode=oct(mode)):
+                self.put({"tasks": [dict(self.RECURRING)]}, mode=mode)
+                d.renew_workspace(self.path)
+                self.assertEqual(stat.S_IMODE(os.stat(self.path).st_mode),
+                                 mode)
+
+    def test_atomic_write_refuses_a_stale_mtime(self):
+        self.put({"tasks": [dict(self.RECURRING)]})
+        stale_mtime = os.stat(self.path).st_mtime_ns
+        with open(self.path, "w", encoding="utf-8") as f:
+            json.dump({"tasks": []}, f)  # Claude Code's newer write
+        with self.assertRaises(d.TaskFileChanged):
+            d.atomic_write_json(self.path, {"tasks": [{"x": 1}]},
+                                stale_mtime)
+        self.assertEqual(read_json(self.path)["tasks"], [])
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_concurrent_change_mid_update_is_not_clobbered(self):
+        self.put({"tasks": [dict(self.RECURRING)]})
+        orig_load = d.load_task_doc
+
+        def racy(path):
+            doc = orig_load(path)
+            # Simulate Claude Code committing an update after doorman read the
+            # document but before it writes its tag back.
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({"tasks": [{"id": "cc-wins"}]}, f)
+            return doc
+
+        d.load_task_doc = racy
+        self.addCleanup(setattr, d, "load_task_doc", orig_load)
+        self.assertEqual(d.renew_workspace(self.path), "changed")
+        # The REPL's newer document survives; no .tmp is left behind.
+        self.assertEqual(read_json(self.path),
+                         {"tasks": [{"id": "cc-wins"}]})
+        self.assertFalse(os.path.exists(self.path + ".tmp"))
+
+    def test_task_view_exposes_the_permanent_flag(self):
+        base = {"cron": "5 0 * * *", "prompt": "x", "createdAt": 0}
+        self.assertTrue(d.task_view({**base, "recurring": True,
+                                     "permanent": True}, NOW)["permanent"])
+        self.assertFalse(d.task_view({**base, "recurring": True},
+                                     NOW)["permanent"])
+        # A one-shot carrying the field is not reported as a permanent
+        # recurring job — permanent only modifies the recurring kind.
+        self.assertFalse(d.task_view({**base, "recurring": False,
+                                      "permanent": True}, NOW)["permanent"])
+
+
+class RunRenewTests(unittest.TestCase):
+    """autoRenew wires renewal into cmd_run; cmd_renew works on its own."""
+
+    FAR = "0 0 1 1 *"  # Jan 1st: nothing fires within a September 7-day window
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "root")
+        os.makedirs(self.root)
+        self.cfg_path = os.path.join(self.tmp, "config.json")
+        for name in ("STATE_PATH", "scan_sessions", "acquire_run_lock",
+                     "rotate_patrol_logs"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.STATE_PATH = os.path.join(self.tmp, "state.json")
+        d.scan_sessions = lambda: (set(), None)
+        d.acquire_run_lock = lambda: 1
+        d.rotate_patrol_logs = lambda: None
+
+    def make_ws(self, name, doc):
+        ws = os.path.join(self.root, name)
+        os.makedirs(os.path.join(ws, ".claude"))
+        path = os.path.join(ws, ".claude", "scheduled_tasks.json")
+        with open(path, "w") as f:
+            json.dump(doc, f, ensure_ascii=False)
+        return path
+
+    def write_cfg(self, auto_renew):
+        write_json(self.cfg_path,
+                   {"roots": [self.root], "maxDepth": 3,
+                    "intervalSeconds": 300, "leadSeconds": 600,
+                    "autoRenew": auto_renew})
+
+    def read(self, path):
+        with open(path) as f:
+            return f.read()
+
+    def recurring(self, task_id="a"):
+        return {"id": task_id, "cron": self.FAR, "recurring": True,
+                "prompt": "周期任务", "createdAt": 1790000000000}
+
+    def run_cmd(self, func):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            func(argparse.Namespace(config=self.cfg_path))
+        return buf.getvalue()
+
+    def test_patrol_tags_when_auto_renew_enabled(self):
+        path = self.make_ws("a", {"tasks": [self.recurring()]})
+        self.write_cfg(True)
+        self.run_cmd(d.cmd_run)
+        self.assertIs(read_json(path)["tasks"][0]["permanent"], True)
+
+    def test_patrol_leaves_the_file_untouched_when_disabled(self):
+        path = self.make_ws("a", {"tasks": [self.recurring()]})
+        self.write_cfg(False)
+        before = self.read(path)
+        self.run_cmd(d.cmd_run)
+        self.assertEqual(before, self.read(path))
+
+    def test_manual_renew_tags_all_regardless_of_the_flag(self):
+        p1 = self.make_ws("a", {"tasks": [self.recurring("a")]})
+        p2 = self.make_ws("b", {"tasks": [
+            {**self.recurring("b"), "permanent": True}]})
+        p3 = self.make_ws("c", None)  # "null": malformed → skipped
+        self.write_cfg(False)          # explicit renew ignores autoRenew
+        out = self.run_cmd(d.cmd_renew)
+        self.assertIs(read_json(p1)["tasks"][0]["permanent"], True)
+        self.assertIn("已续期", out)
+        self.assertIn("已是最新", out)
+        self.assertIn("跳过", out)
+        self.assertIn("本次续期 1 个任务", out)
+        self.assertEqual(self.read(p3), "null")
+
+    def test_manual_renew_waits_its_turn_when_locked(self):
+        d.acquire_run_lock = lambda: None
+        path = self.make_ws("a", {"tasks": [self.recurring()]})
+        before = self.read(path)
+        out = self.run_cmd(d.cmd_renew)
+        self.assertEqual(before, self.read(path))
+        self.assertIn("稍后重试", out)
 
 
 if __name__ == "__main__":

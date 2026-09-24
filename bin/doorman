@@ -12,6 +12,7 @@ Subcommands:
   status      show launchd registration, config and standby sessions
   list        list every task: next fire, cadence, prompt summary, consumer
   run         one patrol round (invoked by launchd every interval)
+  renew       mark recurring tasks permanent so they never hit the 7-day expiry
   logs        tail doorman or a session's TUI log
 
 With no subcommand it prints a Chinese at-a-glance overview (service,
@@ -29,6 +30,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -54,6 +56,13 @@ DEFAULT_CONFIG = {
     "maxDepth": 2,
     "intervalSeconds": 300,
     "leadSeconds": 600,
+    # During each patrol, mark recurring tasks "permanent" in their task file
+    # so Claude Code's 7-day recurring-task expiry never deletes them. Because
+    # load_config fills missing keys from these defaults, the first patrol
+    # after install OR UPGRADE (configs written before this key existed) tags
+    # every existing recurring task. Disable with autoRenew=false in the
+    # config (takes effect next round) or `install --force --no-auto-renew`.
+    "autoRenew": True,
 }
 
 # A warm session that dies while still needed, three times in a row, is
@@ -341,11 +350,13 @@ def task_view(task, now):
     try:
         cron = Cron(expr)
     except (ValueError, IndexError, KeyError, AttributeError, TypeError):
-        return {"valid": False, "expr": expr, "summary": task_summary(task)}
+        return {"valid": False, "expr": expr, "summary": task_summary(task),
+                "permanent": False}
     if not cron.satisfiable:
         # Empty field set (out-of-range or backwards range): no minute can
         # ever match. Distinct from "valid but no fire within 7 days".
-        return {"valid": False, "expr": expr, "summary": task_summary(task)}
+        return {"valid": False, "expr": expr, "summary": task_summary(task),
+                "permanent": False}
     nxt = cron.next_after(now)
     oneshot = task_is_oneshot(task)
     missed = (oneshot and task_wanted(task, now, ZERO_LEAD)
@@ -354,6 +365,7 @@ def task_view(task, now):
     return {
         "valid": True, "nxt": nxt, "missed": missed,
         "kind": "一次性" if oneshot else "周期",
+        "permanent": bool(task.get("permanent")) and not oneshot,
         "cadence": "单次" if oneshot else humanize_cron(cron, expr_s),
         "summary": task_summary(task),
     }
@@ -451,6 +463,99 @@ def read_tasks(ws):
     if not isinstance(tasks, list):
         return None
     return [t for t in tasks if isinstance(t, dict)]
+
+
+class TaskFileChanged(Exception):
+    """The task file changed between doorman's read and its write: another
+    writer (the Claude Code REPL updating lastFiredAt or deleting a fired
+    task) committed first. Never clobber that — drop our rewrite and let the
+    next patrol retry on the newer document."""
+
+
+def load_task_doc(path):
+    """Read a task file and return its WHOLE document (unknown top-level keys
+    preserved), or None when missing/unreadable/malformed. renew rewrites the
+    file in place, so unlike read_tasks it must round-trip every key Claude
+    Code or another tool put there, not just the tasks subset."""
+    try:
+        # Explicit utf-8: launchd spawns us with a minimal environment, and we
+        # must not depend on the locale's preferred encoding for user prompts.
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("tasks"), list):
+        return None
+    return doc
+
+
+def atomic_write_json(path, doc, expected_mtime_ns):
+    """Replace `path` atomically, preserving its mode and literal non-ASCII.
+
+    Beside-then-rename: the Claude Code REPL watches this file, and a reader
+    must never observe a half-written document. Unlike save_config this keeps
+    the original file's permission bits (it is user data doorman does not own)
+    and writes Chinese prompts literally rather than as \\u escapes.
+
+    The temp file is created 0600 (never wider) and only relaxed to the
+    original mode after writing. expected_mtime_ns is an optimistic-lock: if
+    the path's mtime moved since the caller read it, another writer won the
+    race, so TaskFileChanged is raised instead of overwriting its update.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        mode = 0o600
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8",
+              opener=lambda p, flags: os.open(p, flags, 0o600)) as f:
+        json.dump(doc, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fchmod(f.fileno(), mode)
+    try:
+        current = os.stat(path).st_mtime_ns
+    except OSError:
+        current = None
+    if current != expected_mtime_ns:
+        os.unlink(tmp)
+        raise TaskFileChanged(path)
+    os.replace(tmp, path)
+
+
+def renew_workspace(taskfile):
+    """Tag every recurring task that lacks a truthy "permanent" flag.
+
+    Returns the number tagged (file rewritten once), 0 when the file is
+    already fully tagged (left byte-for-byte untouched — the idempotency that
+    keeps a 5-minute patrol from rewriting another program's file forever),
+    None when the file is unreadable/malformed, or "changed" when another
+    writer modified it mid-update (rewrite dropped; next patrol retries).
+    One-shots and flagless hand-authored files are never modified.
+    """
+    try:
+        mtime_ns = os.stat(taskfile).st_mtime_ns
+    except OSError:
+        return None
+    doc = load_task_doc(taskfile)
+    if doc is None:
+        return None
+    tagged = 0
+    for t in doc["tasks"]:
+        # Truthiness, not `is True`: that matches Claude Code's own loader
+        # (...o.permanent && {permanent:true}), so anything it already treats
+        # as permanent counts and is not rewritten. Only an explicitly
+        # recurring task is eligible — periodicity is never inferred from cron
+        # shape here, and one-shots are left alone.
+        if isinstance(t, dict) and t.get("recurring") and not t.get("permanent"):
+            t["permanent"] = True
+            tagged += 1
+    if tagged == 0:
+        return 0
+    try:
+        atomic_write_json(taskfile, doc, mtime_ns)
+    except TaskFileChanged:
+        return "changed"
+    return tagged
 
 
 def _pid_comm_is_claude(pid):
@@ -567,6 +672,8 @@ def load_config(path=CONFIG_PATH, missing_ok=False, corrupt_ok=False):
     merged["roots"] = normalize_roots(merged["roots"])
     if not isinstance(merged.get("maxDepth"), int) or merged["maxDepth"] < 0:
         merged["maxDepth"] = DEFAULT_CONFIG["maxDepth"]
+    if not isinstance(merged.get("autoRenew"), bool):
+        merged["autoRenew"] = DEFAULT_CONFIG["autoRenew"]
     return merged
 
 
@@ -758,9 +865,23 @@ def cmd_run(args):
     if registry_alert:
         log(f"告警：{registry_alert}")
 
-    for ws, _taskfile in discover(cfg["roots"], cfg["maxDepth"]):
+    auto_renew = cfg.get("autoRenew")
+    for ws, taskfile in discover(cfg["roots"], cfg["maxDepth"]):
         # One unreadable workspace must not abort the patrol: discover() is a
         # generator, so an exception here would skip every workspace after it.
+        # Renewal and warming are independently guarded — a failure to tag a
+        # task file must never suppress that workspace's session keep-alive.
+        if auto_renew:
+            try:
+                n = renew_workspace(taskfile)
+                if isinstance(n, int) and n:
+                    log(f"已续期 {ws}：{n} 个周期任务标记为 permanent，"
+                        f"不再受 7 天过期限制")
+                elif n == "changed":
+                    log(f"续期暂缓 {ws}：任务文件刚被 Claude Code 改动，"
+                        f"本轮不覆盖，下轮再续")
+            except Exception as e:  # noqa: BLE001 — never block the patrol
+                log(f"续期错误 {ws}：{type(e).__name__}：{e}")
         try:
             patrol_workspace(ws, state, now, lead, cur, consumers)
         except Exception as e:  # noqa: BLE001 — last-resort per-workspace guard
@@ -851,6 +972,52 @@ def patrol_workspace(ws, state, now, lead, cur, consumers):
     log(f"已启动 {ws} pid={pid}（连续失败计数 {fails}）")
 
 
+def cmd_renew(args):
+    """Tag every recurring task permanent immediately.
+
+    Unlike the patrol hook this ignores cfg.autoRenew — running the command is
+    itself the explicit instruction. It shares the patrol lock so it cannot
+    rewrite a task file while a patrol is mid-flight, reports each workspace,
+    and ends with one summary line.
+    """
+    lock_fd = acquire_run_lock()
+    if lock_fd is None:
+        log("已有一轮巡检（或另一次 renew）在进行，请稍后重试")
+        return
+    cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
+    files = tagged = unchanged = 0
+    skipped = []
+    for ws, taskfile in discover(cfg["roots"], cfg["maxDepth"]):
+        files += 1
+        err = None
+        try:
+            n = renew_workspace(taskfile)
+        except Exception as e:  # noqa: BLE001 — one bad file never aborts the run
+            n, err = None, f"{type(e).__name__}：{e}"
+        if n is None:
+            why = f"（{err}）" if err else "任务文件读不出或格式损坏"
+            print(f"跳过 {ws}：{why}")
+            skipped.append(ws)
+        elif n == "changed":
+            print(f"暂缓 {ws}：任务文件刚被 Claude Code 改动，本次未写入，"
+                  f"可再跑一次")
+            skipped.append(ws)
+        elif n:
+            tagged += n
+            print(f"已续期 {ws}：{n} 个周期任务标记为 permanent")
+        else:
+            unchanged += 1
+            print(f"已是最新 {ws}：周期任务均已 permanent，无需改动")
+    print()
+    line = (f"扫描 {files} 个任务文件：本次续期 {tagged} 个任务，"
+            f"{unchanged} 个文件无需改动")
+    if skipped:
+        line += f"，{len(skipped)} 个跳过"
+    print(line)
+    if tagged:
+        print("这些周期任务此后不再受 7 天过期限制；为它们保活的后台会话会长期常驻。")
+
+
 # --------------------------------------------------------------- install ----
 
 def render_plist(interval):
@@ -925,6 +1092,11 @@ def cmd_install(args):
             overrides["intervalSeconds"] = args.interval
         if args.lead is not None:
             overrides["leadSeconds"] = args.lead
+        # getattr: a hand-built Namespace (tests, older callers) may omit it.
+        # `is not None` so --no-auto-renew (False) is not dropped like a falsy
+        # value would be.
+        if getattr(args, "auto_renew", None) is not None:
+            overrides["autoRenew"] = args.auto_renew
         cfg.update(overrides)
         cfg["roots"] = normalize_roots(cfg.get("roots", []))
         save_config(cfg)
@@ -1070,6 +1242,8 @@ def cmd_status(args):
         else:
             print(f"巡检间隔：{cfg['intervalSeconds']} 秒（服务未加载）  "
                   f"提前量：{cfg['leadSeconds']} 秒")
+        print(f"自动续期：{'开' if cfg.get('autoRenew') else '关'}"
+              f"（巡检时自动给周期任务补 permanent，以跳过 7 天过期）")
         validate_config(cfg, announce=lambda m: print(m))
 
     state = load_state()
@@ -1135,12 +1309,14 @@ def cmd_overview(args):
         print("配置：缺失，运行 doorman install 生成")
     else:
         actual_iv = info.get("interval") if info else None
+        renew_tag = "，自动续期开" if cfg.get("autoRenew") else "，自动续期关"
         if actual_iv is None:
             print(f"巡检：配置为每 {cfg['intervalSeconds']} 秒一轮"
-                  f"（服务未加载），提前 {cfg['leadSeconds']} 秒启动会话")
+                  f"（服务未加载），提前 {cfg['leadSeconds']} 秒启动会话"
+                  f"{renew_tag}")
         else:
             print(f"巡检：每 {actual_iv} 秒一轮，"
-                  f"提前 {cfg['leadSeconds']} 秒启动会话")
+                  f"提前 {cfg['leadSeconds']} 秒启动会话{renew_tag}")
             if actual_iv != cfg["intervalSeconds"]:
                 alerts.append(
                     f"launchd 实际间隔 {actual_iv} 秒与配置 "
@@ -1173,6 +1349,7 @@ def cmd_overview(args):
         ("status", "查看服务、配置与保活会话的完整状态"),
         ("logs [目录片段] [-f]", "查看巡检日志或后台会话记录"),
         ("run", "立即手动巡检一轮"),
+        ("renew", "立即给所有周期任务补 permanent（跳过 7 天过期）"),
         ("install --force", "更新配置并重新安装（全部参数见 --help）"),
     ]
     name_w = max(disp_width(n) for n, _ in commands)
@@ -1189,7 +1366,7 @@ def _overview_tasks(cfg, cols, consumers, state):
     cur = int(now.timestamp())
     lead = datetime.timedelta(seconds=cfg["leadSeconds"])
 
-    n_ws = n_tasks = 0
+    n_ws = n_tasks = unrenewed = 0
     soonest = None
     for ws, _ in discover(cfg["roots"], cfg["maxDepth"]):
         try:
@@ -1202,6 +1379,12 @@ def _overview_tasks(cfg, cols, consumers, state):
         n_tasks += len(tasks)
         bad, wanted = 0, False
         for t in tasks:
+            # Same field-level rule renew_workspace uses: an explicitly
+            # recurring task without a truthy permanent flag is still bound by
+            # the 7-day expiry. Counted from the raw task, independent of cron
+            # validity, so a bad-cron entry still gets the reminder.
+            if t.get("recurring") and not t.get("permanent"):
+                unrenewed += 1
             v = task_view(t, now)
             if not v["valid"]:
                 bad += 1
@@ -1237,6 +1420,11 @@ def _overview_tasks(cfg, cols, consumers, state):
         line = (f"最近：{nxt:%m-%d %H:%M}（{human_delta(nxt - now)}） "
                 f"{os.path.basename(ws)} · {summary}")
         print(clip(line, cols))
+    if not cfg.get("autoRenew") and unrenewed:
+        alerts.append(
+            f"自动续期已关闭：{unrenewed} 个周期任务尚未标记 permanent，"
+            f"创建满 7 天后会末次执行并被删除。运行 doorman renew 立即续期，"
+            f"或在配置中开启 autoRenew")
     return alerts, cooling_warned
 
 
@@ -1302,9 +1490,10 @@ def cmd_list(args):
     blocks.sort(key=lambda b: b[0])
     print(f"共 {len(blocks)} 个工作区、{total} 个定时任务")
 
-    status_w, kind_w, cad_w = 11, 6, 16
+    # kind 列要容下「周期·永久」（9 个等宽列：· 占 1 列），故取 10 而非 6。
+    status_w, kind_w, cad_w = 11, 10, 16
     # "  " + status + "  " + kind + "  " + cadence + "  " + summary，
-    # 固定部分共 41 列；60 列以上的终端每行总宽不超过终端宽度。
+    # 固定部分共 45 列；60 列以上的终端每行总宽不超过终端宽度。
     summary_w = max(12,
                     cols - (2 + status_w + 2 + kind_w + 2 + cad_w + 2))
     for ws, consumer, views in blocks:
@@ -1318,13 +1507,14 @@ def cmd_list(args):
                 summary = f"原字段值：{v['expr']!r}；{v['summary']}"
             elif v["missed"]:
                 # 一次性任务的触发点已过：下次会话启动时会补执行一次。
-                status, kind, cadence, summary = (
-                    "已错过", v["kind"], v["cadence"], v["summary"])
+                status, cadence, summary = (
+                    "已错过", v["cadence"], v["summary"])
+                kind = "周期·永久" if v["permanent"] else v["kind"]
             else:
                 status = v["nxt"].strftime("%m-%d %H:%M") if v["nxt"] \
                     else "无安排"
-                kind, cadence, summary = (
-                    v["kind"], v["cadence"], v["summary"])
+                cadence, summary = v["cadence"], v["summary"]
+                kind = "周期·永久" if v["permanent"] else v["kind"]
             print("  " + pad(status, status_w) + "  " + pad(kind, kind_w)
                   + "  " + pad(clip(cadence, cad_w), cad_w) + "  "
                   + clip(summary, summary_w))
@@ -1393,6 +1583,10 @@ def main():
     p.add_argument("--lead", type=int, help="提前启动会话的时间（秒）")
     p.add_argument("--force", action="store_true",
                    help="覆盖已有配置")
+    p.add_argument("--auto-renew", action=argparse.BooleanOptionalAction,
+                   default=None,
+                   help="巡检时自动给周期任务补 permanent 以跳过 7 天过期"
+                        "（默认开，用 --no-auto-renew 关闭；改它需配合 --force）")
     p.set_defaults(func=cmd_install)
 
     p = sub.add_parser("uninstall", help="卸载 LaunchAgent")
@@ -1407,6 +1601,9 @@ def main():
     sub.add_parser("list",
                    help="逐个列出定时任务及其下次执行时间").set_defaults(func=cmd_list)
     sub.add_parser("run", help="执行一轮巡检（launchd 入口）").set_defaults(func=cmd_run)
+    sub.add_parser("renew",
+                   help="立即给所有周期任务补 permanent（跳过 7 天过期）"
+                   ).set_defaults(func=cmd_renew)
     p = sub.add_parser("logs", help="查看巡检日志或后台会话记录")
     p.add_argument("-f", "--follow", action="store_true",
                    help="实时跟踪日志")
