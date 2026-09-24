@@ -938,6 +938,13 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("已运行 10 分钟", out)
         self.assertIn("已失效 1 个", out)
 
+    def test_hand_edited_state_types_render_without_crashing(self):
+        # 总览页的会话部分在 per-workspace 保护圈之外：手改 state 的
+        # 数值字段（字符串 pid、字符串 cooldownUntil）不能让它 traceback。
+        out = self.render(state={WS_PATH: {"pid": "123", "fails": 1,
+                                           "cooldownUntil": "abc"}})
+        self.assertIn("会话：", out)
+
 
 class StateFileTests(unittest.TestCase):
     """load_state must survive a damaged file: it feeds the launchd path."""
@@ -961,6 +968,32 @@ class StateFileTests(unittest.TestCase):
     def test_non_dict_entries_are_dropped(self):
         self.write('{"/a": {"pid": 1}, "/b": "junk", "/c": null}')
         self.assertEqual(d.load_state(), {"/a": {"pid": 1}})
+
+    def test_hand_edited_numeric_fields_cannot_crash_the_patrol(self):
+        # 手改 state 写进字符串/浮点/负数/超大整数：数值字段在 load_state
+        # 入口整型化并校验范围，否则 tracked_alive 的 waitpid/killpg 抛
+        # TypeError、cooldownUntil 与 now 的比较抛 TypeError——而这两处
+        # （cmd_run 的收尾过滤、总览页）都在 per-workspace 保护圈之外。
+        # 负数 pid 还会被 waitpid/killpg 当成进程组号，可能误伤无辜进程。
+        self.write('{"/a": {"pid": "123", "startedAt": "456", '
+                   '"cooldownUntil": "789", "fails": 2}, '
+                   '"/b": {"pid": [1], "fails": 1, "cooldownUntil": "abc"}, '
+                   '"/c": {"pid": -5}, '
+                   '"/d": {"pid": 100000000000000000000}, '
+                   '"/e": {"pid": 1.5}}')
+        st = d.load_state()
+        cur = int(time.time())
+        for ent in st.values():
+            d.tracked_alive(ent)  # 保护圈之外的真实调用点，不许抛
+            bool(ent.get("cooldownUntil", 0) > cur)
+        self.assertEqual(st["/a"]["pid"], 123)       # 数字字符串按数值接受
+        self.assertEqual(st["/a"]["startedAt"], 456)
+        self.assertEqual(st["/a"]["cooldownUntil"], 789)
+        self.assertIsNone(st["/b"]["pid"])           # 非数值作废
+        self.assertNotIn("cooldownUntil", st["/b"])  # 坏时间戳按不存在
+        self.assertIsNone(st["/c"]["pid"])           # 负数 pid 无意义
+        self.assertIsNone(st["/d"]["pid"])           # 超出 pid_t
+        self.assertEqual(st["/e"]["pid"], 1)         # 浮点截断（pid 1 必死）
 
     def test_missing_file_reads_as_empty(self):
         self.assertEqual(d.load_state(), {})

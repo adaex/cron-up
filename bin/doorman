@@ -668,7 +668,30 @@ def load_state():
         return {}
     if not isinstance(state, dict):
         return {}
-    return {k: v for k, v in state.items() if isinstance(v, dict)}
+    out = {}
+    for ws, ent in state.items():
+        if not isinstance(ent, dict):
+            continue
+        # 数值字段在入口处整型化并校验范围。cmd_run 的收尾过滤与总览页
+        # 都在 per-workspace 保护圈之外，手改写进字符串/浮点会让
+        # waitpid、killpg 抛 TypeError、让 cooldownUntil 与 now 的比较
+        # 直接 TypeError；负数 pid 还会被 waitpid/killpg 当成进程组号，
+        # 可能误伤无辜进程组。pid_t 是 int32：范围外一律作废；
+        # startedAt/cooldownUntil 解析失败按「字段不存在」。
+        pid = ent.get("pid")
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError, OverflowError):
+            pid = None
+        ent["pid"] = pid if pid and 0 < pid <= 2 ** 31 - 1 else None
+        for k in ("startedAt", "cooldownUntil"):
+            try:
+                if ent.get(k) is not None:
+                    ent[k] = int(ent[k])
+            except (TypeError, ValueError, OverflowError):
+                del ent[k]
+        out[ws] = ent
+    return out
 
 
 def save_state(state):
@@ -774,9 +797,11 @@ def reap(pid):
     zombies — and `kill -0` reports a zombie as alive. Without this, waiting
     for a terminated session to disappear always burns the full timeout.
     """
+    # TypeError/OverflowError：非整数或超出 pid_t 的 pid（load_state 已
+    # 整型化，这里是给其他调用方留的兜底），同样无事可做。
     try:
         os.waitpid(pid, os.WNOHANG)
-    except OSError:
+    except (OSError, TypeError, OverflowError):
         pass  # not our child (e.g. `uninstall` in a fresh process)
 
 
