@@ -110,31 +110,8 @@ class CronSatisfiabilityTests(unittest.TestCase):
         self.assertIsNone(cron.next_after(NOW))
 
 
-class CronHumanizeTests(unittest.TestCase):
-    def h(self, expr):
-        return d.humanize_cron(d.Cron(expr), expr)
-
-    def test_common_shapes(self):
-        self.assertEqual(self.h("5 0 * * *"), "每天 00:05")
-        self.assertEqual(self.h("*/5 * * * *"), "每 5 分钟")
-        self.assertEqual(self.h("0 10 * * 0"), "每周日 10:00")
-        self.assertEqual(self.h("0 9 * * 1-5"),
-                         "每周一、周二、周三、周四、周五 09:00")
-        self.assertEqual(self.h("30 4 1,15 * *"), "每月 1、15 日 04:30")
-        self.assertEqual(self.h("7 * * * *"), "每小时第 7 分")
-
-    def test_complex_or_ambiguous_shapes_are_quoted_raw(self):
-        # DoM 与 DoW 同时受限是 OR 语义，人话必然有歧义，照抄原表达式。
-        self.assertEqual(self.h("0 18 20 * 1"), "cron 0 18 20 * 1")
-        self.assertEqual(self.h("0 0 1 1 *"), "cron 0 0 1 1 *")
-
-    def test_minute_hour_shortcuts_require_unrestricted_dates(self):
-        # 日期/星期/月份受限时，「每 N 分钟」「每小时第 N 分」会丢掉
-        # 日期限定，必须照抄原表达式。
-        self.assertEqual(self.h("*/5 * 1 * *"), "cron */5 * 1 * *")
-        self.assertEqual(self.h("7 * * * 1"), "cron 7 * * * 1")
-        # 非等步长、也不是单点的分钟集合同样照抄。
-        self.assertEqual(self.h("3,33 * * * *"), "cron 3,33 * * * *")
+class DisplayTests(unittest.TestCase):
+    """等宽终端的展示助手：CJK 宽度、截断、补位。"""
 
     def test_display_width_handles_cjk_and_punctuation(self):
         self.assertEqual(d.disp_width("中文："), 6)
@@ -191,7 +168,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
     def test_corrupt_json_can_be_raised_for_human_pages(self):
-        # launchd 入口走默认的 exit(2)；总览/status 选择接住后继续渲染。
+        # launchd 入口走默认的 exit(2)；总览选择接住后继续渲染。
         with tempfile.NamedTemporaryFile("w", suffix=".json",
                                          delete=False) as f:
             f.write("{ not valid json")
@@ -207,8 +184,8 @@ class ValidationTests(unittest.TestCase):
             d.load_config("/nonexistent/doorman-config.json")
         self.assertEqual(ctx.exception.code, 2)
 
-    def test_status_still_sees_a_missing_config_as_absent(self):
-        # `status` reports absence as part of its output, so it opts out.
+    def test_overview_still_sees_a_missing_config_as_absent(self):
+        # The overview reports absence as part of its output, so it opts out.
         with self.assertRaises(OSError):
             d.load_config("/nonexistent/doorman-config.json",
                           missing_ok=True)
@@ -602,6 +579,7 @@ class SessionScanTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.real_alive = d.alive
         for name in ("SESSION_DIR", "alive", "_pid_comm_is_claude"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.SESSION_DIR = self.tmp
@@ -648,6 +626,25 @@ class SessionScanTests(unittest.TestCase):
         consumers, alert = d.scan_sessions()
         self.assertEqual(consumers, set())
         self.assertIsNotNone(alert)
+
+    def test_malformed_pid_entries_are_skipped(self):
+        # 登记文件是外部程序写的，pid 可能缺失、null、非数值、非正数：
+        # 一律当「没有活进程」跳过，也不能计入 live_other 误触登记格式
+        # 告警。必须用真实 alive 复现两个旧坑——pid=null 让 int(None) 抛
+        # TypeError 炸掉整轮巡检（scan_sessions 在 per-workspace 保护圈
+        # 之外）；pid 缺失时兜底的 -1 被 kill(-1, 0)（权限探测）读作存活。
+        d.alive = self.real_alive
+        me = os.getpid()  # 一个确定存活的 pid：健康登记长这样
+        d._pid_comm_is_claude = lambda pid: pid == me
+        self.write_reg("live.json", me, os.path.realpath(self.tmp))
+        self.write_reg("null.json", None, "/a")
+        self.write_reg("neg.json", -1, "/a")
+        self.write_reg("junk.json", "abc", "/a")
+        with open(os.path.join(self.tmp, "absent.json"), "w") as f:
+            json.dump({"kind": "interactive", "cwd": "/a"}, f)
+        consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, {os.path.realpath(self.tmp)})
+        self.assertIsNone(alert)
 
 
 class PatrolLogRotateTests(unittest.TestCase):
@@ -750,8 +747,8 @@ class ListTests(unittest.TestCase):
         self.assertIn("群人数每日定时任务：执行某脚本", out)
         self.assertIn("周报任务：", out)  # 只取首个非空行，剥掉首尾空白
         self.assertNotIn("第二行细节不出现", out)
-        self.assertIn("每天 00:05", out)
-        self.assertIn("每周日 10:00", out)
+        self.assertIn("5 0 * * *", out)
+        self.assertIn("0 10 * * 0", out)
         self.assertIn("周期", out)
         self.assertIn("交互会话：无", out)
 
@@ -896,6 +893,21 @@ class OverviewTests(unittest.TestCase):
                                            "cooldownUntil": time.time() + 900}})
         self.assertIn("配置：缺失", out)
         self.assertIn("冷却 1 个", out)
+
+    def test_live_sessions_show_pid_and_dead_entries_are_counted(self):
+        # 会话明细行并入总览后，pid 与失效条目计数是它独有的信息。
+        me = os.getpid()  # tracked_alive 需要一个真实存活的 pid
+        # startedAt 用整数（巡检写入的就是 int）；630 而非 600：渲染前还
+        # 会流逝几毫秒，浮点边界会让 // 60 落到 9。
+        out = self.render(state={
+            WS_PATH: {"pid": me, "startedAt": int(time.time()) - 630,
+                      "procStart": None},
+            "/gone": {"pid": None, "fails": 1},
+        })
+        self.assertIn("保活 1 个", out)
+        self.assertIn(f"pid {me}", out)
+        self.assertIn("已运行 10 分钟", out)
+        self.assertIn("已失效 1 个", out)
 
 
 class StateFileTests(unittest.TestCase):

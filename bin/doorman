@@ -9,14 +9,14 @@ workspace. It never executes tasks itself — it only opens the door.
 Subcommands:
   install     install binary, config and LaunchAgent
   uninstall   remove LaunchAgent (optionally purge everything)
-  status      show launchd registration, config and standby sessions
   list        list every task: next fire, cadence, prompt summary, consumer
   run         one patrol round (invoked by launchd every interval)
   renew       mark recurring tasks permanent so they never hit the 7-day expiry
   logs        tail doorman or a session's TUI log
 
 With no subcommand it prints a Chinese at-a-glance overview (service,
-tasks, warm sessions, alerts) rather than argparse's bare usage error.
+config, tasks, warm sessions, alerts) rather than argparse's bare usage
+error.
 """
 
 import argparse
@@ -248,45 +248,6 @@ def task_wanted(task, now, lead):
 
 # --------------------------------------------------------------- display ----
 
-WEEKDAY_NAMES = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"]
-
-
-def _step_of(values, lo, hi):
-    """步长：values 恰好是从 lo 起步、等步长铺满范围的等差数列。"""
-    seq = sorted(values)
-    if len(seq) < 2 or seq[0] != lo:
-        return None
-    step = seq[1] - seq[0]
-    return step if step > 0 and seq == list(range(lo, hi + 1, step)) else None
-
-
-def humanize_cron(cron, expr):
-    """把常见 cron 形态说成中文节奏；复杂形态照抄原表达式，不猜。"""
-    full_dom = cron.doms == set(range(1, 32))
-    full_mon = cron.months == set(range(1, 13))
-    full_dow = cron.dows == set(range(7))
-    all_days = full_dom and full_mon and full_dow
-    if all_days and cron.hours == set(range(24)):
-        step = _step_of(cron.minutes, 0, 59)
-        if step:
-            return f"每 {step} 分钟"
-        if len(cron.minutes) == 1:
-            return f"每小时第 {next(iter(cron.minutes))} 分"
-    if len(cron.minutes) == 1 and len(cron.hours) == 1:
-        hhmm = f"{next(iter(cron.hours)):02d}:{next(iter(cron.minutes)):02d}"
-        if all_days:
-            return f"每天 {hhmm}"
-        # DoM/DoW 同时受限时是 cron 的 OR 语义，说成人话必然有歧义，照抄；
-        # 月份受限（如每年 1 月）同理，不做半句式猜测。
-        if full_dom and full_mon and cron.dows:
-            days = "、".join(WEEKDAY_NAMES[d] for d in sorted(cron.dows))
-            return f"每{days} {hhmm}"
-        if full_dow and full_mon and cron.doms:
-            days = "、".join(str(d) for d in sorted(cron.doms))
-            return f"每月 {days} 日 {hhmm}"
-    return f"cron {expr}"
-
-
 def human_delta(td):
     """倒计时的粗略中文说法，只用于总览页。"""
     secs = max(0, int(td.total_seconds()))
@@ -366,7 +327,7 @@ def task_view(task, now):
         "valid": True, "nxt": nxt, "missed": missed,
         "kind": "一次性" if oneshot else "周期",
         "permanent": bool(task.get("permanent")) and not oneshot,
-        "cadence": "单次" if oneshot else humanize_cron(cron, expr_s),
+        "cadence": expr_s,
         "summary": task_summary(task),
     }
 
@@ -374,10 +335,11 @@ def task_view(task, now):
 # --------------------------------------------------------------- process ---
 
 def alive(pid):
+    # TypeError：pid 为 None 等非数值时 int() 抛的是它，同样读作「不存在」。
     try:
         os.kill(int(pid), 0)
         return True
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         return False
 
 
@@ -594,8 +556,16 @@ def scan_sessions():
     comm_cache = {}
     live_other = 0
     for s in interactive:
-        pid = s.get("pid", -1)
-        if not alive(pid):
+        # pid 也是外部程序写的字段：缺失、null、非数值、非正数都当
+        # 「没有活进程」跳过。这段代码在 per-workspace 保护圈之外，一个
+        # 畸形登记抛出去就是整轮巡检失败；而缺失时兜底 -1 会被
+        # kill(-1, 0)（对全部进程的权限探测，不是存在性检查）误读为存活。
+        pid = s.get("pid")
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            continue
+        if pid <= 0 or not alive(pid):
             continue
         if pid not in comm_cache:
             comm_cache[pid] = _pid_comm_is_claude(pid)  # one ps per pid
@@ -1144,7 +1114,7 @@ def cmd_install(args):
     print("已加载到 launchd")
 
     cmd_run(argparse.Namespace(config=None))
-    print("首轮巡检完成，查看状态：doorman status")
+    print("首轮巡检完成，查看状态：doorman")
 
 
 def cmd_uninstall(args):
@@ -1175,7 +1145,7 @@ def cmd_uninstall(args):
               "--stop-sessions 结束保活会话）")
 
 
-# ---------------------------------------------------------------- status ----
+# ------------------------------------------------------------- overview ----
 
 def launchctl_info():
     r = launchctl("print", f"{gui_target()}/{LABEL}", check=False)
@@ -1203,7 +1173,7 @@ def launchd_state_zh(state):
 
 
 def service_line(info, plist_exists):
-    """status 与总览共用的服务状态行，两边文案必须保持一致。"""
+    """服务状态行：launchd 注册态与上次退出码（含未加载/未安装的提示）。"""
     if info:
         return (f"服务：launchd 已加载，{launchd_state_zh(info.get('state'))}，"
                 f"上次退出码 {info.get('last exit code', '?')}")
@@ -1212,66 +1182,12 @@ def service_line(info, plist_exists):
     return "服务：未安装，运行 doorman install 安装"
 
 
-def cmd_status(args):
-    print(f"doorman {VERSION}")
-    cfg = None
-    cfg_path = args.config or CONFIG_PATH
-    try:
-        cfg = load_config(cfg_path, missing_ok=True, corrupt_ok=True)
-    except OSError:
-        print("配置：缺失（运行 doorman install 生成）")
-    except ValueError as e:
-        # 损坏不致命于 status：页面其余部分（launchd、保活会话）照常显示。
-        print(f"配置：文件损坏，不是合法 JSON（{cfg_path}）\n  {e}")
-
-    info = launchctl_info()
-    plist_exists = os.path.exists(PLIST_PATH)
-    print(f"plist 文件：{PLIST_PATH}（{'存在' if plist_exists else '缺失'}）")
-    print(service_line(info, plist_exists))
-
-    if cfg:
-        print(f"扫描目录：{'、'.join(cfg['roots'])}"
-              f"（maxDepth={cfg['maxDepth']}）")
-        actual_iv = info.get("interval") if info else None
-        if actual_iv is not None:
-            mismatch = "" if actual_iv == cfg["intervalSeconds"] else \
-                f"  （配置写 {cfg['intervalSeconds']} 秒，" \
-                f"需重新运行 install 生效）"
-            print(f"巡检间隔：{actual_iv} 秒{mismatch}  "
-                  f"提前量：{cfg['leadSeconds']} 秒")
-        else:
-            print(f"巡检间隔：{cfg['intervalSeconds']} 秒（服务未加载）  "
-                  f"提前量：{cfg['leadSeconds']} 秒")
-        print(f"自动续期：{'开' if cfg.get('autoRenew') else '关'}"
-              f"（巡检时自动给周期任务补 permanent，以跳过 7 天过期）")
-        validate_config(cfg, announce=lambda m: print(m))
-
-    state = load_state()
-    if not state:
-        print("保活会话：0 个")
-        return
-    print(f"保活会话：{len(state)} 个")
-    now = int(time.time())
-    for ws, ent in sorted(state.items()):
-        if ent.get("cooldownUntil", 0) > now:
-            eta = ent["cooldownUntil"] - now
-            print(f"  冷却中 {ws}（约 {eta // 60} 分钟后重试，"
-                  f"连续失败 {ent.get('fails')} 次）")
-        elif tracked_alive(ent):
-            up = now - ent.get("startedAt", now)
-            print(f"  运行中 {ws}  pid={ent['pid']}  "
-                  f"已运行 {max(0, up) // 60} 分钟")
-        else:
-            print(f"  已失效 {ws}  pid={ent.get('pid')}"
-                  f"（记录的进程已不存在，下轮巡检自动清理）")
-
-
 def cmd_overview(args):
-    """无子命令时的总览：一眼看清服务、任务、保活会话与需要留意的事。
+    """无子命令时的总览：一眼看清服务、配置、任务、保活会话与需要留意的事。
 
-    和 `status`、`list` 不同，它回答的是「现在一切正常吗」，所以除了
-    汇总现状，还会把巡检视角的异常（该有会话却没有、冷却中、cron
-    损坏、配置与 launchd 不一致）集中成一个「需要留意」清单。
+    它回答的是「现在一切正常吗」：除了汇总现状，还会把巡检视角的异常
+    （该有会话却没有、冷却中、cron 损坏、配置与 launchd 不一致）集中
+    成一个「需要留意」清单。
     """
     cols = terminal_width()
     print(f"doorman {VERSION} —— 为定时任务提前备好交互会话")
@@ -1346,7 +1262,6 @@ def cmd_overview(args):
 
     commands = [
         ("list", "逐个列出任务的内容摘要、执行时间与会话状态"),
-        ("status", "查看服务、配置与保活会话的完整状态"),
         ("logs [目录片段] [-f]", "查看巡检日志或后台会话记录"),
         ("run", "立即手动巡检一轮"),
         ("renew", "立即给所有周期任务补 permanent（跳过 7 天过期）"),
@@ -1432,23 +1347,28 @@ def _overview_sessions(cols, state, suppress_cooling=()):
     """总览页的保活会话部分，数据来自 state.json，与配置状态无关。"""
     alerts = []
     cur = int(time.time())
-    live, cooling = [], []
+    live, cooling, dead = [], [], []
     for ws, ent in sorted(state.items()):
         if ent.get("cooldownUntil", 0) > cur:
             cooling.append((ws, ent))
         elif tracked_alive(ent):
             live.append((ws, ent))
+        else:
+            dead.append(ws)  # 记录仍在、进程已没：下一轮巡检即清理
+    tail = f"，冷却 {len(cooling)} 个"
+    if dead:
+        tail += f"，已失效 {len(dead)} 个（下轮巡检清理）"
     if live:
         desc = "、".join(
-            f"{os.path.basename(ws)}（已运行 "
+            f"{os.path.basename(ws)}（pid {ent['pid']}，已运行 "
             f"{max(0, cur - ent.get('startedAt', cur)) // 60} 分钟）"
             for ws, ent in live)
-        # 外层中文固定部分（按「保活 10 个（…），冷却 10 个」的最长形态）
-        # 合计约 37 列，截 desc 时给它们留足。
-        print(f"会话：保活 {len(live)} 个（{clip(desc, cols - 37)}），"
-              f"冷却 {len(cooling)} 个")
+        head = f"会话：保活 {len(live)} 个（"
+        # desc 之外的固定部分逐字算宽，desc 按剩余宽度截断，整行不超终端。
+        fixed = disp_width(head) + disp_width(tail) + disp_width("）")
+        print(f"{head}{clip(desc, cols - fixed)}）{tail}")
     else:
-        print(f"会话：无保活会话，冷却 {len(cooling)} 个")
+        print(f"会话：无保活会话{tail}")
     for ws, ent in cooling:
         if ws in suppress_cooling:
             continue  # 任务区已给过带上下文的合并告警
@@ -1596,8 +1516,6 @@ def main():
                    help="同时结束 doorman 启动的后台会话")
     p.set_defaults(func=cmd_uninstall)
 
-    sub.add_parser("status",
-                   help="查看服务注册、配置与保活会话").set_defaults(func=cmd_status)
     sub.add_parser("list",
                    help="逐个列出定时任务及其下次执行时间").set_defaults(func=cmd_list)
     sub.add_parser("run", help="执行一轮巡检（launchd 入口）").set_defaults(func=cmd_run)
