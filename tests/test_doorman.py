@@ -110,6 +110,64 @@ class CronSatisfiabilityTests(unittest.TestCase):
         self.assertIsNone(cron.next_after(NOW))
 
 
+class CronFastForwardTests(unittest.TestCase):
+    """next_after 的日历快进必须与朴素逐分钟扫描给出完全相同的结果。"""
+
+    @staticmethod
+    def brute_next_after(cron, after, within_days):
+        if not cron.satisfiable:
+            return None
+        t = (after + datetime.timedelta(minutes=1)).replace(
+            second=0, microsecond=0)
+        deadline = after + datetime.timedelta(days=within_days)
+        while t <= deadline:
+            if cron._matches(t):
+                return t
+            t += datetime.timedelta(minutes=1)
+        return None
+
+    EXPRS = ("*/5 * * * *", "3 9 * * *", "0 0 29 2 *", "0 0 31 4 *",
+             "0 10 * * 0", "0 18 20 * 1", "0 12 25 * 1", "30 3 1 1 *",
+             "*/7 */3 * * *", "0 0 1 * *", "15 14 * * 5", "0 0 29 2 1",
+             "59 23 31 12 *", "0,30 8-18/2 1,15 * *", "0 0 29 2 0")
+    STARTS = (datetime.datetime(2026, 9, 20, 15, 47),
+              datetime.datetime(2026, 1, 31, 23, 59),
+              datetime.datetime(2027, 2, 28, 0, 0),
+              datetime.datetime(2028, 2, 29, 12, 0),
+              datetime.datetime(2026, 12, 31, 23, 58))
+
+    def test_fast_forward_matches_brute_force(self):
+        for expr in self.EXPRS:
+            cron = d.Cron(expr)
+            for start in self.STARTS:
+                for window in (7, 31, 366, 800):
+                    with self.subTest(expr=expr, start=start, window=window):
+                        self.assertEqual(
+                            cron.next_after(start, within_days=window),
+                            self.brute_next_after(cron, start, window))
+
+    def test_year_long_display_window_stays_cheap(self):
+        # 快进之前，一年窗口意味着 52 万次逐分钟迭代；闰日表达式是最坏
+        # 情况之一，也必须毫秒级返回。
+        cron = d.Cron("0 0 29 2 *")
+        started = time.time()
+        cron.next_after(NOW, within_days=d.DISPLAY_SEARCH_DAYS)
+        self.assertLess(time.time() - started, 0.2)
+
+    def test_task_view_sees_a_year_ahead(self):
+        # list/总览共用的展示视图：年度任务必须给出真实日期，而不是
+        # 被 7 天巡检窗口误报成「无安排」。
+        future = NOW + datetime.timedelta(days=60)
+        expr = (f"{future.minute} {future.hour} {future.day} "
+                f"{future.month} *")
+        v = d.task_view({"cron": expr, "recurring": True}, NOW)
+        self.assertEqual(v["nxt"], future)
+        # 巡检判定不受显示窗口影响：60 天外不算「需要预热」。
+        self.assertFalse(d.task_wanted(
+            {"cron": expr, "recurring": True}, NOW,
+            datetime.timedelta(minutes=10)))
+
+
 class DisplayTests(unittest.TestCase):
     """等宽终端的展示助手：CJK 宽度、截断、补位。"""
 
@@ -160,6 +218,13 @@ class ValidationTests(unittest.TestCase):
         warnings = d.validate_config(
             {"intervalSeconds": 300, "leadSeconds": 600, "roots": ["/tmp"]})
         self.assertEqual(warnings, [])
+
+    def test_empty_roots_warn(self):
+        # roots 为空意味着巡检永远空转，必须说得出来
+        warnings = d.validate_config(
+            {"intervalSeconds": 300, "leadSeconds": 600, "roots": []},
+            announce=lambda _: None)
+        self.assertTrue(any("roots" in w for w in warnings))
 
     def test_corrupt_json_exits_cleanly(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json",
@@ -331,11 +396,13 @@ class StateMachineTests(unittest.TestCase):
         self.cfg_path = os.path.join(self.tmp, "config.json")
         # Module globals are patched wholesale below; restore them so test
         # order never matters.
-        for name in ("STATE_PATH", "alive", "proc_started_at", "discover",
-                     "read_tasks", "scan_sessions", "spawn_session",
-                     "stop_session", "acquire_run_lock"):
+        for name in ("STATE_PATH", "SESSION_LOG_DIR", "alive",
+                     "proc_started_at", "discover", "read_tasks",
+                     "scan_sessions", "spawn_session", "stop_session",
+                     "acquire_run_lock", "list_script_processes"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.STATE_PATH = os.path.join(self.tmp, "state.json")
+        d.SESSION_LOG_DIR = os.path.join(self.tmp, "sessions")
         write_json(self.cfg_path,
                    {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
                     "leadSeconds": 600})
@@ -347,6 +414,7 @@ class StateMachineTests(unittest.TestCase):
         d.read_tasks = lambda ws: [{"cron": "*/5 * * * *", "createdAt": 0}]
         d.scan_sessions = lambda: (
             ({WS_PATH} if self.consumer else set(), None))
+        d.list_script_processes = lambda: []
         d.alive = lambda pid: pid in self.alive_pids
         # Identity fingerprints are faked as "start-<pid>": a pid that is
         # alive in the fake table reports the same value spawn recorded, and
@@ -518,6 +586,87 @@ class StateMachineTests(unittest.TestCase):
         self.assertIn(pid, self.alive_pids)
         self.assertEqual(self.state()[WS_PATH]["pid"], pid)
 
+    def test_old_idle_session_is_rotated_not_counted_as_failure(self):
+        """permanent 任务的会话长生不死后需要维护：超龄且日志静默的会话
+        被主动结束并按需重拉——换代是维护，不进失败计数。"""
+        self.patrol()
+        pid1 = self.state()[WS_PATH]["pid"]
+        self.consumer = True  # 长驻会话都是已登记的健康会话
+
+        # 未满龄：不动
+        s = self.state()
+        s[WS_PATH]["startedAt"] -= d.SESSION_MAX_AGE_SECONDS - 100
+        write_json(d.STATE_PATH, s)
+        self.patrol()
+        self.assertEqual(self.state()[WS_PATH]["pid"], pid1)
+
+        # 超龄且 typescript 不存在（无任何活动证据）→ 本轮换代，下轮重拉
+        s = self.state()
+        s[WS_PATH]["startedAt"] -= 200
+        write_json(d.STATE_PATH, s)
+        self.patrol()
+        self.assertNotIn(pid1, self.alive_pids)  # 旧会话真的被结束了
+        self.assertNotIn(WS_PATH, self.state())  # 登记也清了
+
+        self.consumer = False  # 登记处同步消失后，下轮按需重拉
+        self.patrol()
+        ent = self.state()[WS_PATH]
+        self.assertNotEqual(ent["pid"], pid1)
+        self.assertEqual(ent["fails"], 0)
+
+    def test_old_but_active_session_is_not_rotated(self):
+        """超龄但 typescript 仍在写入（任务在执行中）：不能砍。"""
+        self.patrol()
+        pid1 = self.state()[WS_PATH]["pid"]
+        self.consumer = True  # 已登记的健康会话
+        log_path = d.session_log_path(WS_PATH)
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "w") as f:
+            f.write("task output\n")  # mtime 即现在
+        s = self.state()
+        s[WS_PATH]["startedAt"] -= d.SESSION_MAX_AGE_SECONDS + 1
+        write_json(d.STATE_PATH, s)
+        self.patrol()
+        self.assertEqual(self.state()[WS_PATH]["pid"], pid1)
+        self.assertIn(pid1, self.alive_pids)
+
+    def test_orphan_session_is_adopted_not_duplicated(self):
+        """state.json 丢失后，进程表里仍有本工作区的 script 会话：认回
+        跟踪（卡死的 3 分钟后照常被退休），绝不在同目录再拉一个。"""
+        log_path = d.session_log_path(WS_PATH)
+        self.alive_pids.add(555)
+        d.list_script_processes = lambda: [(
+            555, f"/usr/bin/script -q {log_path} "
+                 f"/bin/zsh -lic 'cd /x && claude'")]
+        self.patrol()
+        ent = self.state()[WS_PATH]
+        self.assertEqual(ent["pid"], 555)        # 接管而非新拉
+        self.assertEqual(ent["procStart"], "start-555")
+        self.assertEqual(self.next_pid, 100)     # 没有发生新 spawn
+
+        # 接管后进入正常生命周期：下轮巡检照常跟踪它
+        self.patrol()
+        self.assertEqual(self.state()[WS_PATH]["pid"], 555)
+
+    def test_dead_orphan_in_snapshot_is_not_adopted(self):
+        """进程表快照拍于轮次开头，可能含着刚死掉的 pid：接管前必须
+        复核存活，否则认回一个死人会白记失败。"""
+        log_path = d.session_log_path(WS_PATH)
+        d.list_script_processes = lambda: [(
+            556, f"/usr/bin/script -q {log_path} /bin/zsh -lic x")]
+        # 556 不在 alive_pids：快照里的死人
+        self.patrol()
+        ent = self.state()[WS_PATH]
+        self.assertNotEqual(ent["pid"], 556)
+        self.assertEqual(ent["pid"], 100)  # 正常新拉
+
+    def test_unrelated_script_processes_are_not_adopted(self):
+        self.alive_pids.add(557)
+        d.list_script_processes = lambda: [(
+            557, "/usr/bin/script -q /other/place.log /bin/zsh -lic x")]
+        self.patrol()
+        self.assertEqual(self.state()[WS_PATH]["pid"], 100)
+
     def test_one_broken_workspace_does_not_stop_the_patrol(self):
         """discover() is a generator: an exception would skip the rest."""
         visited = []
@@ -584,12 +733,12 @@ class SessionScanTests(unittest.TestCase):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.real_alive = d.alive
-        for name in ("SESSION_DIR", "alive", "_pid_comm_is_claude"):
+        for name in ("SESSION_DIR", "alive", "_pid_is_claude"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.SESSION_DIR = self.tmp
         self.live, self.claude = set(), set()
         d.alive = lambda pid: pid in self.live
-        d._pid_comm_is_claude = lambda pid: pid in self.claude
+        d._pid_is_claude = lambda pid: pid in self.claude
 
     def write_reg(self, name, pid, cwd, kind="interactive"):
         with open(os.path.join(self.tmp, name), "w") as f:
@@ -642,7 +791,7 @@ class SessionScanTests(unittest.TestCase):
         # realpath 处抛 TypeError——活 pid 配畸形 cwd 也要安全跳过。
         d.alive = self.real_alive
         me = os.getpid()  # 一个确定存活的 pid：健康登记长这样
-        d._pid_comm_is_claude = lambda pid: pid == me
+        d._pid_is_claude = lambda pid: pid == me
         self.write_reg("live.json", me, os.path.realpath(self.tmp))
         self.write_reg("null.json", None, "/a")
         self.write_reg("neg.json", -1, "/a")
@@ -661,6 +810,45 @@ class SessionScanTests(unittest.TestCase):
         consumers, alert = d.scan_sessions()
         self.assertEqual(consumers, {os.path.realpath(self.tmp)})
         self.assertIsNone(alert)
+
+
+class ClaudeProcessDetectionTests(unittest.TestCase):
+    """_pid_is_claude：原生安装看 comm；npm/bun 形态是解释器进程，
+    要到完整命令行里认 claude 入口路径。"""
+
+    def detect(self, comm, args=""):
+        def fake_run(cmd, **kw):
+            if "comm=" in cmd:
+                return mock.Mock(stdout=f"{comm}\n")
+            return mock.Mock(stdout=f"{args}\n")
+        with mock.patch.object(d.subprocess, "run", side_effect=fake_run):
+            return d._pid_is_claude(42)
+
+    def test_native_install_by_comm(self):
+        self.assertTrue(self.detect("claude"))
+        self.assertTrue(self.detect("/Users/u/.local/bin/claude"))
+
+    def test_npm_install_via_interpreter_args(self):
+        # bin/claude 是指向包内 cli.js 的符号链接，两种形态都要认
+        self.assertTrue(self.detect("node", "node /opt/homebrew/bin/claude"))
+        self.assertTrue(self.detect(
+            "node", "node /opt/homebrew/lib/node_modules/"
+                    "@anthropic-ai/claude-code/cli.js"))
+        self.assertTrue(self.detect("bun", "bun /home/u/.bun/bin/claude -r"))
+        self.assertTrue(self.detect("node", "node /x/claude/run.js"))
+
+    def test_unrelated_processes_are_rejected(self):
+        self.assertFalse(self.detect("node", "node server.js"))
+        self.assertFalse(self.detect("node", "node claude.md"))
+        # 非解释器进程绝不看命令行：参数里提到 claude 也不算
+        self.assertFalse(self.detect("vim", "vim claude.md"))
+        self.assertFalse(self.detect("zsh", ""))
+        self.assertFalse(self.detect("python3", "python3 /x/claude"))
+
+    def test_ps_failure_reads_as_not_claude(self):
+        with mock.patch.object(d.subprocess, "run",
+                               side_effect=OSError("ps gone")):
+            self.assertFalse(d._pid_is_claude(42))
 
 
 class PatrolLogRotateTests(unittest.TestCase):
@@ -741,16 +929,23 @@ class ListTests(unittest.TestCase):
             "recurring": False}])
         self.assertIn("已错过", out)
 
-    def test_one_shot_beyond_the_window_is_not_missed(self):
-        # Fires in ~60 days: outside the search window, so next_after is None
-        # — but it has not been missed, and must not be reported as such.
+    def test_one_shot_weeks_ahead_shows_its_date_not_missed(self):
+        # Fires in ~60 days: inside the year-long display window, so its
+        # date is shown (not "一年内无") — and it has not been missed.
         future = datetime.datetime.now() + datetime.timedelta(days=60)
         out = self.render([{
             "cron": f"{future.minute} {future.hour} {future.day} "
                     f"{future.month} *",
             "createdAt": int(time.time() * 1000), "recurring": False}])
         self.assertNotIn("已错过", out)
-        self.assertIn("无安排", out)
+        self.assertIn(future.strftime("%m-%d %H:%M"), out)
+
+    def test_valid_cron_that_never_fires_reads_as_such(self):
+        # 2 月 30 日：字段都在界内（satisfiable），但一年窗口内扫不到任何
+        # 触发点——显示「一年内无」而不是一个假日期。
+        out = self.render([{"cron": "0 0 30 2 *", "recurring": True,
+                            "prompt": "永不触发的任务"}])
+        self.assertIn("一年内无", out)
 
     def test_each_task_gets_its_own_row_with_summary_and_cadence(self):
         out = self.render([
@@ -1053,6 +1248,26 @@ class LogPathTests(unittest.TestCase):
             self.resolve("space")
         self.assertTrue(any("a-space" in n for n in self.notes))
 
+    def test_rotated_dot1_logs_are_not_candidates(self):
+        # 轮转过一次的工作区不该永远被报成「匹配到多个」。
+        path = os.path.join(d.SESSION_LOG_DIR, "Users_me_proj.log")
+        open(path, "w").close()
+        open(path + ".1", "w").close()
+        self.assertEqual(self.resolve("proj"), path)
+
+
+class SessionLogPathTests(unittest.TestCase):
+    """日志文件名 slug：下划线转义在斜杠折叠之前，路径不再撞名。"""
+
+    def test_similar_workspaces_do_not_collide(self):
+        self.assertNotEqual(d.session_log_path("/a/b"),
+                            d.session_log_path("/a_b"))
+
+    def test_mapping_shape(self):
+        self.assertTrue(d.session_log_path("/a/b").endswith("a_b.log"))
+        self.assertTrue(d.session_log_path("/a_b").endswith("a__b.log"))
+        self.assertTrue(d.session_log_path("/x").endswith("x.log"))
+
 
 class InstallArgTests(unittest.TestCase):
     """cmd_install with the system-touching parts stubbed out."""
@@ -1092,6 +1307,32 @@ class InstallArgTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             self.install(interval=0)
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_explicitly_empty_roots_is_rejected_loudly(self):
+        # `--roots ,` 解析不出任何有效目录：必是手误，静默写进配置
+        # 会让巡检从此空转。
+        with self.assertRaises(SystemExit) as ctx:
+            self.install(roots=",")
+        self.assertEqual(ctx.exception.code, 1)
+
+    def test_default_roots_prints_a_safety_notice(self):
+        # 未指定 --roots 落到默认全家目录：自动续期会把今后 clone 进来
+        # 的任何周期任务永久化，这一点要在安装时当面说清。
+        args = argparse.Namespace(roots=None, interval=None, lead=None,
+                                  force=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_install(args)
+        self.assertIn("--roots", buf.getvalue())
+        self.assertIn("clone", buf.getvalue())
+
+    def test_explicit_roots_prints_no_safety_notice(self):
+        args = argparse.Namespace(roots=self.tmp, interval=None, lead=None,
+                                  force=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_install(args)
+        self.assertNotIn("今后 clone", buf.getvalue())
 
     def test_omitted_flags_preserve_existing_values(self):
         self.install(lead=45)
@@ -1137,6 +1378,57 @@ class InstallArgTests(unittest.TestCase):
                                    "intervalSeconds": 300, "leadSeconds": 600,
                                    "autoRenew": "yes"})
         self.assertIs(d.load_config(d.CONFIG_PATH)["autoRenew"], True)
+
+
+class UninstallTests(unittest.TestCase):
+    """卸载即解除管理：自己启动的保活会话默认一并结束，不留孤儿。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        for name in ("STATE_PATH", "PLIST_PATH", "APP_SUPPORT", "LOG_DIR",
+                     "BIN_PATH", "launchctl", "stop_session",
+                     "tracked_alive"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.STATE_PATH = os.path.join(self.tmp, "state.json")
+        d.PLIST_PATH = os.path.join(self.tmp, "x.plist")
+        d.APP_SUPPORT = os.path.join(self.tmp, "support")
+        d.LOG_DIR = os.path.join(self.tmp, "logs")
+        d.BIN_PATH = os.path.join(self.tmp, "bin")
+        d.launchctl = lambda *a, **k: mock.Mock(returncode=0)
+        self.stopped = []
+        d.stop_session = lambda ent: self.stopped.append(ent.get("pid"))
+        d.tracked_alive = lambda ent: bool(ent.get("pid"))
+
+    def uninstall(self, **kw):
+        args = argparse.Namespace(purge=False, keep_sessions=False)
+        for k, v in kw.items():
+            setattr(args, k, v)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_uninstall(args)
+        return buf.getvalue()
+
+    def test_sessions_are_stopped_by_default(self):
+        write_json(d.STATE_PATH,
+                   {"/x": {"pid": 11}, "/y": {"pid": 22}})
+        out = self.uninstall()
+        self.assertEqual(sorted(self.stopped), [11, 22])
+        self.assertIn("正在结束保活会话", out)
+
+    def test_keep_sessions_leaves_them_running(self):
+        write_json(d.STATE_PATH, {"/x": {"pid": 11}})
+        self.uninstall(keep_sessions=True)
+        self.assertEqual(self.stopped, [])
+
+    def test_legacy_stop_sessions_flag_is_accepted(self):
+        # 旧拼法 --stop-sessions（曾是非默认的开关）不能变成未知参数错误。
+        write_json(d.STATE_PATH, {"/x": {"pid": 11}})
+        args = argparse.Namespace(purge=False, keep_sessions=False,
+                                  stop_sessions=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            d.cmd_uninstall(args)
+        self.assertEqual(self.stopped, [11])
 
 
 class RenewTests(unittest.TestCase):
@@ -1303,12 +1595,13 @@ class RunRenewTests(unittest.TestCase):
         os.makedirs(self.root)
         self.cfg_path = os.path.join(self.tmp, "config.json")
         for name in ("STATE_PATH", "scan_sessions", "acquire_run_lock",
-                     "rotate_patrol_logs"):
+                     "rotate_patrol_logs", "list_script_processes"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.STATE_PATH = os.path.join(self.tmp, "state.json")
         d.scan_sessions = lambda: (set(), None)
         d.acquire_run_lock = lambda: 1
         d.rotate_patrol_logs = lambda: None
+        d.list_script_processes = lambda: []
 
     def make_ws(self, name, doc):
         ws = os.path.join(self.root, name)

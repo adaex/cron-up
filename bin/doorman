@@ -76,6 +76,15 @@ COOLDOWN_SECONDS = 1800
 # That failure mode keeps the process alive forever, so liveness alone would
 # report it as healthy; only this deadline catches it.
 WARMUP_GRACE_SECONDS = 180
+# A warm session is a cache, not a pet: "permanent" tasks keep it alive
+# indefinitely, which pins it to the claude version — and the ever-growing
+# typescript — of the day it was spawned. Sessions older than this are
+# retired, but only once their typescript has gone silent for a while: a
+# quiet log is the evidence no task is mid-flight, so a running task is
+# never cut. (If some TUI repaints while idle, the condition simply never
+# holds and nothing is retired — a safe degradation.)
+SESSION_MAX_AGE_SECONDS = 7 * 86400
+SESSION_IDLE_SECONDS = 3600
 # TUI typescripts are full-screen render streams and grow unboundedly while a
 # long-lived warm session runs. Rotate at spawn time (script(1) truncates on
 # open, so rotation granularity is one warm-session life).
@@ -129,11 +138,15 @@ def parse_cron_field(expr, lo, hi):
 
 
 # Scheduled tasks expire after 7 days (recurring ones are dropped by the
-# scheduler; one-shots have fired long before). Nothing here needs to look
-# further ahead than that, which keeps the search a plain minute-by-minute
-# scan: no calendar skipping, no unsatisfiable-expression special case, and
-# no four-year worst case to guard against. A full miss costs ~3ms.
+# scheduler; one-shots have fired long before). The patrol therefore never
+# needs to look further ahead than that. Display pages are another matter —
+# see DISPLAY_SEARCH_DAYS.
 SEARCH_DAYS = 7
+# `list` and the overview answer "when does this fire next?" for a human, so
+# they look a full year ahead: a yearly task must show its date, not a
+# misleading "no schedule". The calendar fast-forward in next_after keeps
+# the longer window cheap (it only ever skips times _matches would reject).
+DISPLAY_SEARCH_DAYS = 366
 # Catch-up detection searches forward from a task's creation time instead,
 # so it needs its own bound — see task_wanted.
 MISSED_LOOKBACK_DAYS = 30
@@ -186,6 +199,18 @@ class Cron:
             second=0, microsecond=0)
         deadline = after + datetime.timedelta(days=within_days)
         while t <= deadline:
+            # Calendar fast-forward: jump over months/hours that cannot match
+            # anything, then scan the remainder minute by minute. The jumps
+            # only skip times _matches would reject, so results are identical
+            # to a naive scan — but a year-long window costs ~10⁴ iterations
+            # instead of 5·10⁵, which is what makes DISPLAY_SEARCH_DAYS viable.
+            if t.month not in self.months:
+                t = (t.replace(day=1, hour=0, minute=0)
+                     + datetime.timedelta(days=32)).replace(day=1)
+                continue
+            if t.hour not in self.hours:
+                t = (t + datetime.timedelta(hours=1)).replace(minute=0)
+                continue
             if self._matches(t):
                 return t
             t += datetime.timedelta(minutes=1)
@@ -315,10 +340,11 @@ def task_view(task, now):
                 "permanent": False}
     if not cron.satisfiable:
         # Empty field set (out-of-range or backwards range): no minute can
-        # ever match. Distinct from "valid but no fire within 7 days".
+        # ever match. Distinct from "valid but no fire within the display
+        # window" (e.g. Feb 30th, which parses fine yet never fires).
         return {"valid": False, "expr": expr, "summary": task_summary(task),
                 "permanent": False}
-    nxt = cron.next_after(now)
+    nxt = cron.next_after(now, within_days=DISPLAY_SEARCH_DAYS)
     oneshot = task_is_oneshot(task)
     missed = (oneshot and task_wanted(task, now, ZERO_LEAD)
               and (nxt is None or nxt > now))
@@ -522,16 +548,33 @@ def renew_workspace(taskfile):
     return tagged
 
 
-def _pid_comm_is_claude(pid):
-    """Does the live pid's executable name contain "claude"? Caller checks
-    liveness first; this confirms a recycled PID did not inherit the number
-    from an unrelated process."""
+# npm/bun 形态的 claude 是解释器跑的脚本：进程 comm 是 node/bun/deno，
+# 只能从完整命令行里认 claude 入口路径（bin/claude 符号链接，或包目录
+# 下的 cli.js）。回退只对已知解释器开放——任何命令行里碰巧提到 claude
+# 的进程（vim claude.md）不会被误认。
+_INTERPRETER_COMMS = {"node", "nodejs", "bun", "deno"}
+_CLAUDE_ENTRY_RE = re.compile(r"(?:^|/)claude(?:-code)?(?:\.js)?(?:$|[/\s])")
+
+
+def _ps(pid, fmt):
     try:
-        r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "comm="],
+        r = subprocess.run(["/bin/ps", "-p", str(pid), "-o", fmt],
                            capture_output=True, text=True, timeout=5)
     except (OSError, ValueError, subprocess.SubprocessError):
-        return False
-    return "claude" in os.path.basename(r.stdout.strip()).lower()
+        return ""
+    return r.stdout.strip()
+
+
+def _pid_is_claude(pid):
+    """Does the live pid look like a Claude Code process? Caller checks
+    liveness first; this confirms a recycled PID did not inherit the number
+    from an unrelated process."""
+    comm = os.path.basename(_ps(pid, "comm=")).lower()
+    if "claude" in comm:
+        return True
+    if comm in _INTERPRETER_COMMS:
+        return bool(_CLAUDE_ENTRY_RE.search(_ps(pid, "args=").lower()))
+    return False
 
 
 def scan_sessions():
@@ -572,7 +615,7 @@ def scan_sessions():
         if pid <= 0 or not alive(pid):
             continue
         if pid not in comm_cache:
-            comm_cache[pid] = _pid_comm_is_claude(pid)  # one ps per pid
+            comm_cache[pid] = _pid_is_claude(pid)  # ps calls cached per pid
         if comm_cache[pid]:
             # cwd 同样不可信：非字符串（登记格式变更、文件损坏）当
             # 「定位不到工作区」处理，不给 realpath 抛 TypeError 的机会；
@@ -717,7 +760,10 @@ def log(msg):
 
 
 def session_log_path(ws):
-    slug = ws.strip("/").replace("/", "_")
+    # 转义顺序不能反：先把已有的 _ 翻倍，再把 / 折成 _。/a/b → a_b、
+    # /a_b → a__b，两种路径不再共用同一个日志文件（script(1) 启动即截断，
+    # 撞名意味着两个工作区互相覆盖记录）。
+    slug = ws.strip("/").replace("_", "__").replace("/", "_")
     return os.path.join(SESSION_LOG_DIR, slug + ".log")
 
 
@@ -833,6 +879,36 @@ def stop_session(ent):
     return True
 
 
+def session_log_idle_seconds(log_path, cur):
+    """Seconds since the workspace's typescript was last written. A missing
+    log is treated as no sign of activity: it does not block rotation."""
+    try:
+        return max(0, cur - int(os.path.getmtime(log_path)))
+    except OSError:
+        return SESSION_IDLE_SECONDS + 1
+
+
+def list_script_processes():
+    """(pid, args) of every live script(1) process.
+
+    The process table is the backstop for a lost state.json: a warm session
+    the state file forgot stays invisible to the session registry while it is
+    stuck on a prompt, and without this cross-check the patrol would pile a
+    second TUI into the same workspace.
+    """
+    try:
+        r = subprocess.run(["/bin/ps", "-axo", "pid=,args="],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return []
+    procs = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"\s*(\d+)\s+(/usr/bin/script\s.*)", line)
+        if m:
+            procs.append((int(m.group(1)), m.group(2)))
+    return procs
+
+
 def rotate_patrol_logs():
     """Rename oversized launchd logs to .1 once per round (see the constant's
     comment for why this is safe despite launchd holding fds)."""
@@ -863,6 +939,9 @@ def cmd_run(args):
     now = datetime.datetime.now()
     lead = datetime.timedelta(seconds=cfg["leadSeconds"])
     state = load_state()
+    if not cfg["roots"]:
+        log("警告：扫描目录 roots 为空，巡检不会发现任何工作区；"
+            "请检查配置文件或用 install --roots 指定")
 
     cur = int(time.time())
     # Read the registry once: each workspace otherwise globs and forks a ps
@@ -870,6 +949,7 @@ def cmd_run(args):
     consumers, registry_alert = scan_sessions()
     if registry_alert:
         log(f"告警：{registry_alert}")
+    script_procs = list_script_processes()
 
     auto_renew = cfg.get("autoRenew")
     for ws, taskfile in discover(cfg["roots"], cfg["maxDepth"]):
@@ -889,7 +969,8 @@ def cmd_run(args):
             except Exception as e:  # noqa: BLE001 — never block the patrol
                 log(f"续期错误 {ws}：{type(e).__name__}：{e}")
         try:
-            patrol_workspace(ws, state, now, lead, cur, consumers)
+            patrol_workspace(ws, state, now, lead, cur, consumers,
+                             script_procs)
         except Exception as e:  # noqa: BLE001 — last-resort per-workspace guard
             log(f"错误 {ws}：{type(e).__name__}：{e}")
 
@@ -901,7 +982,7 @@ def cmd_run(args):
     save_state(state)
 
 
-def patrol_workspace(ws, state, now, lead, cur, consumers):
+def patrol_workspace(ws, state, now, lead, cur, consumers, script_procs=()):
     """Ensure a consumer is warm in one workspace. Mutates `state` in place."""
     tasks = read_tasks(ws)
     ent = state.get(ws)
@@ -923,10 +1004,26 @@ def patrol_workspace(ws, state, now, lead, cur, consumers):
                     f"结束保活会话")
             state.pop(ws, None)
         return
+
+    # 换代：长驻会话停留在 spawn 当天的 claude 版本与持续增长的
+    # typescript 上。超龄且日志静默（无任务在执行的证据）时主动结束，
+    # 需要时下文自然重拉。这不计失败——换代是维护，不是故障。
+    mine_alive = tracked_alive(ent)
+    if mine_alive:
+        age = cur - ent.get("startedAt", cur)
+        if age > SESSION_MAX_AGE_SECONDS and session_log_idle_seconds(
+                ent.get("log") or session_log_path(ws), cur) \
+                > SESSION_IDLE_SECONDS:
+            stop_session(ent)
+            log(f"换代 {ws} pid={ent['pid']}：会话已连续运行 "
+                f"{age // 86400} 天且近期无输出，结束后按需重拉")
+            state.pop(ws, None)
+            ent = None
+            mine_alive = False
+
     if not any(task_wanted(t, now, lead) for t in tasks):
         return
 
-    mine_alive = tracked_alive(ent)
     cooling = bool(ent and ent.get("cooldownUntil", 0) > cur)
 
     if ws in consumers:
@@ -971,6 +1068,24 @@ def patrol_workspace(ws, state, now, lead, cur, consumers):
         log(f"冷却 {ws}：仍有任务需要会话，但保活会话连续失败 {fails} 次，"
             f"暂停重试 {COOLDOWN_SECONDS // 60} 分钟")
         return
+
+    if ent is None:
+        # state 里没有记录不等于没有会话：state.json 丢失（手删、
+        # --purge 时保留会话）后，进程表里可能还躺着一个本工作区的
+        # script 会话。它若卡在提问界面上就不会出现在会话登记里，直接
+        # 再拉一个就是同目录双开。认回进程表里的孤儿，重新纳入正常
+        # 生命周期（卡死的 3 分钟后会被照退休处理）。
+        log_path = session_log_path(ws)
+        for proc_pid, proc_args in script_procs:
+            # alive 复核：快照拍于本轮开头，可能含着刚被换代/回收杀掉的
+            # pid——把死人认回来会白记一次失败。
+            if f"-q {log_path} " in proc_args and alive(proc_pid):
+                state[ws] = {"pid": proc_pid, "startedAt": cur,
+                             "procStart": proc_started_at(proc_pid),
+                             "fails": 0, "log": log_path}
+                log(f"接管 {ws} pid={proc_pid}：state 记录缺失，但进程"
+                    f"表里仍有本工作区的保活会话，重新纳入跟踪")
+                return
 
     pid, started = spawn_session(ws)
     state[ws] = {"pid": pid, "startedAt": cur, "procStart": started,
@@ -1045,6 +1160,9 @@ def launchctl(*args, check=True):
 def validate_config(cfg, announce=print):
     """Soft checks (non-fatal): prints and returns warning strings."""
     warnings = []
+    if not cfg.get("roots"):
+        warnings.append("扫描目录 roots 为空：巡检不会发现任何工作区，"
+                        "doorman 形同空转")
     interval = cfg.get("intervalSeconds")
     lead = cfg.get("leadSeconds")
     if isinstance(interval, int) and isinstance(lead, int) \
@@ -1090,7 +1208,14 @@ def cmd_install(args):
                 pass
         overrides = {}
         if args.roots:
-            overrides["roots"] = normalize_roots(args.roots.split(","))
+            # 显式给了参数却解析不出任何有效目录（--roots , 之类），必是
+            # 手误；静默写进配置会让巡检从此空转。
+            roots = normalize_roots(args.roots.split(","))
+            if not roots:
+                print(f"--roots 解析后没有有效目录：{args.roots!r}",
+                      file=sys.stderr)
+                sys.exit(1)
+            overrides["roots"] = roots
         # `is not None`, not truthiness: --lead 0 ("no lead time") is a legal
         # choice and must not be silently dropped. --interval 0 is illegal but
         # has to reach the validation below to be reported as such.
@@ -1120,6 +1245,12 @@ def cmd_install(args):
         print(f"leadSeconds 必须是非负整数秒，当前为 {lv!r}", file=sys.stderr)
         sys.exit(1)
     validate_config(cfg)
+    if cfg.get("roots") == normalize_roots(DEFAULT_CONFIG["roots"]):
+        # 与 README 安全说明同一句话，在配置落定的这一刻当面再说一遍：
+        # 全目录扫描会把今后 clone 进来的任何仓库纳入巡检与自动续期。
+        print("提示：未指定 --roots，扫描范围是整个用户目录，今后 clone "
+              "的仓库也会进入巡检；自动续期会把其中的周期任务永久化。"
+              "建议用 --roots 显式限定范围（见 README 安全说明）")
 
     # Self-copy: the repo is a source, the installed binary stands alone.
     # Atomic, and more load-bearing than it looks: launchd runs this very path
@@ -1158,7 +1289,10 @@ def cmd_uninstall(args):
     if r.returncode == 0:
         print("已从 launchd 卸载")
 
-    if args.stop_sessions:
+    # 服务没了就没有回收者：默认结束自己启动的保活会话，不留以 bypass
+    # 权限空转的孤儿。--stop-sessions 是旧拼法（现已是默认行为），
+    # --keep-sessions 显式保留（例如马上会重装）。
+    if not getattr(args, "keep_sessions", False):
         for ws, ent in load_state().items():
             if tracked_alive(ent):
                 print(f"正在结束保活会话 {ws} pid={ent['pid']}")
@@ -1178,7 +1312,7 @@ def cmd_uninstall(args):
             print(f"已删除 {BIN_PATH}")
     else:
         print("配置与日志已保留（--purge 删除全部产物，"
-              "--stop-sessions 结束保活会话）")
+              "--keep-sessions 保留保活会话）")
 
 
 # ------------------------------------------------------------- overview ----
@@ -1292,9 +1426,10 @@ def cmd_overview(args):
                     f"重新运行 doorman install 后生效")
         suffix = f"（深度 {cfg['maxDepth']}）"
         roots = "、".join(cfg["roots"])
-        # 前缀「扫描：」在等宽终端里占 6 列（中文与全角冒号各两列）。
-        print("扫描："
-              + clip(roots, cols - 6 - disp_width(suffix)) + suffix)
+        prefix = "扫描："
+        print(prefix
+              + clip(roots, cols - disp_width(prefix) - disp_width(suffix))
+              + suffix)
         alerts.extend(validate_config(
             cfg, announce=lambda _: None))
         print()
@@ -1395,6 +1530,14 @@ def _overview_tasks(cfg, cols, consumers, state):
     return alerts, cooling_warned
 
 
+def session_age_zh(started_at, cur):
+    """会话年龄的粗粒度中文：长驻会话按天计，否则按分钟。"""
+    secs = max(0, cur - started_at)
+    if secs >= 86400:
+        return f"{secs // 86400} 天"
+    return f"{secs // 60} 分钟"
+
+
 def _overview_sessions(cols, state, suppress_cooling=()):
     """总览页的保活会话部分，数据来自 state.json，与配置状态无关。"""
     alerts = []
@@ -1412,8 +1555,8 @@ def _overview_sessions(cols, state, suppress_cooling=()):
         tail += f"，已失效 {len(dead)} 个"
     if live:
         desc = "、".join(
-            f"{os.path.basename(ws)}（pid {ent['pid']}，已运行 "
-            f"{max(0, cur - ent.get('startedAt', cur)) // 60} 分钟）"
+            f"{os.path.basename(ws)}（pid {ent['pid']}，"
+            f"已运行 {session_age_zh(ent.get('startedAt', cur), cur)}）"
             for ws, ent in live)
         head = f"会话：保活 {len(live)} 个（"
         # desc 之外的固定部分逐字算宽、desc 按剩余宽度截断；两位数计数下
@@ -1445,7 +1588,7 @@ def cmd_list(args):
         if not tasks:
             continue
         views = [task_view(t, now) for t in tasks]
-        # 错过待补执行的排最前，然后按下次时间升序，无安排的垫底。
+        # 错过待补执行的排最前，然后按下次时间升序，一年内无安排的垫底。
         views.sort(key=lambda v: (
             3 if not v["valid"] else 0 if v["missed"]
             else 1 if v.get("nxt") else 2,
@@ -1463,10 +1606,14 @@ def cmd_list(args):
     blocks.sort(key=lambda b: b[0])
     print(f"共 {len(blocks)} 个工作区、{total} 个定时任务")
 
-    # kind 列要容下「周期·永久」（9 个等宽列：· 占 1 列），故取 10 而非 6。
-    status_w, kind_w, cad_w = 11, 10, 16
-    # "  " + status + "  " + kind + "  " + cadence + "  " + summary，
-    # 固定部分共 45 列；60 列以上的终端每行总宽不超过终端宽度。
+    # 列宽从全部候选文案动态算出（时间戳 "09-25 08:30" 恒为 11 列），
+    # 改文案不会静默错位；cadence 列是截断列，取固定上限。
+    status_w = max([11] + [disp_width(s)
+                           for s in ("cron 无效", "已错过", "一年内无")])
+    kind_w = max(disp_width(k) for k in ("一次性", "周期", "周期·永久")) + 1
+    cad_w = 16
+    # "  " + status + "  " + kind + "  " + cadence + "  " + summary：
+    # 每行总宽不超过终端宽度（60 列起步，见 terminal_width）。
     summary_w = max(12,
                     cols - (2 + status_w + 2 + kind_w + 2 + cad_w + 2))
     for ws, consumer, views in blocks:
@@ -1476,7 +1623,7 @@ def cmd_list(args):
         print(f"{pad(clip(ws, path_w), path_w)} {label}")
         for v in views:
             if not v["valid"]:
-                status, kind, cadence = "无安排", "—", "cron 无效"
+                status, kind, cadence = "cron 无效", "—", "—"
                 summary = f"原字段值：{v['expr']!r}；{v['summary']}"
             elif v["missed"]:
                 # 一次性任务的触发点已过：下次会话启动时会补执行一次。
@@ -1485,7 +1632,7 @@ def cmd_list(args):
                 kind = "周期·永久" if v["permanent"] else v["kind"]
             else:
                 status = v["nxt"].strftime("%m-%d %H:%M") if v["nxt"] \
-                    else "无安排"
+                    else "一年内无"
                 cadence, summary = v["cadence"], v["summary"]
                 kind = "周期·永久" if v["permanent"] else v["kind"]
             print("  " + pad(status, status_w) + "  " + pad(kind, kind_w)
@@ -1500,7 +1647,9 @@ def resolve_log_path(workspace, announce=lambda m: print(m, file=sys.stderr)):
         if os.path.isabs(workspace):
             path = session_log_path(os.path.realpath(workspace))
             return path if os.path.exists(path) else None
-        matches = [f for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*"))
+        # 只匹配当前日志（*.log）：轮转的 .log.1 若参与匹配，轮转过一次
+        # 的工作区会永远被报成「匹配到多个」。
+        matches = [f for f in glob.glob(os.path.join(SESSION_LOG_DIR, "*.log"))
                    if workspace in os.path.basename(f)]
         if len(matches) > 1:
             announce(f"'{workspace}' 匹配到多个会话日志，请给出更长的片段：")
@@ -1565,8 +1714,10 @@ def main():
     p = sub.add_parser("uninstall", help="卸载 LaunchAgent")
     p.add_argument("--purge", action="store_true",
                    help="同时删除命令行、配置与日志")
+    p.add_argument("--keep-sessions", action="store_true",
+                   help="保留 doorman 启动的后台会话（默认卸载时结束）")
     p.add_argument("--stop-sessions", action="store_true",
-                   help="同时结束 doorman 启动的后台会话")
+                   help=argparse.SUPPRESS)  # 旧拼法；结束会话已是默认行为
     p.set_defaults(func=cmd_uninstall)
 
     sub.add_parser("list",
