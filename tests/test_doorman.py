@@ -628,11 +628,13 @@ class SessionScanTests(unittest.TestCase):
         self.assertIsNotNone(alert)
 
     def test_malformed_pid_entries_are_skipped(self):
-        # 登记文件是外部程序写的，pid 可能缺失、null、非数值、非正数：
-        # 一律当「没有活进程」跳过，也不能计入 live_other 误触登记格式
-        # 告警。必须用真实 alive 复现两个旧坑——pid=null 让 int(None) 抛
-        # TypeError 炸掉整轮巡检（scan_sessions 在 per-workspace 保护圈
-        # 之外）；pid 缺失时兜底的 -1 被 kill(-1, 0)（权限探测）读作存活。
+        # 登记文件是外部程序写的，pid 可能缺失、null、非数值、非正数、
+        # 超出 pid_t 的巨大整数（json.load 甚至会读进 Infinity）：一律当
+        # 「没有活进程」跳过，也不能计入 live_other 误触登记格式告警。
+        # 必须用真实 alive 复现旧坑——pid=null 让 int(None) 抛 TypeError、
+        # 超大整数让 os.kill 抛 OverflowError，都会炸掉整轮巡检
+        # （scan_sessions 在 per-workspace 保护圈之外）；pid 缺失时兜底的
+        # -1 被 kill(-1, 0)（权限探测）读作存活。
         d.alive = self.real_alive
         me = os.getpid()  # 一个确定存活的 pid：健康登记长这样
         d._pid_comm_is_claude = lambda pid: pid == me
@@ -640,6 +642,9 @@ class SessionScanTests(unittest.TestCase):
         self.write_reg("null.json", None, "/a")
         self.write_reg("neg.json", -1, "/a")
         self.write_reg("junk.json", "abc", "/a")
+        self.write_reg("huge.json", 10 ** 20, "/a")
+        with open(os.path.join(self.tmp, "inf.json"), "w") as f:
+            f.write('{"kind": "interactive", "pid": Infinity, "cwd": "/a"}')
         with open(os.path.join(self.tmp, "absent.json"), "w") as f:
             json.dump({"kind": "interactive", "cwd": "/a"}, f)
         consumers, alert = d.scan_sessions()

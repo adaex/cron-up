@@ -335,11 +335,12 @@ def task_view(task, now):
 # --------------------------------------------------------------- process ---
 
 def alive(pid):
-    # TypeError：pid 为 None 等非数值时 int() 抛的是它，同样读作「不存在」。
+    # TypeError：pid 为 None 等非数值时 int() 抛的是它；OverflowError：
+    # 超出 pid_t 的巨大整数（含 Infinity 转 int）。都读作「不存在」。
     try:
         os.kill(int(pid), 0)
         return True
-    except (OSError, ValueError, TypeError):
+    except (OSError, ValueError, TypeError, OverflowError):
         return False
 
 
@@ -556,14 +557,15 @@ def scan_sessions():
     comm_cache = {}
     live_other = 0
     for s in interactive:
-        # pid 也是外部程序写的字段：缺失、null、非数值、非正数都当
-        # 「没有活进程」跳过。这段代码在 per-workspace 保护圈之外，一个
-        # 畸形登记抛出去就是整轮巡检失败；而缺失时兜底 -1 会被
-        # kill(-1, 0)（对全部进程的权限探测，不是存在性检查）误读为存活。
+        # pid 也是外部程序写的字段：缺失、null、非数值、非正数、超出
+        # pid_t 的巨大整数（json 还会读进 Infinity）都当「没有活进程」
+        # 跳过。这段代码在 per-workspace 保护圈之外，一个畸形登记抛出去
+        # 就是整轮巡检失败；而缺失时兜底 -1 会被 kill(-1, 0)（对全部
+        # 进程的权限探测，不是存在性检查）误读为存活。
         pid = s.get("pid")
         try:
             pid = int(pid)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if pid <= 0 or not alive(pid):
             continue
@@ -1357,14 +1359,15 @@ def _overview_sessions(cols, state, suppress_cooling=()):
             dead.append(ws)  # 记录仍在、进程已没：下一轮巡检即清理
     tail = f"，冷却 {len(cooling)} 个"
     if dead:
-        tail += f"，已失效 {len(dead)} 个（下轮巡检清理）"
+        tail += f"，已失效 {len(dead)} 个"
     if live:
         desc = "、".join(
             f"{os.path.basename(ws)}（pid {ent['pid']}，已运行 "
             f"{max(0, cur - ent.get('startedAt', cur)) // 60} 分钟）"
             for ws, ent in live)
         head = f"会话：保活 {len(live)} 个（"
-        # desc 之外的固定部分逐字算宽，desc 按剩余宽度截断，整行不超终端。
+        # desc 之外的固定部分逐字算宽、desc 按剩余宽度截断；两位数计数下
+        # 固定部分 ≤ 46 列，最窄 60 列的终端也放得下整行。
         fixed = disp_width(head) + disp_width(tail) + disp_width("）")
         print(f"{head}{clip(desc, cols - fixed)}）{tail}")
     else:
