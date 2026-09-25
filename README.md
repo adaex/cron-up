@@ -33,18 +33,22 @@ doorman 是一个由 launchd 每 5 分钟运行一次的巡检脚本，逻辑只
 | 保证有会话在场 | launchd 每 5 分钟调用一次 `doorman run`，脚本运行完立即退出，不常驻 |
 | 周期任务续期 | 巡检时给周期任务补 `permanent: true`（默认开启、可关），使其不受 7 天过期限制；见下 |
 | 后台会话 | 通过 macOS 自带的 `script(1)` 启动无窗口交互界面，输出写入日志，可随时恢复 |
+| 安装与升级 | 二进制与校验和由 GitHub Actions 在每次发版时产出（打 `v*` tag 即触发）；本机经 `install.sh` 或 `doorman upgrade` 下载并校验 sha256，不依赖本地仓库 |
 
 各部分互不影响：卸载 doorman 后，定时任务文件依然有效，只是没人保证会话在场；删除任务文件后，doorman 巡检发现没有任务，什么都不会启动。
 
 ## 安装
 
+一行命令，从 GitHub 最新 release 下载并安装（脚本会先校验 sha256）：
+
 ```bash
-git clone git@github.com:adaex/doorman.git ~/space/doorman
-~/space/doorman/bin/doorman install \
+curl -fsSL https://raw.githubusercontent.com/adaex/doorman/main/install.sh | bash -s -- \
   --roots ~/code,~/work \
   --interval 300 \
   --lead 600
 ```
+
+参数原样传给 `doorman install`；不带参数则用默认扫描范围与间隔。开发本工具才需要 clone 仓库（见文末「测试」）。
 
 `--roots` 填写存放 agent 工作目录的父目录（逗号分隔）。不填时默认扫描家目录下两层以内（`~/` 自身、`~/*` 与 `~/*/*`），并自动跳过 `Library`、`Documents` 等系统目录和 `.git`、`node_modules`、`.cache` 等目录；建议显式指定，范围越小越安全、越快。使用默认范围安装时 install 会再打印一次安全提示：今后 clone 进家目录的任何仓库都会进入巡检，其中的周期任务会被自动续期永久化（原理见「安全说明」）。
 
@@ -87,10 +91,13 @@ doorman run                    # 立即手动巡检一次（与定时巡检互�
 doorman renew                  # 立即给所有周期任务补 permanent（手动执行，不受 autoRenew 开关影响）
 doorman logs                   # 查看巡检日志（stderr 有内容时在开头提示一行）
 doorman logs <目录名片段> -f    # 实时查看某个后台会话的界面输出
+doorman upgrade                # 从 GitHub 最新 release 升级（下载后校验 sha256，再原子替换）
 doorman uninstall              # 停止并卸载服务，结束后台保活会话，保留配置和日志
 doorman uninstall --keep-sessions   # 卸载但保留后台会话（例如马上重装）
 doorman uninstall --purge      # 结束后台会话并删除全部安装产物
 ```
+
+`doorman upgrade` 只换二进制、不碰配置与任务文件；launchd 按路径每轮拉起新进程，替换即生效，无需重载服务。从仓库直接跑 `bin/doorman install` 装的是本地工作副本（开发用）；已安装副本再跑 `install` 会明说二进制未动、不会假装升级。
 
 `doorman list` 按工作区分组，每个任务一行：状态列可能是下次执行时间、`已错过`（一次性任务触发点已过，下次会话启动时会补执行）、`一年内无`（一年的展示查找窗口内没有触发点，如 2 月 30 日这类永不满足的合法表达式）或 `cron 无效`（表达式无法解析，或字段越界、反向区间等任何分钟都不可能匹配的写法）；内容摘要取任务 prompt 的首个非空行；已续期的周期任务类型列显示为 `周期·永久`。自动续期关闭且仍有周期任务未打标时，无参数总览的「需要留意」会提示这些任务将于创建满 7 天后失效。不带任何参数的 `doorman` 是一页总览，把「任务已进入提前启动窗口却没有会话」「保活冷却中（若同时有任务待执行，会合并成一条带排查指引的告警，不会再承诺『下轮启动』）」「cron 无效」「配置与 launchd 实际间隔不一致」「会话登记格式疑似变更」等需要处理的情况集中列在「需要留意」里。
 
@@ -118,7 +125,8 @@ doorman spawn 的预热会话进程环境里带 `DOORMAN_SESSION=1`（值严格�
 - **修改扫描范围**：直接编辑配置文件的 `roots`、`maxDepth`，最多 5 分钟后的下一轮巡检自动生效，无需重新加载服务。
 - **开关自动续期**：编辑配置文件的 `autoRenew`（`true`/`false`）同样在下一轮巡检生效；或运行 `doorman install --force --auto-renew`（`--no-auto-renew` 关闭）。想立即处理一次而不改长期开关，用 `doorman renew`。
 - **修改巡检间隔或提前量**：重新运行 `doorman install --force --interval 600`，会重新生成 launchd 配置。`--force` 只更新命令行里显式给出的字段，其余配置（如 `roots`）保留；路径参数建议都加引号书写，例如 `--roots "$HOME/code,$HOME/work"`，避免 shell 对逗号后的波浪号不展开。
-- **升级**：`git pull` 后重新运行一次 `doorman install`，程序和 launchd 配置会被覆盖更新，配置文件保留。
+- **升级**：`doorman upgrade`。从 GitHub 最新 release 下载二进制与 SHA256SUMS，校验通过后原子替换，再用新二进制跑一轮巡检验证；配置文件保留。首次安装则执行 README 顶部的一行命令（install.sh）。
+- **发布（维护者）**：改 `bin/doorman` 里的 `VERSION` 并提交（与修复同一提交），随后 `git tag v<VERSION>` 推送 tag。GitHub Actions 会跑测试、校验 VERSION 与 tag 一致、产出 `doorman` 与 `SHA256SUMS` 资产并创建 Release；VERSION 与 tag 不符时发布直接失败，杜绝「代码是 0.1.8、tag 叫 0.1.9」这类漂移。push 到 main 的每次提交也会先跑一遍测试（ci workflow）。
 - **配置校验**：安装时会校验配置——间隔或提前量不是合法数字（布尔值也不行，`true` 不会被当成 1 秒）会中止安装；提前量小于间隔（可能来不及在任务前启动会话）、扫描目录不存在会给出明确警告。无参数的 `doorman` 总览随时也会显示这些问题；其中 interval 显示的是 launchd **实际生效**的间隔，手动改过 config 但与实际不一致时会提示需要重新 install。
 - **路径大小写**：macOS 默认文件系统大小写不敏感，而 `realpath` 并不规范化大小写。扫描入口会把 `roots` 认回磁盘上的真实写法，`doorman logs` 给绝对路径时也一样——大小写敲错不再是「警告一声然后匹配失效」，而是直接按同一路径工作。
 - **提前量与间隔的关系**：请保持 `leadSeconds ≥ intervalSeconds`，否则极端情况下任务会在两轮巡检之间到期而来不及启动。默认 600 ≥ 300 有一倍余量。`--lead 0` 是合法取值（表示不提前，只靠错过补执行兜底），会如实写入配置；`--interval 0` 非法，安装时直接报错中止。
@@ -136,7 +144,7 @@ doorman spawn 的预热会话进程环境里带 `DOORMAN_SESSION=1`（值严格�
   3. 若某个仓库把 `.claude/scheduled_tasks.json` 纳入了版本控制，首次续期会让该文件因新增 `"permanent": true`（及按统一的两空格缩进排版）出现 diff，提交前请知悉；本机自用仓通常已在 `.git/info/exclude` 忽略它，不受影响。
 - **任务文件本身就是执行输入，而不只是数据**：任何能在 roots 下某个已信任目录落盘 `.claude/scheduled_tasks.json` 的主体，等于登记了一条定时指令——最快 5 分钟后，doorman 就会为该目录拉起一个以你的身份运行、自动执行其中 prompt 的会话。这包括一次普通的 `git pull`（任务文件随提交进入工作树）和共享仓库的协作者。因此不要把他人可写仓库的父目录放进 roots；拉取外部代码后若发现 `.claude/scheduled_tasks.json` 被新增或改动，先看内容再让它留在那里。
 - 会话日志可能包含任务执行过程和输出，默认仅本人可读（600），对外分享或截图前请留意内容。
-- 本工具自身不发起任何网络请求；唯一的外部通信来自被启动的 agent 会话。
+- 巡检、保活与续期都不发起网络请求；唯一的例外是**安装与升级**：`doorman upgrade` 与 install.sh 会访问 GitHub（release 元数据与资产，域名 `api.github.com`/`github.com`），下载后先按 release 附带的 SHA256SUMS 校验 sha256，通过才落盘。除此之外的外部通信来自被启动的 agent 会话。
 
 ## 已知限制
 
@@ -158,12 +166,17 @@ doorman spawn 的预热会话进程环境里带 `DOORMAN_SESSION=1`（值严格�
 | 任务到点没有执行 | `doorman list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.doorman` 查看 last exit code |
 | 手动 `doorman run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错 |
 | `last exit code=2` | config.json 缺失、不是合法 JSON、顶层不是对象，或字段类型不对（如 `leadSeconds` 写成字符串）；无参数 `doorman` 总览的配置行或「需要留意」会给出具体原因 |
+| `doorman upgrade` 报「查询最新 release 失败」 | 多半是网络到不了 GitHub（或 API 限流）；已安装版本不受影响，网络恢复后重试 |
+| `doorman upgrade` 报「sha256 校验失败」 | 下载内容与 release 的校验和不符，已中止且原二进制未动；重试一次仍失败则可能是发布资产损坏，到仓库提 issue |
 
 ## 测试
 
 ```bash
+git clone git@github.com:adaex/doorman.git && cd doorman   # 开发才需要 clone
 /usr/bin/python3 -m unittest discover -s tests
 ```
+
+从仓库跑 `bin/doorman install` 会把本地工作副本装进系统（开发迭代的入口）；日常更新一律 `doorman upgrade`，与仓库无关。
 
 用例名与 docstring 自说明覆盖面，不再这里另抄一份清单（抄来的清单只会腐化）。
 

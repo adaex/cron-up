@@ -7,6 +7,7 @@ it is loaded explicitly via SourceFileLoader.
 import argparse
 import contextlib
 import datetime
+import hashlib
 import io
 import json
 import os
@@ -1575,6 +1576,18 @@ class InstallArgTests(unittest.TestCase):
                     d.cmd_install(args)
                 self.assertIn(expect, buf.getvalue())
 
+    def test_installed_copy_points_at_upgrade_instead_of_pretending(self):
+        # 已安装副本再跑 install：二进制无从更新，必须说破并指向 upgrade，
+        # 而不是静默跳过、照常打印「已安装命令行」装作升级成功。
+        d.BIN_PATH = os.path.realpath(d.__file__)
+        args = argparse.Namespace(roots=self.tmp, interval=None,
+                                  lead=None, force=True)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_install(args)
+        self.assertIn("doorman upgrade", buf.getvalue())
+        self.assertNotIn("已安装命令行", buf.getvalue())
+
     def test_zero_lead_is_an_explicit_choice_not_a_missing_flag(self):
         # `if args.lead:` dropped --lead 0 silently; 0 means "no lead time"
         # and is legal, so it must survive into the config.
@@ -1768,6 +1781,90 @@ class CliTests(unittest.TestCase):
                 d, "cmd_list", lambda args: captured.update(vars(args))):
             self.run_main(["doorman", "list"])
         self.assertNotIn("config", captured)
+
+
+class UpgradeTests(unittest.TestCase):
+    """cmd_upgrade: 从 GitHub release 拉取、校验、原子替换、新二进制首巡。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.bin = os.path.join(self.tmp, "doorman")
+        with open(self.bin, "w") as f:
+            f.write('VERSION = "0.1.9"\n')
+        for name in ("BIN_PATH", "latest_release", "_download"):
+            self.addCleanup(setattr, d, name, getattr(d, name))
+        d.BIN_PATH = self.bin
+
+    def good_blob(self):
+        blob = b"#!/usr/bin/env python3\nVERSION = \"9.9.9\"\n"
+        sums = f"{hashlib.sha256(blob).hexdigest()}  doorman\n".encode()
+        return blob, sums
+
+    def run_upgrade(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            try:
+                d.cmd_upgrade(argparse.Namespace())
+            except SystemExit as e:
+                return e.code, out.getvalue(), err.getvalue()
+        return 0, out.getvalue(), err.getvalue()
+
+    def test_upgrade_replaces_binary_after_checksum_verifies(self):
+        blob, sums = self.good_blob()
+        d.latest_release = lambda: ("v9.9.9", "https://x/doorman", "https://x/s")
+        d._download = mock.Mock(side_effect=[blob, sums])
+        with mock.patch.object(d.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout="", stderr="")):
+            code, out, _ = self.run_upgrade()
+        self.assertEqual(code, 0)
+        self.assertIn("已升级 0.1.9 → 9.9.9", out)
+        self.assertIn("首轮巡检完成", out)
+        with open(self.bin, "rb") as f:
+            self.assertEqual(f.read(), blob)
+
+    def test_checksum_mismatch_aborts_and_keeps_old_binary(self):
+        blob, _ = self.good_blob()
+        bad_sums = b"deadbeef" * 8 + b"  doorman\n"
+        d.latest_release = lambda: ("v9.9.9", "u1", "u2")
+        d._download = mock.Mock(side_effect=[blob, bad_sums])
+        code, _, err = self.run_upgrade()
+        self.assertEqual(code, 1)
+        self.assertIn("校验失败", err)
+        with open(self.bin) as f:
+            self.assertIn("0.1.9", f.read())
+
+    def test_already_latest_skips_download(self):
+        d.latest_release = lambda: ("v0.1.9", "u1", "u2")
+        d._download = mock.Mock(
+            side_effect=AssertionError("已是最新时不该下载"))
+        code, out, _ = self.run_upgrade()
+        self.assertEqual(code, 0)
+        self.assertIn("已是最新", out)
+
+    def test_api_failure_exits_with_one_line(self):
+        d.latest_release = mock.Mock(side_effect=OSError("无网络"))
+        code, _, err = self.run_upgrade()
+        self.assertEqual(code, 1)
+        self.assertIn("查询最新 release 失败", err)
+
+    def test_upgrade_without_installation_points_at_install(self):
+        os.remove(self.bin)
+        code, _, err = self.run_upgrade()
+        self.assertEqual(code, 1)
+        self.assertIn("全新安装", err)
+
+    def test_failed_first_patrol_is_reported(self):
+        blob, sums = self.good_blob()
+        d.latest_release = lambda: ("v9.9.9", "u1", "u2")
+        d._download = mock.Mock(side_effect=[blob, sums])
+        with mock.patch.object(d.subprocess, "run", return_value=mock.Mock(
+                returncode=2, stdout="", stderr="配置损坏")):
+            code, _, err = self.run_upgrade()
+        self.assertEqual(code, 1)
+        self.assertIn("退出码 2", err)
+        self.assertIn("配置损坏", err)
 
 
 class RenewTests(unittest.TestCase):

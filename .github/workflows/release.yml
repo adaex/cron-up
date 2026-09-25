@@ -1,0 +1,46 @@
+name: release
+
+# 发布即打版本 tag：测试通过 → 校验 VERSION 与 tag 一致 → 产出资产并发布
+# GitHub Release。upgrade 命令与 install.sh 都从 release 资产下载。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: /usr/bin/python3 -m unittest discover -s tests
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify VERSION matches the tag
+        run: |
+          version="v$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' bin/doorman)"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "bin/doorman 的 VERSION（$version）与 tag" \
+              "（$GITHUB_REF_NAME）不一致：先改版本号再发版" >&2
+            exit 1
+          fi
+
+      - name: Package release assets
+        run: |
+          mkdir -p dist
+          cp bin/doorman dist/doorman
+          chmod 0755 dist/doorman
+          (cd dist && sha256sum doorman > SHA256SUMS)
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/doorman \
+          dist/SHA256SUMS --generate-notes
