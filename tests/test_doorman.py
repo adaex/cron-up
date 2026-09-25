@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import stat
+import sys
 import tempfile
 import time
 import unittest
@@ -226,6 +227,25 @@ class ValidationTests(unittest.TestCase):
             announce=lambda _: None)
         self.assertTrue(any("roots" in w for w in warnings))
 
+    def test_root_with_wrong_case_warns(self):
+        # macOS 默认文件系统大小写不敏感：敲错大小写的 roots 照样 isdir，
+        # 但会话登记按真实路径匹配，消费者判断会静默失效——必须警告。
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        typed = os.path.join(os.path.dirname(tmp),
+                             os.path.basename(tmp).swapcase())
+        if not os.path.isdir(typed):
+            self.skipTest("大小写敏感的文件系统上无法构造该场景")
+        warnings = d.validate_config(
+            {"intervalSeconds": 300, "leadSeconds": 600, "roots": [typed]},
+            announce=lambda _: None)
+        self.assertTrue(any("大小写" in w for w in warnings))
+        self.assertTrue(any(tmp in w for w in warnings))  # 给出正确写法
+
+    def test_on_disk_case_passes_missing_paths_through(self):
+        self.assertEqual(d.on_disk_case("/nonexistent/xyz/abc"),
+                         "/nonexistent/xyz/abc")
+
     def test_corrupt_json_exits_cleanly(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json",
                                          delete=False) as f:
@@ -268,6 +288,16 @@ class ValidationTests(unittest.TestCase):
         cfg = d.load_config(path)
         self.assertIsInstance(cfg["roots"], list)
         self.assertNotIn("~", "".join(cfg["roots"]))
+
+    def test_bool_maxdepth_is_coerced_to_default(self):
+        # bool 是 int 的子类：手改 config 写入 true 不能冒充合法深度
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            json.dump({"maxDepth": True}, f)
+            path = f.name
+        self.addCleanup(os.unlink, path)
+        self.assertEqual(d.load_config(path)["maxDepth"],
+                         d.DEFAULT_CONFIG["maxDepth"])
 
 
 class WantedTests(unittest.TestCase):
@@ -667,6 +697,16 @@ class StateMachineTests(unittest.TestCase):
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["pid"], 100)
 
+    def test_bool_lead_seconds_fails_the_launchd_entry(self):
+        # bool 是 int 的子类：手改 config 写入 true 必须像其他非法值一样
+        # 让 launchd 入口以退出码 2 失败，而不是静默变成 1 秒提前量。
+        write_json(self.cfg_path,
+                   {"roots": ["/x"], "maxDepth": 3, "intervalSeconds": 300,
+                    "leadSeconds": True})
+        with self.assertRaises(SystemExit) as ctx:
+            self.patrol()
+        self.assertEqual(ctx.exception.code, 2)
+
     def test_one_broken_workspace_does_not_stop_the_patrol(self):
         """discover() is a generator: an exception would skip the rest."""
         visited = []
@@ -769,6 +809,33 @@ class SessionScanTests(unittest.TestCase):
             f.write("{ truncated")
         _, alert = d.scan_sessions()
         self.assertIsNotNone(alert)
+
+    def test_transiently_unreadable_registration_is_retried(self):
+        # Claude Code 会就地重写登记文件（非原子），读写相撞读到半个
+        # JSON：睡一拍重读能拿回完整内容，这一轮不能误判成「无会话」。
+        self.live, self.claude = {101}, {101}
+        with open(os.path.join(self.tmp, "a.json"), "w") as f:
+            f.write("占位：json.load 被接管，真实内容不参与")
+        good = {"kind": "interactive", "pid": 101,
+                "cwd": os.path.realpath(self.tmp)}
+        with mock.patch.object(d.json, "load",
+                               side_effect=[ValueError("mid-write"), good]), \
+                mock.patch.object(d.time, "sleep") as sleep:
+            consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, {os.path.realpath(self.tmp)})
+        self.assertIsNone(alert)
+        sleep.assert_called_once_with(0.1)
+
+    def test_permanently_corrupt_registration_gives_up_after_one_retry(self):
+        with open(os.path.join(self.tmp, "bad.json"), "w") as f:
+            f.write("占位：json.load 被接管，真实内容不参与")
+        with mock.patch.object(d.json, "load",
+                               side_effect=ValueError("corrupt")), \
+                mock.patch.object(d.time, "sleep") as sleep:
+            consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, set())
+        self.assertIsNotNone(alert)  # 有文件却读不出会话：自检告警仍在
+        self.assertEqual(sleep.call_count, 1)  # 只重试一次，不无限纠缠
 
     def test_live_non_claude_process_alerts(self):
         # A recycled/other pid holding a registration: consumers must not
@@ -1118,6 +1185,33 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("需要留意", out)
         self.assertIn("会话：", out)
 
+    def test_bool_numeric_fields_alert_like_other_bad_types(self):
+        # true/false 是 int 子类，不能被当成合法的间隔/提前量
+        write_json(self.cfg_path,
+                   {"roots": [self.tmp], "maxDepth": 3,
+                    "intervalSeconds": True, "leadSeconds": False})
+        out = self.render()
+        self.assertIn("应为整数秒", out)
+        self.assertIn("需要留意", out)
+
+    def test_live_session_outside_scan_scope_is_flagged(self):
+        # 目录从巡检视野消失（任务文件被删/移出 roots）后，它的保活会话
+        # 不再被回收或换代——总览必须把这种「无人管理」的会话点出来。
+        me = os.getpid()
+        d.discover = lambda roots, depth: iter([])
+        out = self.render(state={WS_PATH: {
+            "pid": me, "startedAt": int(time.time()) - 60,
+            "procStart": None}})
+        self.assertIn("已不在巡检范围", out)
+
+    def test_live_session_inside_scan_scope_is_not_flagged(self):
+        me = os.getpid()
+        out = self.render(state={WS_PATH: {
+            "pid": me, "startedAt": int(time.time()) - 60,
+            "procStart": None}})
+        self.assertIn("保活 1 个", out)
+        self.assertNotIn("已不在巡检范围", out)
+
     def test_live_sessions_show_pid_and_dead_entries_are_counted(self):
         # 会话明细行并入总览后，pid 与失效条目计数是它独有的信息。
         me = os.getpid()  # tracked_alive 需要一个真实存活的 pid
@@ -1308,6 +1402,16 @@ class InstallArgTests(unittest.TestCase):
             self.install(interval=0)
         self.assertEqual(ctx.exception.code, 1)
 
+    def test_bool_interval_in_config_is_rejected_loudly(self):
+        # true 是 int 的子类，不能被 isinstance(int) 当成合法间隔：
+        # 手改进现有配置的布尔值要在安装校验处被拦下。
+        write_json(d.CONFIG_PATH,
+                   {"roots": [self.tmp], "maxDepth": 2,
+                    "intervalSeconds": True, "leadSeconds": 600})
+        with self.assertRaises(SystemExit) as ctx:
+            self.install()
+        self.assertEqual(ctx.exception.code, 1)
+
     def test_explicitly_empty_roots_is_rejected_loudly(self):
         # `--roots ,` 解析不出任何有效目录：必是手误，静默写进配置
         # 会让巡检从此空转。
@@ -1421,14 +1525,15 @@ class UninstallTests(unittest.TestCase):
         self.uninstall(keep_sessions=True)
         self.assertEqual(self.stopped, [])
 
-    def test_legacy_stop_sessions_flag_is_accepted(self):
-        # 旧拼法 --stop-sessions（曾是非默认的开关）不能变成未知参数错误。
-        write_json(d.STATE_PATH, {"/x": {"pid": 11}})
-        args = argparse.Namespace(purge=False, keep_sessions=False,
-                                  stop_sessions=True)
-        with contextlib.redirect_stdout(io.StringIO()):
-            d.cmd_uninstall(args)
-        self.assertEqual(self.stopped, [11])
+    def test_legacy_stop_sessions_flag_is_gone(self):
+        # 旧拼法 --stop-sessions 已删除：个人工具不留双拼法，未知参数
+        # 必须像其他误输一样报用法错误（argparse 退出码 2）。
+        with mock.patch.object(
+                sys, "argv", ["doorman", "uninstall", "--stop-sessions"]), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                d.main()
+        self.assertEqual(ctx.exception.code, 2)
 
 
 class RenewTests(unittest.TestCase):

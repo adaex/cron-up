@@ -346,8 +346,9 @@ def task_view(task, now):
                 "permanent": False}
     nxt = cron.next_after(now, within_days=DISPLAY_SEARCH_DAYS)
     oneshot = task_is_oneshot(task)
-    missed = (oneshot and task_wanted(task, now, ZERO_LEAD)
-              and (nxt is None or nxt > now))
+    # nxt 按定义严格晚于 now，「已错过」完全由 task_wanted 的补执行判定
+    # 回答，无需再对 nxt 设防。
+    missed = oneshot and task_wanted(task, now, ZERO_LEAD)
     expr_s = expr if isinstance(expr, str) else str(expr)
     return {
         "valid": True, "nxt": nxt, "missed": missed,
@@ -577,6 +578,27 @@ def _pid_is_claude(pid):
     return False
 
 
+def read_session_file(path):
+    """读一个会话登记文件；读不出返回 None。
+
+    登记是 Claude Code 以 UTF-8 写的，显式指定编码（同 load_task_doc）。
+    它会就地重写登记（2.1.281 实测读到过半成品文件）：解析失败睡一拍
+    重读一次，仍失败才放弃——否则读写相撞的这一轮会把该工作区误判成
+    「无会话」，在用户会话旁边多拉一个。文件消失（OSError）不是竞态，
+    不重试。
+    """
+    for attempt in range(2):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                return json.load(fh)
+        except OSError:
+            return None
+        except ValueError:
+            if attempt:
+                return None
+            time.sleep(0.1)
+
+
 def scan_sessions():
     """Read the session registry once per patrol/page.
 
@@ -589,12 +611,7 @@ def scan_sessions():
     files = glob.glob(os.path.join(SESSION_DIR, "*.json"))
     interactive = []
     for f in files:
-        try:
-            # 登记是 Claude Code 以 UTF-8 写的，显式指定（同 load_task_doc）
-            with open(f, encoding="utf-8") as fh:
-                s = json.load(fh)
-        except (OSError, ValueError):
-            continue
+        s = read_session_file(f)
         if isinstance(s, dict) and s.get("kind") == "interactive":
             interactive.append(s)
 
@@ -663,6 +680,11 @@ def normalize_roots(roots):
             for r in roots if isinstance(r, str) and r.strip()]
 
 
+def _is_int(x):
+    """配置数值校验用：bool 是 int 的子类，true 不能冒充合法的秒数/深度。"""
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
 def load_config(path=CONFIG_PATH, missing_ok=False, corrupt_ok=False):
     """Load config, exiting legibly on damage.
 
@@ -694,7 +716,7 @@ def load_config(path=CONFIG_PATH, missing_ok=False, corrupt_ok=False):
     if not isinstance(merged.get("roots"), list):
         merged["roots"] = DEFAULT_CONFIG["roots"]
     merged["roots"] = normalize_roots(merged["roots"])
-    if not isinstance(merged.get("maxDepth"), int) or merged["maxDepth"] < 0:
+    if not _is_int(merged.get("maxDepth")) or merged["maxDepth"] < 0:
         merged["maxDepth"] = DEFAULT_CONFIG["maxDepth"]
     if not isinstance(merged.get("autoRenew"), bool):
         merged["autoRenew"] = DEFAULT_CONFIG["autoRenew"]
@@ -932,7 +954,7 @@ def cmd_run(args):
         return
     rotate_patrol_logs()
     cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
-    if not isinstance(cfg.get("leadSeconds"), int) or cfg["leadSeconds"] < 0:
+    if not _is_int(cfg.get("leadSeconds")) or cfg["leadSeconds"] < 0:
         print(f"配置错误：leadSeconds 必须是非负整数秒，当前为 "
               f"{cfg.get('leadSeconds')!r}", file=sys.stderr)
         sys.exit(2)
@@ -1157,6 +1179,34 @@ def launchctl(*args, check=True):
                           text=True, check=check)
 
 
+def on_disk_case(path):
+    """路径在磁盘上真实存储的大小写形态；任何一段读不出时原样返回。
+
+    macOS 默认文件系统大小写不敏感，而 realpath 并不规范化大小写（实测）：
+    敲错大小写的 roots 照样通过 isdir，但 discover 产出的工作区路径会带着
+    错误的大小写，与 Claude Code 登记的真实 cwd 永远匹配不上，消费者判断
+    随之静默失效（同目录被再拉一个会话）。逐段从目录列表里认回真实写法，
+    供安装/总览校验比对。
+    """
+    parts = []
+    p = path.rstrip(os.sep) or os.sep
+    while True:
+        head, tail = os.path.split(p)
+        if not tail:
+            break
+        parts.append(tail)
+        p = head
+    cur = p  # 循环结束时 p 已停在根
+    for name in reversed(parts):
+        try:
+            match = next(e for e in os.listdir(cur)
+                         if e.lower() == name.lower())
+        except (OSError, StopIteration):
+            return path
+        cur = os.path.join(cur, match)
+    return cur
+
+
 def validate_config(cfg, announce=print):
     """Soft checks (non-fatal): prints and returns warning strings."""
     warnings = []
@@ -1165,7 +1215,7 @@ def validate_config(cfg, announce=print):
                         "doorman 形同空转")
     interval = cfg.get("intervalSeconds")
     lead = cfg.get("leadSeconds")
-    if isinstance(interval, int) and isinstance(lead, int) \
+    if _is_int(interval) and _is_int(lead) \
             and interval > 0 and 0 <= lead < interval:
         warnings.append(
             f"leadSeconds={lead} 小于 intervalSeconds={interval}：任务可能在"
@@ -1173,6 +1223,12 @@ def validate_config(cfg, announce=print):
     for root in cfg.get("roots", []):
         if not os.path.isdir(root):
             warnings.append(f"扫描目录不存在，巡检不会覆盖它：{root}")
+            continue
+        real_case = on_disk_case(root)
+        if real_case != root:
+            warnings.append(
+                f"扫描目录的大小写与磁盘实际不符（应为 {real_case}）：{root}；"
+                f"会话登记按真实路径匹配，不一致会导致同目录重复拉起会话")
     for w in warnings:
         announce(f"警告：{w}")
     return warnings
@@ -1191,7 +1247,9 @@ def cmd_install(args):
         pass
 
     if os.path.exists(CONFIG_PATH) and not args.force:
-        cfg = load_config()
+        # 显式传 path：load_config 的默认参数在定义时绑定，测试替换
+        # 模块级 CONFIG_PATH 后默认参数仍指向旧值。
+        cfg = load_config(CONFIG_PATH)
         print(f"保留现有配置：{CONFIG_PATH}"
               f"（需要更新时加 --force）")
     else:
@@ -1238,10 +1296,10 @@ def cmd_install(args):
     # values abort; soft problems (small lead, missing dirs) only warn.
     iv = cfg.get("intervalSeconds")
     lv = cfg.get("leadSeconds")
-    if not isinstance(iv, int) or iv <= 0:
+    if not _is_int(iv) or iv <= 0:
         print(f"intervalSeconds 必须是正整数秒，当前为 {iv!r}", file=sys.stderr)
         sys.exit(1)
-    if not isinstance(lv, int) or lv < 0:
+    if not _is_int(lv) or lv < 0:
         print(f"leadSeconds 必须是非负整数秒，当前为 {lv!r}", file=sys.stderr)
         sys.exit(1)
     validate_config(cfg)
@@ -1290,8 +1348,7 @@ def cmd_uninstall(args):
         print("已从 launchd 卸载")
 
     # 服务没了就没有回收者：默认结束自己启动的保活会话，不留以 bypass
-    # 权限空转的孤儿。--stop-sessions 是旧拼法（现已是默认行为），
-    # --keep-sessions 显式保留（例如马上会重装）。
+    # 权限空转的孤儿。--keep-sessions 显式保留（例如马上会重装）。
     if not getattr(args, "keep_sessions", False):
         for ws, ent in load_state().items():
             if tracked_alive(ent):
@@ -1376,10 +1433,10 @@ def cmd_overview(args):
     # 判定式与 cmd_run 的守卫保持一致。
     bad_fields = []
     if cfg is not None:
-        if not isinstance(cfg.get("intervalSeconds"), int) \
+        if not _is_int(cfg.get("intervalSeconds")) \
                 or cfg["intervalSeconds"] <= 0:
             bad_fields.append("intervalSeconds")
-        if not isinstance(cfg.get("leadSeconds"), int) \
+        if not _is_int(cfg.get("leadSeconds")) \
                 or cfg["leadSeconds"] < 0:
             bad_fields.append("leadSeconds")
 
@@ -1395,6 +1452,9 @@ def cmd_overview(args):
     # Workspaces whose cooldown is reported in the task section with full
     # context, so the session section does not add a blunter duplicate.
     cooling_warned = set()
+    # 本轮巡检视野内的工作区集合，供会话部分识别「已无人管理」的保活
+    # 会话；配置不可用时保持 None（无法判断视野，不误报）。
+    discovered = None
     if cfg_error is not None:
         # 页面不能死在半路：损坏配置是「需要留意」的一种，巡检本身
         # （launchd 入口）仍会以退出码 2 失败，错误详情见 doorman logs。
@@ -1433,13 +1493,13 @@ def cmd_overview(args):
         alerts.extend(validate_config(
             cfg, announce=lambda _: None))
         print()
-        task_alerts, cooling_warned = _overview_tasks(
+        task_alerts, cooling_warned, discovered = _overview_tasks(
             cfg, cols, consumers, state)
         alerts.extend(task_alerts)
 
     # 会话状态来自 state.json，与配置无关：未安装或配置损坏时也可能有
     # 残留的保活会话，照常展示。
-    alerts.extend(_overview_sessions(cols, state, cooling_warned))
+    alerts.extend(_overview_sessions(cols, state, cooling_warned, discovered))
 
     if alerts:
         print("需要留意：")
@@ -1461,9 +1521,14 @@ def cmd_overview(args):
 
 
 def _overview_tasks(cfg, cols, consumers, state):
-    """总览页的任务盘点部分，返回 (告警, 已在告警里说明冷却的工作区集合)。"""
+    """总览页的任务盘点部分。
+
+    返回 (告警, 已在告警里说明冷却的工作区集合, 本轮发现的工作区集合)。
+    第三个返回值供会话部分识别「已移出巡检视野」的保活会话。
+    """
     alerts = []
     cooling_warned = set()
+    discovered = set()
     now = datetime.datetime.now()
     cur = int(now.timestamp())
     lead = datetime.timedelta(seconds=cfg["leadSeconds"])
@@ -1471,6 +1536,7 @@ def _overview_tasks(cfg, cols, consumers, state):
     n_ws = n_tasks = unrenewed = 0
     soonest = None
     for ws, _ in discover(cfg["roots"], cfg["maxDepth"]):
+        discovered.add(ws)
         try:
             tasks = read_tasks(ws) or []
         except Exception:  # noqa: BLE001 — 总览页不能被一个坏目录带走
@@ -1527,7 +1593,7 @@ def _overview_tasks(cfg, cols, consumers, state):
             f"自动续期已关闭：{unrenewed} 个周期任务尚未标记 permanent，"
             f"创建满 7 天后会末次执行并被删除。运行 doorman renew 立即续期，"
             f"或在配置中开启 autoRenew")
-    return alerts, cooling_warned
+    return alerts, cooling_warned, discovered
 
 
 def session_age_zh(started_at, cur):
@@ -1538,8 +1604,13 @@ def session_age_zh(started_at, cur):
     return f"{secs // 60} 分钟"
 
 
-def _overview_sessions(cols, state, suppress_cooling=()):
-    """总览页的保活会话部分，数据来自 state.json，与配置状态无关。"""
+def _overview_sessions(cols, state, suppress_cooling=(), discovered=None):
+    """总览页的保活会话部分，数据来自 state.json，与配置状态无关。
+
+    discovered 是本轮巡检视野内的工作区集合（配置不可用时为 None，不做
+    越界判断）：活着却不在其中的会话已经无人管理——巡检只为发现范围内
+    的工作区服务，视野外的会话不会被回收或换代，必须提示出来。
+    """
     alerts = []
     cur = int(time.time())
     live, cooling, dead = [], [], []
@@ -1571,6 +1642,13 @@ def _overview_sessions(cols, state, suppress_cooling=()):
         eta = max(0, (ent["cooldownUntil"] - cur) // 60)
         alerts.append(f"{ws} 保活连续失败 {ent.get('fails', '?')} 次，"
                       f"冷却中，约 {eta} 分钟后重试")
+    if discovered is not None:
+        for ws, ent in live:
+            if ws not in discovered:
+                alerts.append(
+                    f"{ws} 的保活会话（pid {ent['pid']}）仍在运行，但该目录"
+                    f"已不在巡检范围内（任务文件被删或已移出 roots），"
+                    f"doorman 不会再回收或换代它；不需要时请自行结束")
     return alerts
 
 
@@ -1716,8 +1794,6 @@ def main():
                    help="同时删除命令行、配置与日志")
     p.add_argument("--keep-sessions", action="store_true",
                    help="保留 doorman 启动的后台会话（默认卸载时结束）")
-    p.add_argument("--stop-sessions", action="store_true",
-                   help=argparse.SUPPRESS)  # 旧拼法；结束会话已是默认行为
     p.set_defaults(func=cmd_uninstall)
 
     sub.add_parser("list",
