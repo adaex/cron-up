@@ -42,5 +42,6 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/doorman \
-          dist/SHA256SUMS --generate-notes
+        # 单行书写：YAML 会把纯标量里的换行折叠成空格，行尾 \ 续行在
+        # bash 里反而变成「\ + 空格」的转义空格，资产名会带前导空格。
+        run: gh release create "$GITHUB_REF_NAME" dist/doorman dist/SHA256SUMS --generate-notes
