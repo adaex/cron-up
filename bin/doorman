@@ -966,19 +966,20 @@ def stop_session(ent):
 
     Verifies identity first: state entries outlive the processes they name,
     and signalling a recycled pid would kill an unrelated process group.
+    调用方只依赖副作用，不读返回值。
     """
     if not tracked_alive(ent):
-        return False
+        return
     pid = ent["pid"]
     try:
         os.killpg(pid, signal.SIGTERM)
     except OSError:
-        return False
+        return
     for _ in range(20):
         time.sleep(0.1)
         reap(pid)
         if not alive(pid):
-            return True
+            return
     if tracked_alive(ent):
         try:
             os.killpg(pid, signal.SIGKILL)
@@ -986,7 +987,6 @@ def stop_session(ent):
             pass
         time.sleep(0.1)
         reap(pid)
-    return True
 
 
 def session_log_idle_seconds(log_path, cur):
