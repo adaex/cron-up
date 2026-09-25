@@ -266,6 +266,31 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             d.load_config(path, corrupt_ok=True)
 
+    def test_non_object_json_config_exits_legibly(self):
+        # 手改成合法 JSON 但顶层不是对象（123、["a"]）：dict.update 会在
+        # try 之外抛 TypeError/ValueError——launchd 入口每轮 traceback。
+        # 与「不是合法 JSON」同等对待：一行原因、退出码 2。
+        for content in ("123", '["a", "b"]', '"text"'):
+            with self.subTest(content=content):
+                with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                                 delete=False) as f:
+                    f.write(content)
+                    path = f.name
+                self.addCleanup(os.unlink, path)
+                with self.assertRaises(SystemExit) as ctx:
+                    d.load_config(path)
+                self.assertEqual(ctx.exception.code, 2)
+
+    def test_non_object_json_config_is_corrupt_for_human_pages(self):
+        # 总览页选择接住损坏配置继续渲染：非对象配置要以 ValueError 报出。
+        with tempfile.NamedTemporaryFile("w", suffix=".json",
+                                         delete=False) as f:
+            f.write("123")
+            path = f.name
+        self.addCleanup(os.unlink, path)
+        with self.assertRaises(ValueError):
+            d.load_config(path, corrupt_ok=True)
+
     def test_missing_config_exits_cleanly_for_launchd(self):
         # `run` is launchd's entry point: a deleted config must produce a
         # one-line reason, not a traceback with exit code 0.
@@ -528,6 +553,21 @@ class StateMachineTests(unittest.TestCase):
         self.consumer = False
         self.patrol()
         self.assertEqual(self.state()[WS_PATH]["fails"], 0)
+
+    def test_observed_registration_resets_streak_even_when_nothing_wanted(self):
+        # 健康会话长期常驻（周期任务不在提前窗口，wanted 轮次一直不来）：
+        # 失败计数必须在看到登记的当轮就清零——否则计数挂在活会话头上，
+        # 之后一次无关死亡（重启）就把陈年计数顶满冷却。
+        self.patrol()
+        pid1 = self.state()[WS_PATH]["pid"]
+        d.read_tasks = lambda ws: [{"cron": "0 9 1 1 *", "recurring": True}]
+        s = self.state()
+        s[WS_PATH]["fails"] = 2
+        write_json(d.STATE_PATH, s)
+        self.consumer = True  # 会话早已登记，只是近期没有任务想要它
+        self.patrol()
+        self.assertEqual(self.state()[WS_PATH]["fails"], 0)
+        self.assertEqual(self.state()[WS_PATH]["pid"], pid1)
 
     def test_stuck_session_is_retired_and_counted(self):
         """Alive but never registering — parked on a trust/permission prompt.
@@ -878,6 +918,28 @@ class SessionScanTests(unittest.TestCase):
         self.assertEqual(consumers, {os.path.realpath(self.tmp)})
         self.assertIsNone(alert)
 
+    def test_registrations_without_pid_or_cwd_alert(self):
+        # 登记还能认出 interactive，但 pid/cwd 字段集体读不出（改名、
+        # 缺失）：前两条自检分别只看 kind 与进程形态，兜不住这种漂移，
+        # consumers 会静默变空、已有会话旁边被重复拉起——第三条烟雾
+        # 告警兜这个洞。
+        self.live, self.claude = {101}, {101}
+        with open(os.path.join(self.tmp, "nopid.json"), "w") as f:
+            json.dump({"kind": "interactive", "cwd": "/a"}, f)
+        self.write_reg("nocwd.json", 101, None)
+        consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, set())
+        self.assertIsNotNone(alert)
+        self.assertIn("pid", alert)
+
+    def test_dead_pid_registrations_are_quiet(self):
+        # 进程已退出的陈旧登记是正常现象（Claude Code 崩溃会留下），
+        # 不是格式漂移，不许误报。
+        self.write_reg("stale.json", 999, "/a")
+        consumers, alert = d.scan_sessions()
+        self.assertEqual(consumers, set())
+        self.assertIsNone(alert)
+
 
 class ClaudeProcessDetectionTests(unittest.TestCase):
     """_pid_is_claude：原生安装看 comm；npm/bun 形态是解释器进程，
@@ -1113,6 +1175,12 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("无保活会话", out)
         self.assertIn("常用命令", out)
 
+    def test_no_cooling_tail_when_nothing_is_cooling(self):
+        # 没有冷却中的会话时不显示「冷却 0 个」——计数后缀只在有事时说。
+        out = self.render()
+        self.assertIn("会话：无保活会话", out)
+        self.assertNotIn("冷却", out)
+
     def test_task_inventory_and_soonest_line(self):
         out = self.render([{
             "cron": "59 23 * * *", "recurring": True,
@@ -1284,6 +1352,18 @@ class StateFileTests(unittest.TestCase):
         self.assertIsNone(st["/d"]["pid"])           # 超出 pid_t
         self.assertEqual(st["/e"]["pid"], 1)         # 浮点截断（pid 1 必死）
 
+    def test_non_numeric_fails_cannot_wedge_a_workspace(self):
+        # fails 不做整型化的话，手改成字符串会让巡检在 fails+1 处抛
+        # TypeError——每轮都被 per-workspace 保护圈接住，该工作区永远
+        # 等不到会话。load_state 与其他数值字段一并清洗。
+        self.write('{"/a": {"pid": 1, "fails": "abc"},'
+                   ' "/b": {"pid": 1, "fails": "2"},'
+                   ' "/c": {"pid": 1, "fails": 2.7}}')
+        st = d.load_state()
+        self.assertNotIn("fails", st["/a"])    # 非数值按「字段不存在」
+        self.assertEqual(st["/b"]["fails"], 2)  # 数字字符串按数值接受
+        self.assertEqual(st["/c"]["fails"], 2)  # 浮点截断
+
     def test_missing_file_reads_as_empty(self):
         self.assertEqual(d.load_state(), {})
 
@@ -1401,6 +1481,16 @@ class InstallArgTests(unittest.TestCase):
         with self.assertRaises(SystemExit) as ctx:
             self.install(interval=0)
         self.assertEqual(ctx.exception.code, 1)
+
+    def test_non_object_legacy_config_is_ignored_on_force(self):
+        # 手改成合法 JSON 但顶层不是对象：--force 合并旧配置时不能
+        # 在 dict.update 上抛 TypeError，按没有旧值、全部默认处理。
+        with open(d.CONFIG_PATH, "w") as f:
+            f.write("123")
+        cfg = self.install()
+        self.assertEqual(cfg["intervalSeconds"],
+                         d.DEFAULT_CONFIG["intervalSeconds"])
+        self.assertEqual(cfg["roots"], [self.tmp])
 
     def test_bool_interval_in_config_is_rejected_loudly(self):
         # true 是 int 的子类，不能被 isinstance(int) 当成合法间隔：

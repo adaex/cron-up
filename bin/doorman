@@ -605,8 +605,10 @@ def scan_sessions():
     Returns (workspaces_with_a_live_consumer, registry_alert). The registry
     is another program's undocumented output: if its shape changes we fail
     SILENTLY — every session reads as "absent", so patrols kill and respawn
-    their warm sessions in a loop. The alert is the canary for that: files
-    exist but zero registrations look like a live interactive Claude Code.
+    their warm sessions in a loop. The alert is the canary for that, armed
+    for three distinct drift shapes: no file parses as interactive (kind
+    changed), live processes are all non-claude (launch shape changed),
+    and interactive registrations yield no usable pid/cwd (fields renamed).
     """
     files = glob.glob(os.path.join(SESSION_DIR, "*.json"))
     interactive = []
@@ -618,19 +620,27 @@ def scan_sessions():
     consumers = set()
     comm_cache = {}
     live_other = 0
+    # 登记能认出 interactive，却读不出有效 pid 或工作目录的条目数：
+    # pid/cwd 字段改名或缺失就是这种形态，而下面两条自检分别只看
+    # kind 与进程形态，都兜不住它——这是第三条自检的计数。
+    suspect = 0
     for s in interactive:
-        # pid 也是外部程序写的字段：缺失、null、非数值、非正数、超出
-        # pid_t 的巨大整数（json 还会读进 Infinity）都当「没有活进程」
-        # 跳过。这段代码在 per-workspace 保护圈之外，一个畸形登记抛出去
-        # 就是整轮巡检失败；而缺失时兜底 -1 会被 kill(-1, 0)（对全部
-        # 进程的权限探测，不是存在性检查）误读为存活。
+        # pid 也是外部程序写的字段：null、非数值、非正数、超出 pid_t
+        # 的巨大整数（json 还会读进 Infinity）都读不出活进程。这段代码
+        # 在 per-workspace 保护圈之外，一个畸形登记抛出去就是整轮巡检
+        # 失败；而缺失时兜底 -1 会被 kill(-1, 0)（对全部进程的权限探测，
+        # 不是存在性检查）误读为存活。
         pid = s.get("pid")
         try:
             pid = int(pid)
         except (TypeError, ValueError, OverflowError):
+            suspect += 1  # 正常登记必带可解析的 pid：缺失/变质即字段漂移
             continue
-        if pid <= 0 or not alive(pid):
+        if pid <= 0:
+            suspect += 1
             continue
+        if not alive(pid):
+            continue  # 进程已退出的陈旧登记：正常现象（崩溃会留下），不计
         if pid not in comm_cache:
             comm_cache[pid] = _pid_is_claude(pid)  # ps calls cached per pid
         if comm_cache[pid]:
@@ -643,6 +653,8 @@ def scan_sessions():
                 cwd = os.path.realpath(cwd)
                 if cwd:
                     consumers.add(cwd)
+                    continue
+            suspect += 1  # 活着的 claude 却没有可用 cwd：cwd 字段漂移
         else:
             live_other += 1
 
@@ -654,6 +666,10 @@ def scan_sessions():
     elif live_other and not consumers:
         alert = ("会话登记中的存活进程都不是 claude 命令；Claude Code 的启动"
                  "形态可能已变更，doorman 可能反复重拉会话")
+    elif suspect and not consumers:
+        alert = ("会话登记中的 interactive 会话都读不出有效的 pid 或工作"
+                 "目录；Claude Code 的会话登记字段可能已变更，doorman 会把"
+                 "已有会话误判为不存在，在同目录重复拉起会话")
     return consumers, alert
 
 
@@ -708,6 +724,17 @@ def load_config(path=CONFIG_PATH, missing_ok=False, corrupt_ok=False):
             raise
         print(f"配置文件不是合法 JSON：{path}\n  {e}", file=sys.stderr)
         sys.exit(2)
+    if not isinstance(cfg, dict):
+        # 合法 JSON 但顶层不是对象（手改成 123、["a"]）：dict.update 会
+        # 在这里抛 TypeError/ValueError，launchd 入口每轮 traceback——
+        # 与「不是合法 JSON」同等对待，死成一行人能读的原因。
+        if corrupt_ok:
+            raise ValueError(f"配置文件顶层不是 JSON 对象：{path}")
+        print(f"配置文件顶层应是 JSON 对象而不是"
+              f"{type(cfg).__name__}：{path}\n"
+              f"  运行 doorman install 生成，或用 --config 指定路径",
+              file=sys.stderr)
+        sys.exit(2)
     merged = dict(DEFAULT_CONFIG)
     merged.update(cfg)
     # Type-coerce hand-edited configs: a string roots would otherwise be
@@ -742,14 +769,16 @@ def load_state():
         # waitpid、killpg 抛 TypeError、让 cooldownUntil 与 now 的比较
         # 直接 TypeError；负数 pid 还会被 waitpid/killpg 当成进程组号，
         # 可能误伤无辜进程组。pid_t 是 int32：范围外一律作废；
-        # startedAt/cooldownUntil 解析失败按「字段不存在」。
+        # startedAt/cooldownUntil 解析失败按「字段不存在」。fails 同理：
+        # 字符串 fails 会让巡检在 fails+1 处抛 TypeError，该工作区从此
+        # 每轮都被保护圈拦住，永远等不到会话。
         pid = ent.get("pid")
         try:
             pid = int(pid)
         except (TypeError, ValueError, OverflowError):
             pid = None
         ent["pid"] = pid if pid and 0 < pid <= 2 ** 31 - 1 else None
-        for k in ("startedAt", "cooldownUntil"):
+        for k in ("startedAt", "cooldownUntil", "fails"):
             try:
                 if ent.get(k) is not None:
                     ent[k] = int(ent[k])
@@ -1043,6 +1072,12 @@ def patrol_workspace(ws, state, now, lead, cur, consumers, script_procs=()):
             ent = None
             mine_alive = False
 
+    # 登记成功即健康证据：当场清零失败计数，不等「有任务想要会话」的
+    # 轮次——健康会话常驻时计数会一直挂着，之后一次无关死亡（重启）
+    # 就把陈年计数顶满冷却，连一次新尝试都不给。
+    if ent is not None and mine_alive and ws in consumers:
+        ent["fails"] = 0
+
     if not any(task_wanted(t, now, lead) for t in tasks):
         return
 
@@ -1261,9 +1296,13 @@ def cmd_install(args):
         if os.path.exists(CONFIG_PATH):
             try:
                 with open(CONFIG_PATH) as f:
-                    cfg.update(json.load(f))
+                    old = json.load(f)
             except ValueError:
-                pass
+                old = None
+            # 手改成合法 JSON 但不是对象（123、["a"]）：没有可继承的
+            # 旧值，静默按默认走；dict.update 会直接抛 TypeError。
+            if isinstance(old, dict):
+                cfg.update(old)
         overrides = {}
         if args.roots:
             # 显式给了参数却解析不出任何有效目录（--roots , 之类），必是
@@ -1621,7 +1660,9 @@ def _overview_sessions(cols, state, suppress_cooling=(), discovered=None):
             live.append((ws, ent))
         else:
             dead.append(ws)  # 记录仍在、进程已没：下一轮巡检即清理
-    tail = f"，冷却 {len(cooling)} 个"
+    tail = ""
+    if cooling:
+        tail += f"，冷却 {len(cooling)} 个"
     if dead:
         tail += f"，已失效 {len(dead)} 个"
     if live:
