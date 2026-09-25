@@ -168,6 +168,22 @@ class CronFastForwardTests(unittest.TestCase):
             {"cron": expr, "recurring": True}, NOW,
             datetime.timedelta(minutes=10)))
 
+    def test_task_view_can_answer_the_patrol_question_too(self):
+        # 传了 lead 就不必再问一遍 task_wanted：在同一个已解析的 cron 上
+        # 算完，总览页因此不必为同一任务重复解析、重复扫触发窗口。
+        soon = NOW + datetime.timedelta(minutes=5)
+        expr = f"{soon.minute} {soon.hour} {soon.day} {soon.month} *"
+        task = {"cron": expr, "recurring": True}
+        lead = datetime.timedelta(minutes=10)
+        self.assertIs(d.task_view(task, NOW, lead)["wanted"], True)
+        self.assertIs(d.task_view(task, NOW, lead)["wanted"],
+                      d.task_wanted(task, NOW, lead))
+        # 不传 lead 时 wanted 为 None（不是缺席）：list 只关心展示，不该
+        # 多算一遍。
+        self.assertIsNone(d.task_view(task, NOW)["wanted"])
+        # 无效任务的 wanted 同样是 None，调用方判完 valid 就走，不踩空。
+        self.assertIsNone(d.task_view({"cron": "nope"}, NOW, lead)["wanted"])
+
 
 class DisplayTests(unittest.TestCase):
     """等宽终端的展示助手：CJK 宽度、截断、补位。"""
@@ -227,20 +243,22 @@ class ValidationTests(unittest.TestCase):
             announce=lambda _: None)
         self.assertTrue(any("roots" in w for w in warnings))
 
-    def test_root_with_wrong_case_warns(self):
+    def test_discover_recovers_the_on_disk_case_of_a_root(self):
         # macOS 默认文件系统大小写不敏感：敲错大小写的 roots 照样 isdir，
-        # 但会话登记按真实路径匹配，消费者判断会静默失效——必须警告。
+        # 但会话登记里的 cwd 是磁盘真实写法，带错大小写的 ws 会永远匹配
+        # 不上，消费者判断静默失效。认回真实写法是 discover 的职责，而不
+        # 是留给安装时的一句警告。
         tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-        typed = os.path.join(os.path.dirname(tmp),
-                             os.path.basename(tmp).swapcase())
+        ws = os.path.join(tmp, "MyProj")
+        os.makedirs(os.path.join(ws, ".claude"))
+        write_json(os.path.join(ws, ".claude", "scheduled_tasks.json"),
+                   {"tasks": []})
+        typed = os.path.join(tmp, "myproj")
         if not os.path.isdir(typed):
             self.skipTest("大小写敏感的文件系统上无法构造该场景")
-        warnings = d.validate_config(
-            {"intervalSeconds": 300, "leadSeconds": 600, "roots": [typed]},
-            announce=lambda _: None)
-        self.assertTrue(any("大小写" in w for w in warnings))
-        self.assertTrue(any(tmp in w for w in warnings))  # 给出正确写法
+        self.assertEqual([w for w, _ in d.discover([typed], 2)],
+                         [os.path.realpath(ws)])
 
     def test_on_disk_case_passes_missing_paths_through(self):
         self.assertEqual(d.on_disk_case("/nonexistent/xyz/abc"),
@@ -425,6 +443,12 @@ class TaskFileTests(unittest.TestCase):
                                "scheduled_tasks.json"), "w") as f:
             f.write(text)
 
+    def capture_logs(self):
+        logs = []
+        self.addCleanup(setattr, d, "log", d.log)
+        d.log = logs.append
+        return logs
+
     def test_shapes_that_used_to_crash_the_patrol(self):
         for text in ("[]", "null", '"a string"', "42",
                      '{"tasks": {"a": 1}}', '{"tasks": "nope"}',
@@ -443,12 +467,32 @@ class TaskFileTests(unittest.TestCase):
         self.assertIsNone(d.read_tasks(
             os.path.join(self.ws, "nonexistent")))
 
+    def test_unreadable_file_is_reported_by_the_patrol(self):
+        # 「证据不足所以不动会话」不等于「不吭声」：文件仍在却读不出，意味
+        # 着该目录的定时任务一个都不会执行，正是 doorman 要防的静默失效。
+        self.write("{ truncated")
+        logs = self.capture_logs()
+        d.patrol_workspace(self.ws, {}, datetime.datetime.now(),
+                           datetime.timedelta(0), int(time.time()), set(), [])
+        self.assertTrue(any("任务文件读不出" in m for m in logs))
+
+    def test_file_vanished_after_discovery_is_not_reported(self):
+        # discover 之后文件消失（一次性任务执行完被删）是正常竞态，不告警。
+        logs = self.capture_logs()
+        d.patrol_workspace(self.ws, {}, datetime.datetime.now(),
+                           datetime.timedelta(0), int(time.time()), set(), [])
+        self.assertEqual(logs, [])
+
 
 class StateMachineTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.cfg_path = os.path.join(self.tmp, "config.json")
+        # 本类每个用例都要跑完整巡检，日志直写 stdout 会冲散 unittest 的
+        # 进度输出；用例判的是 state.json，不看日志。
+        self.addCleanup(setattr, d, "log", d.log)
+        d.log = lambda *a, **k: None
         # Module globals are patched wholesale below; restore them so test
         # order never matters.
         for name in ("STATE_PATH", "SESSION_LOG_DIR", "alive",
@@ -891,11 +935,13 @@ class SessionScanTests(unittest.TestCase):
         # 登记文件是外部程序写的，pid 可能缺失、null、非数值、非正数、
         # 超出 pid_t 的巨大整数（json.load 甚至会读进 Infinity）：一律当
         # 「没有活进程」跳过，也不能计入 live_other 误触登记格式告警。
-        # 必须用真实 alive 复现旧坑——pid=null 让 int(None) 抛 TypeError、
-        # 超大整数让 os.kill 抛 OverflowError，都会炸掉整轮巡检
-        # （scan_sessions 在 per-workspace 保护圈之外）；pid 缺失时兜底的
-        # -1 被 kill(-1, 0)（权限探测）读作存活。cwd 非字符串同理，会在
-        # realpath 处抛 TypeError——活 pid 配畸形 cwd 也要安全跳过。
+        # 必须用真实 alive 跑——这几道关是 scan_sessions 唯一的防线，漏
+        # 一类就炸掉整轮巡检（它在 per-workspace 保护圈之外）。超大整数
+        # 是最隐蔽的那类：int() 对 Python 整数是恒等运算，类型转换和
+        # 「> 0」都拦不住它，只有 pid_t 上界挡得住，否则一路走到 os.kill
+        # 抛 OverflowError。pid 缺失时兜底的 -1 会被 kill(-1, 0)（权限
+        # 探测）读作存活。cwd 非字符串同理，会在 realpath 处抛
+        # TypeError——活 pid 配畸形 cwd 也要安全跳过。
         d.alive = self.real_alive
         me = os.getpid()  # 一个确定存活的 pid：健康登记长这样
         d._pid_is_claude = lambda pid: pid == me
@@ -1057,6 +1103,20 @@ class ListTests(unittest.TestCase):
             "createdAt": int(created.timestamp() * 1000),
             "recurring": False}])
         self.assertIn("已错过", out)
+
+    def test_unreadable_file_is_reported_as_such(self):
+        # 读不出 ≠ 空：文件损坏时如实说任务不会执行，而不是报「均为空」。
+        self.assertIn("全部读不出", self.render(None))
+
+    def test_mixed_unreadable_and_empty_files_are_itemized(self):
+        d.discover = lambda roots, depth: iter([(WS_PATH, "x"), ("/y", "y")])
+        d.read_tasks = lambda ws: None if ws == WS_PATH else []
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_list(argparse.Namespace(config=self.cfg_path))
+        out = buf.getvalue()
+        self.assertIn("其中 1 个读不出", out)
+        self.assertIn("其余的任务列表均为空", out)
 
     def test_one_shot_weeks_ahead_shows_its_date_not_missed(self):
         # Fires in ~60 days: inside the year-long display window, so its
@@ -1222,6 +1282,23 @@ class OverviewTests(unittest.TestCase):
                              "cooldownUntil": int(time.time()) + 900}})
         self.assertIn("cron 无法解析", out)
         self.assertIn("冷却中", out)
+
+    def test_unreadable_task_file_is_alerted_not_ghosted(self):
+        # 与巡检同一条规则：文件在却读不出，总览必须把它摆进「需要留意」，
+        # 而不是从任务盘点里抹掉、装作一切正常。
+        ws = os.path.join(self.tmp, "proj")
+        os.makedirs(os.path.join(ws, ".claude"))
+        with open(os.path.join(ws, ".claude", "scheduled_tasks.json"),
+                  "w") as f:
+            f.write("{ broken")
+        d.discover = lambda roots, depth: iter([(ws, os.path.join(
+            ws, ".claude", "scheduled_tasks.json"))])
+        # 不走 render()：它会把 read_tasks 换成 None→[] 的 fake，而这里要
+        # 让真实的 read_tasks 读出 None。
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            d.cmd_overview(self.args)
+        self.assertIn("任务文件读不出", buf.getvalue())
 
     def test_corrupt_config_renders_the_whole_page(self):
         # 损坏配置不能让总览死在半路：服务、会话、命令都还得显示。
@@ -1429,6 +1506,19 @@ class LogPathTests(unittest.TestCase):
         open(path + ".1", "w").close()
         self.assertEqual(self.resolve("proj"), path)
 
+    def test_absolute_path_recovers_the_on_disk_case(self):
+        # 日志文件名由工作区路径折成，而 spawn 记的是 discover 规范化后的
+        # 真实大小写：敲错大小写的绝对路径必须认回同一个文件，而不是报
+        # 「找不到」。
+        root = os.path.realpath(self.tmp)
+        os.makedirs(os.path.join(root, "MyProj"))
+        path = d.session_log_path(os.path.join(root, "MyProj"))
+        open(path, "w").close()
+        typed = os.path.join(root, "myproj")
+        if not os.path.isdir(typed):
+            self.skipTest("大小写敏感的文件系统上无法构造该场景")
+        self.assertEqual(self.resolve(typed), path)
+
 
 class SessionLogPathTests(unittest.TestCase):
     """日志文件名 slug：下划线转义在斜杠折叠之前，路径不再撞名。"""
@@ -1471,6 +1561,19 @@ class InstallArgTests(unittest.TestCase):
         with mock.patch("sys.stdout"):
             d.cmd_install(args)
         return read_json(d.CONFIG_PATH)
+
+    def test_first_patrol_message_matches_what_actually_happened(self):
+        # install 与 launchd 的巡检撞车时首轮是被跳过的，不能照常说「完成」。
+        for ran, expect in ((True, "首轮巡检完成"),
+                            (False, "首轮巡检暂未执行")):
+            with self.subTest(ran=ran):
+                d.cmd_run = mock.Mock(return_value=ran)
+                args = argparse.Namespace(roots=self.tmp, interval=None,
+                                          lead=None, force=True)
+                buf = io.StringIO()
+                with contextlib.redirect_stdout(buf):
+                    d.cmd_install(args)
+                self.assertIn(expect, buf.getvalue())
 
     def test_zero_lead_is_an_explicit_choice_not_a_missing_flag(self):
         # `if args.lead:` dropped --lead 0 silently; 0 means "no lead time"
@@ -1626,6 +1729,47 @@ class UninstallTests(unittest.TestCase):
         self.assertEqual(ctx.exception.code, 2)
 
 
+class CliTests(unittest.TestCase):
+    """--config 挂在主解析器和每个子解析器上，写在子命令前后都认。
+
+    只认一个位置时，报错提示只说「用 --config 指定路径」而不说放哪，
+    用户每次都得以试错换答案。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cfg = os.path.join(self.tmp, "config.json")
+        write_json(self.cfg, {"roots": [], "maxDepth": 2,
+                              "intervalSeconds": 300, "leadSeconds": 600})
+        self.addCleanup(setattr, d, "scan_sessions", d.scan_sessions)
+        d.scan_sessions = lambda: (set(), None)
+
+    def run_main(self, argv):
+        buf = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), \
+                contextlib.redirect_stdout(buf):
+            d.main()
+        return buf.getvalue()
+
+    def test_config_flag_before_the_subcommand(self):
+        self.assertIn("没有发现定时任务文件",
+                      self.run_main(["doorman", "--config", self.cfg, "list"]))
+
+    def test_config_flag_after_the_subcommand(self):
+        self.assertIn("没有发现定时任务文件",
+                      self.run_main(["doorman", "list", "--config", self.cfg]))
+
+    def test_config_flag_defaults_to_being_absent(self):
+        # 没给 --config 时属性根本不落上（与「给了但是 None」不同），读取处
+        # 因此统一 getattr。一旦有人去掉 SUPPRESS 默认值，这条就红。
+        captured = {}
+        with mock.patch.object(
+                d, "cmd_list", lambda args: captured.update(vars(args))):
+            self.run_main(["doorman", "list"])
+        self.assertNotIn("config", captured)
+
+
 class RenewTests(unittest.TestCase):
     """renew_workspace tags recurring tasks permanent: atomically, exactly
     once, and without disturbing anything else in the file."""
@@ -1760,7 +1904,8 @@ class RenewTests(unittest.TestCase):
 
         d.load_task_doc = racy
         self.addCleanup(setattr, d, "load_task_doc", orig_load)
-        self.assertEqual(d.renew_workspace(self.path), "changed")
+        with self.assertRaises(d.TaskFileChanged):
+            d.renew_workspace(self.path)
         # The REPL's newer document survives; no .tmp is left behind.
         self.assertEqual(read_json(self.path),
                          {"tasks": [{"id": "cc-wins"}]})
@@ -1860,6 +2005,18 @@ class RunRenewTests(unittest.TestCase):
         out = self.run_cmd(d.cmd_renew)
         self.assertEqual(before, self.read(path))
         self.assertIn("稍后重试", out)
+
+    def test_run_reports_whether_it_actually_ran(self):
+        # install 末尾靠这个返回值决定说「首轮巡检完成」还是「被跳过」：
+        # 抢不到锁时必须说得出来，否则紧接着的两行输出自相矛盾。
+        self.write_cfg(True)
+        args = argparse.Namespace(config=self.cfg_path)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            self.assertIs(d.cmd_run(args), True)
+            d.acquire_run_lock = lambda: None
+            self.assertIs(d.cmd_run(args), False)
+        self.assertIn("本轮跳过", buf.getvalue())
 
 
 if __name__ == "__main__":

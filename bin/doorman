@@ -70,6 +70,10 @@ DEFAULT_CONFIG = {
 # every 5 minutes forever.
 FAIL_LIMIT = 3
 COOLDOWN_SECONDS = 1800
+# pid 的合法值域。两个外部来源（state.json、会话登记）都按它校验：int()
+# 对 Python 整数是恒等运算，10**30 这种值能原样穿过类型转换，直到
+# os.kill/waitpid 才抛 OverflowError——所以范围必须在入口处卡。
+PID_T_MAX = 2 ** 31 - 1
 # A healthy session registers in ~10s. One that is still alive but has not
 # registered long after that is not warming up — it is parked on a prompt
 # nobody will answer (folder-trust confirmation, a tool permission request).
@@ -235,17 +239,20 @@ def task_is_oneshot(task):
         return False
 
 
-def task_wanted(task, now, lead):
-    """True if a consumer session must already be warm for this task.
+def parse_cron_or_none(expr):
+    """解析 cron 表达式；任何畸形都返回 None 而不是抛给调用方。
 
-    Every field here comes from a file another program writes, so a malformed
-    task must read as "not wanted" — never raise. One bad entry would
-    otherwise abort the patrol before the remaining workspaces are visited.
+    任务字段全是别的程序写的，一个坏条目不该中断整轮巡检。展示页与巡检
+    共用这一个入口，两边不必各自抄一遍异常元组。
     """
     try:
-        cron = Cron(task["cron"])
+        return Cron(expr)
     except (ValueError, IndexError, KeyError, AttributeError, TypeError):
-        return False
+        return None
+
+
+def _wanted(cron, task, now, lead):
+    """在已解析的 cron 上判定：这个任务现在是否需要一个已预热的会话。"""
     nxt = cron.next_after(now)
     if nxt and nxt <= now + lead:
         return True
@@ -269,6 +276,17 @@ def task_wanted(task, now, lead):
         if first and first <= now:
             return True
     return False
+
+
+def task_wanted(task, now, lead):
+    """True if a consumer session must already be warm for this task.
+
+    Every field here comes from a file another program writes, so a malformed
+    task must read as "not wanted" — never raise. One bad entry would
+    otherwise abort the patrol before the remaining workspaces are visited.
+    """
+    cron = parse_cron_or_none(task.get("cron"))
+    return cron is not None and _wanted(cron, task, now, lead)
 
 
 # --------------------------------------------------------------- display ----
@@ -330,25 +348,26 @@ def task_summary(task):
     return re.sub(r"\s+", " ", first)
 
 
-def task_view(task, now):
-    """把一个任务整理成展示数据。字段来自别的程序写的文件，畸形也不抛。"""
+def task_view(task, now, lead=None):
+    """把一个任务整理成展示数据。字段来自别的程序写的文件，畸形也不抛。
+
+    传入 lead 时顺带在同一个已解析的 cron 上回答「现在是否需要一个已
+    预热的会话」（键 wanted），总览页就不必为了同一个任务再解析一遍
+    cron、再扫一遍触发窗口。
+    """
     expr = task.get("cron")
-    try:
-        cron = Cron(expr)
-    except (ValueError, IndexError, KeyError, AttributeError, TypeError):
+    cron = parse_cron_or_none(expr)
+    if cron is None or not cron.satisfiable:
+        # 解析失败，或字段越界/反向区间导致字段集合为空：任何分钟都
+        # 不可能匹配。区别于「合法但展示窗口内没有触发点」（如 2 月
+        # 30 日，解析正常却永不触发）。
         return {"valid": False, "expr": expr, "summary": task_summary(task),
-                "permanent": False}
-    if not cron.satisfiable:
-        # Empty field set (out-of-range or backwards range): no minute can
-        # ever match. Distinct from "valid but no fire within the display
-        # window" (e.g. Feb 30th, which parses fine yet never fires).
-        return {"valid": False, "expr": expr, "summary": task_summary(task),
-                "permanent": False}
+                "permanent": False, "wanted": None}
     nxt = cron.next_after(now, within_days=DISPLAY_SEARCH_DAYS)
     oneshot = task_is_oneshot(task)
-    # nxt 按定义严格晚于 now，「已错过」完全由 task_wanted 的补执行判定
-    # 回答，无需再对 nxt 设防。
-    missed = oneshot and task_wanted(task, now, ZERO_LEAD)
+    # nxt 按定义严格晚于 now，「已错过」完全由补执行判定回答，无需再对
+    # nxt 设防。
+    missed = oneshot and _wanted(cron, task, now, ZERO_LEAD)
     expr_s = expr if isinstance(expr, str) else str(expr)
     return {
         "valid": True, "nxt": nxt, "missed": missed,
@@ -356,18 +375,27 @@ def task_view(task, now):
         "permanent": bool(task.get("permanent")) and not oneshot,
         "cadence": expr_s,
         "summary": task_summary(task),
+        # wanted 恒在：None 表示调用方没问（没给 lead），键的形状不随
+        # 参数变化，调用方拿到的是同一份契约的字典。
+        "wanted": (_wanted(cron, task, now, lead)
+                   if lead is not None else None),
     }
 
 
 # --------------------------------------------------------------- process ---
 
 def alive(pid):
-    # TypeError：pid 为 None 等非数值时 int() 抛的是它；OverflowError：
-    # 超出 pid_t 的巨大整数（含 Infinity 转 int）。都读作「不存在」。
+    """pid 是否对应一个活进程。
+
+    畸形 pid 的防御不在这里：两个外部来源各自由自己的入口规范化——
+    state.json 走 load_state（整型化 + pid_t 范围校验，坏值归 None），
+    会话登记走 scan_sessions（解析失败与非正数当场跳过）。走到这儿的
+    pid 一定已经是正整数。
+    """
     try:
-        os.kill(int(pid), 0)
+        os.kill(pid, 0)
         return True
-    except (OSError, ValueError, TypeError, OverflowError):
+    except OSError:
         return False
 
 
@@ -417,6 +445,32 @@ TASK_REL = os.path.join(".claude", "scheduled_tasks.json")
 SESSION_DIR = os.path.join(HOME, ".claude", "sessions")
 
 
+def on_disk_case(path):
+    """路径在磁盘上真实存储的大小写形态；任何一段读不出时原样返回。
+
+    macOS 默认文件系统大小写不敏感，而 realpath 并不规范化大小写（实测）：
+    敲错大小写的路径照样通过 isdir，却与会话登记里真实大小写的 cwd 永远
+    匹配不上。在扫描边界认回一次真实写法，下游就不必再各自提防。
+    """
+    parts = []
+    p = path.rstrip(os.sep) or os.sep
+    while True:
+        head, tail = os.path.split(p)
+        if not tail:
+            break
+        parts.append(tail)
+        p = head
+    cur = p  # 循环结束时 p 已停在根
+    for name in reversed(parts):
+        try:
+            match = next(e for e in os.listdir(cur)
+                         if e.lower() == name.lower())
+        except (OSError, StopIteration):
+            return path
+        cur = os.path.join(cur, match)
+    return cur
+
+
 def discover(roots, max_depth):
     """Yield (workspace, task file) for every workspace holding a task file."""
     seen = set()
@@ -424,6 +478,10 @@ def discover(roots, max_depth):
         root = os.path.realpath(os.path.expanduser(root)).rstrip("/")
         if not os.path.isdir(root):
             continue
+        # 在边界认回真实大小写，而不是把隐患留给调用方去警告：带错大小写
+        # 的 root 会让产出的 ws 与会话登记的 cwd 匹配不上，同目录被重复拉起
+        # 会话。
+        root = on_disk_case(root)
         base = root.count(os.sep)
         for dirpath, dirnames, _ in os.walk(root):
             depth = dirpath.count(os.sep) - base
@@ -519,9 +577,10 @@ def renew_workspace(taskfile):
     Returns the number tagged (file rewritten once), 0 when the file is
     already fully tagged (left byte-for-byte untouched — the idempotency that
     keeps a 5-minute patrol from rewriting another program's file forever),
-    None when the file is unreadable/malformed, or "changed" when another
-    writer modified it mid-update (rewrite dropped; next patrol retries).
-    One-shots and flagless hand-authored files are never modified.
+    or None when the file is unreadable/malformed. Raises TaskFileChanged
+    when another writer modified it mid-update: the rewrite is dropped and
+    the next patrol retries. One-shots and flagless hand-authored files are
+    never modified.
     """
     try:
         mtime_ns = os.stat(taskfile).st_mtime_ns
@@ -542,10 +601,7 @@ def renew_workspace(taskfile):
             tagged += 1
     if tagged == 0:
         return 0
-    try:
-        atomic_write_json(taskfile, doc, mtime_ns)
-    except TaskFileChanged:
-        return "changed"
+    atomic_write_json(taskfile, doc, mtime_ns)
     return tagged
 
 
@@ -636,7 +692,7 @@ def scan_sessions():
         except (TypeError, ValueError, OverflowError):
             suspect += 1  # 正常登记必带可解析的 pid：缺失/变质即字段漂移
             continue
-        if pid <= 0:
+        if not 0 < pid <= PID_T_MAX:
             suspect += 1
             continue
         if not alive(pid):
@@ -777,7 +833,7 @@ def load_state():
             pid = int(pid)
         except (TypeError, ValueError, OverflowError):
             pid = None
-        ent["pid"] = pid if pid and 0 < pid <= 2 ** 31 - 1 else None
+        ent["pid"] = pid if pid and 0 < pid <= PID_T_MAX else None
         for k in ("startedAt", "cooldownUntil", "fails"):
             try:
                 if ent.get(k) is not None:
@@ -894,11 +950,11 @@ def reap(pid):
     zombies — and `kill -0` reports a zombie as alive. Without this, waiting
     for a terminated session to disappear always burns the full timeout.
     """
-    # TypeError/OverflowError：非整数或超出 pid_t 的 pid（load_state 已
-    # 整型化，这里是给其他调用方留的兜底），同样无事可做。
+    # pid 由 load_state 整型化并校验过范围，这里不重复兜底。唯一预期的
+    # 失败是不是我们的子进程（例如 uninstall 在全新进程里跑），无事可做。
     try:
         os.waitpid(pid, os.WNOHANG)
-    except (OSError, TypeError, OverflowError):
+    except OSError:
         pass  # not our child (e.g. `uninstall` in a fresh process)
 
 
@@ -977,10 +1033,11 @@ def rotate_patrol_logs():
 
 
 def cmd_run(args):
+    """跑一轮巡检，返回本轮是否真的执行了（抢不到锁时为 False）。"""
     lock_fd = acquire_run_lock()
     if lock_fd is None:
         log("已有一轮巡检在进行，本轮跳过")
-        return
+        return False
     rotate_patrol_logs()
     cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
     if not _is_int(cfg.get("leadSeconds")) or cfg["leadSeconds"] < 0:
@@ -1011,12 +1068,12 @@ def cmd_run(args):
         if auto_renew:
             try:
                 n = renew_workspace(taskfile)
-                if isinstance(n, int) and n:
+                if n:
                     log(f"已续期 {ws}：{n} 个周期任务标记为 permanent，"
                         f"不再受 7 天过期限制")
-                elif n == "changed":
-                    log(f"续期暂缓 {ws}：任务文件刚被 Claude Code 改动，"
-                        f"本轮不覆盖，下轮再续")
+            except TaskFileChanged:
+                log(f"续期暂缓 {ws}：任务文件刚被 Claude Code 改动，"
+                    f"本轮不覆盖，下轮再续")
             except Exception as e:  # noqa: BLE001 — never block the patrol
                 log(f"续期错误 {ws}：{type(e).__name__}：{e}")
         try:
@@ -1031,6 +1088,7 @@ def cmd_run(args):
         if tracked_alive(ent) or ent.get("cooldownUntil", 0) > cur
     }
     save_state(state)
+    return True
 
 
 def patrol_workspace(ws, state, now, lead, cur, consumers, script_procs=()):
@@ -1040,6 +1098,12 @@ def patrol_workspace(ws, state, now, lead, cur, consumers, script_procs=()):
 
     if tasks is None:
         # Unreadable task file: never touch a session on evidence this weak.
+        # 但「不动会话」不等于「不吭声」：文件仍在却读不出意味着该目录的
+        # 定时任务一个都不会执行，正是 doorman 存在要防的那种静默失效。
+        # 文件本身已消失则是正常竞态（一次性任务执行完被删），不报。
+        if os.path.isfile(os.path.join(ws, TASK_REL)):
+            log(f"任务文件读不出 {ws}：格式损坏或不可读，本轮跳过该目录，"
+                f"其中 {TASK_REL} 里的定时任务都不会执行")
         return
     if not tasks:
         # The file is intact but holds no tasks any more — a one-shot fired
@@ -1167,18 +1231,19 @@ def cmd_renew(args):
     skipped = []
     for ws, taskfile in discover(cfg["roots"], cfg["maxDepth"]):
         files += 1
-        err = None
         try:
             n = renew_workspace(taskfile)
-        except Exception as e:  # noqa: BLE001 — one bad file never aborts the run
-            n, err = None, f"{type(e).__name__}：{e}"
-        if n is None:
-            why = f"（{err}）" if err else "任务文件读不出或格式损坏"
-            print(f"跳过 {ws}：{why}")
-            skipped.append(ws)
-        elif n == "changed":
+        except TaskFileChanged:
             print(f"暂缓 {ws}：任务文件刚被 Claude Code 改动，本次未写入，"
                   f"可再跑一次")
+            skipped.append(ws)
+            continue
+        except Exception as e:  # noqa: BLE001 — one bad file never aborts the run
+            print(f"跳过 {ws}：（{type(e).__name__}：{e}）")
+            skipped.append(ws)
+            continue
+        if n is None:
+            print(f"跳过 {ws}：任务文件读不出或格式损坏")
             skipped.append(ws)
         elif n:
             tagged += n
@@ -1214,34 +1279,6 @@ def launchctl(*args, check=True):
                           text=True, check=check)
 
 
-def on_disk_case(path):
-    """路径在磁盘上真实存储的大小写形态；任何一段读不出时原样返回。
-
-    macOS 默认文件系统大小写不敏感，而 realpath 并不规范化大小写（实测）：
-    敲错大小写的 roots 照样通过 isdir，但 discover 产出的工作区路径会带着
-    错误的大小写，与 Claude Code 登记的真实 cwd 永远匹配不上，消费者判断
-    随之静默失效（同目录被再拉一个会话）。逐段从目录列表里认回真实写法，
-    供安装/总览校验比对。
-    """
-    parts = []
-    p = path.rstrip(os.sep) or os.sep
-    while True:
-        head, tail = os.path.split(p)
-        if not tail:
-            break
-        parts.append(tail)
-        p = head
-    cur = p  # 循环结束时 p 已停在根
-    for name in reversed(parts):
-        try:
-            match = next(e for e in os.listdir(cur)
-                         if e.lower() == name.lower())
-        except (OSError, StopIteration):
-            return path
-        cur = os.path.join(cur, match)
-    return cur
-
-
 def validate_config(cfg, announce=print):
     """Soft checks (non-fatal): prints and returns warning strings."""
     warnings = []
@@ -1258,12 +1295,6 @@ def validate_config(cfg, announce=print):
     for root in cfg.get("roots", []):
         if not os.path.isdir(root):
             warnings.append(f"扫描目录不存在，巡检不会覆盖它：{root}")
-            continue
-        real_case = on_disk_case(root)
-        if real_case != root:
-            warnings.append(
-                f"扫描目录的大小写与磁盘实际不符（应为 {real_case}）：{root}；"
-                f"会话登记按真实路径匹配，不一致会导致同目录重复拉起会话")
     for w in warnings:
         announce(f"警告：{w}")
     return warnings
@@ -1377,8 +1408,12 @@ def cmd_install(args):
     launchctl("enable", f"{gui_target()}/{LABEL}", check=False)
     print("已加载到 launchd")
 
-    cmd_run(argparse.Namespace(config=None))
-    print("首轮巡检完成，查看状态：doorman")
+    # install 与 launchd 的巡检撞在一起时首轮会被跳过，不能照常说「完成」。
+    if cmd_run(argparse.Namespace(config=None)):
+        print("首轮巡检完成，查看状态：doorman")
+    else:
+        print("首轮巡检暂未执行（已有一轮在进行），launchd 会在下个间隔自动"
+              "补跑；查看状态：doorman")
 
 
 def cmd_uninstall(args):
@@ -1577,8 +1612,17 @@ def _overview_tasks(cfg, cols, consumers, state):
     for ws, _ in discover(cfg["roots"], cfg["maxDepth"]):
         discovered.add(ws)
         try:
-            tasks = read_tasks(ws) or []
+            tasks = read_tasks(ws)
         except Exception:  # noqa: BLE001 — 总览页不能被一个坏目录带走
+            continue
+        if tasks is None:
+            # 与巡检同一条规则：文件仍在却读不出，意味着该目录的定时任务
+            # 一个都不会执行——总览页要把它摆进「需要留意」，而不是装作
+            # 这个工作区不存在。文件已消失（一次性任务执行完被删）是正常
+            # 竞态，不报。
+            if os.path.isfile(os.path.join(ws, TASK_REL)):
+                alerts.append(f"{ws} 的任务文件读不出：其中的定时任务"
+                              f"一个都不会执行")
             continue
         if not tasks:
             continue
@@ -1592,13 +1636,13 @@ def _overview_tasks(cfg, cols, consumers, state):
             # validity, so a bad-cron entry still gets the reminder.
             if t.get("recurring") and not t.get("permanent"):
                 unrenewed += 1
-            v = task_view(t, now)
+            v = task_view(t, now, lead)
             if not v["valid"]:
                 bad += 1
                 continue
             if v["nxt"] and (soonest is None or v["nxt"] < soonest[0]):
                 soonest = (v["nxt"], ws, v["summary"])
-            if task_wanted(t, now, lead):
+            if v["wanted"]:
                 wanted = True
         if bad:
             alerts.append(f"{ws} 有 {bad} 个任务的 cron 无法解析，"
@@ -1694,16 +1738,21 @@ def _overview_sessions(cols, state, suppress_cooling=(), discovered=None):
 
 
 def cmd_list(args):
-    cfg = load_config(args.config or CONFIG_PATH)
+    cfg = load_config(getattr(args, "config", None) or CONFIG_PATH)
     now = datetime.datetime.now()
     cols = terminal_width()
     blocks = []
     total = 0
-    files_seen = 0
+    files_seen = unreadable = 0
     consumers, _ = scan_sessions()
     for ws, _ in discover(cfg["roots"], cfg["maxDepth"]):
         files_seen += 1
-        tasks = read_tasks(ws) or []
+        tasks = read_tasks(ws)
+        if tasks is None:
+            # 与巡检同一类问题要如实说：读不出不等于空，里面的任务都不会
+            # 执行。
+            unreadable += 1
+            continue
         if not tasks:
             continue
         views = [task_view(t, now) for t in tasks]
@@ -1716,10 +1765,14 @@ def cmd_list(args):
         total += len(tasks)
 
     if not blocks:
-        if files_seen:
-            print(f"发现 {files_seen} 个任务文件，其中的任务列表均为空")
-        else:
+        if not files_seen:
             print("配置的扫描目录下没有发现定时任务文件")
+        elif unreadable == files_seen:
+            print(f"发现 {files_seen} 个任务文件，全部读不出：其中的定时任务"
+                  f"一个都不会执行")
+        else:
+            tail = f"，其中 {unreadable} 个读不出" if unreadable else ""
+            print(f"发现 {files_seen} 个任务文件{tail}，其余的任务列表均为空")
         return
 
     blocks.sort(key=lambda b: b[0])
@@ -1764,7 +1817,10 @@ def resolve_log_path(workspace, announce=lambda m: print(m, file=sys.stderr)):
     workspace matched nothing (caller exits), otherwise a path."""
     if workspace:
         if os.path.isabs(workspace):
-            path = session_log_path(os.path.realpath(workspace))
+            # 日志文件名由工作区路径折成，大小写必须认回磁盘真实写法：
+            # realpath 不规范化大小写，而 spawn 时用的是 discover 规范化后
+            # 的路径，两边差一个字母就找不到同一个文件。
+            path = session_log_path(on_disk_case(os.path.realpath(workspace)))
             return path if os.path.exists(path) else None
         # 只匹配当前日志（*.log）：轮转的 .log.1 若参与匹配，轮转过一次
         # 的工作区会永远被报成「匹配到多个」。
@@ -1811,14 +1867,20 @@ def cmd_logs(args):
 
 
 def main():
+    # --config 是隐藏的调试出口，挂在主解析器和每个子解析器上，写在子命令
+    # 前后都认。default=SUPPRESS 让「没给」不落属性，否则子解析器的默认值
+    # 会盖掉写在子命令前的那一个；读取处因此统一用 getattr。
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--config", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     parser = argparse.ArgumentParser(
-        prog="doorman",
+        prog="doorman", parents=[common],
         description="定时任务门房：到点前为对应目录提前备好交互会话。")
-    parser.add_argument("--config", help=argparse.SUPPRESS)
     # 不带子命令不是误用：走总览页，而不是抛一段 usage 错误。
     sub = parser.add_subparsers(dest="command")
 
-    p = sub.add_parser("install", help="安装命令行、配置与 LaunchAgent")
+    p = sub.add_parser("install", parents=[common],
+                       help="安装命令行、配置与 LaunchAgent")
     p.add_argument("--roots", help="以逗号分隔的工作区根目录")
     p.add_argument("--interval", type=int, help="巡检间隔（秒）")
     p.add_argument("--lead", type=int, help="提前启动会话的时间（秒）")
@@ -1830,20 +1892,23 @@ def main():
                         "（默认开，用 --no-auto-renew 关闭；改它需配合 --force）")
     p.set_defaults(func=cmd_install)
 
-    p = sub.add_parser("uninstall", help="卸载 LaunchAgent")
+    p = sub.add_parser("uninstall", parents=[common], help="卸载 LaunchAgent")
     p.add_argument("--purge", action="store_true",
                    help="同时删除命令行、配置与日志")
     p.add_argument("--keep-sessions", action="store_true",
                    help="保留 doorman 启动的后台会话（默认卸载时结束）")
     p.set_defaults(func=cmd_uninstall)
 
-    sub.add_parser("list",
-                   help="逐个列出定时任务及其下次执行时间").set_defaults(func=cmd_list)
-    sub.add_parser("run", help="执行一轮巡检（launchd 入口）").set_defaults(func=cmd_run)
-    sub.add_parser("renew",
+    sub.add_parser("list", parents=[common],
+                   help="逐个列出定时任务及其下次执行时间"
+                   ).set_defaults(func=cmd_list)
+    sub.add_parser("run", parents=[common],
+                   help="执行一轮巡检（launchd 入口）").set_defaults(func=cmd_run)
+    sub.add_parser("renew", parents=[common],
                    help="立即给所有周期任务补 permanent（跳过 7 天过期）"
                    ).set_defaults(func=cmd_renew)
-    p = sub.add_parser("logs", help="查看巡检日志或后台会话记录")
+    p = sub.add_parser("logs", parents=[common],
+                       help="查看巡检日志或后台会话记录")
     p.add_argument("-f", "--follow", action="store_true",
                    help="实时跟踪日志")
     p.add_argument("workspace", nargs="?",
