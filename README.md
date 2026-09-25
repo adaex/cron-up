@@ -8,7 +8,8 @@
 ## 平台要求
 
 - **macOS**（依赖 launchd、`script(1)`、zsh 登录配置；暂不支持其他系统）
-- Python 3.9 以上（macOS 自带的 `/usr/bin/python3` 即可，**不需要安装任何第三方包**）
+- Python 3.9 以上（macOS 自带的 `/usr/bin/python3` 即可，**不需要安装任何第三方包**；运行中的巡检不依赖任何第三方工具）
+- GitHub CLI（仅安装与升级需要：仓库是私有的，release 下载走 `gh` 的登录态；`brew install gh` 后 `gh auth login`）
 - Claude Code 命令行（在交互登录 shell 里能直接运行 `claude`）
 
 ## 它解决什么问题
@@ -144,7 +145,7 @@ doorman spawn 的预热会话进程环境里带 `DOORMAN_SESSION=1`（值严格�
   3. 若某个仓库把 `.claude/scheduled_tasks.json` 纳入了版本控制，首次续期会让该文件因新增 `"permanent": true`（及按统一的两空格缩进排版）出现 diff，提交前请知悉；本机自用仓通常已在 `.git/info/exclude` 忽略它，不受影响。
 - **任务文件本身就是执行输入，而不只是数据**：任何能在 roots 下某个已信任目录落盘 `.claude/scheduled_tasks.json` 的主体，等于登记了一条定时指令——最快 5 分钟后，doorman 就会为该目录拉起一个以你的身份运行、自动执行其中 prompt 的会话。这包括一次普通的 `git pull`（任务文件随提交进入工作树）和共享仓库的协作者。因此不要把他人可写仓库的父目录放进 roots；拉取外部代码后若发现 `.claude/scheduled_tasks.json` 被新增或改动，先看内容再让它留在那里。
 - 会话日志可能包含任务执行过程和输出，默认仅本人可读（600），对外分享或截图前请留意内容。
-- 巡检、保活与续期都不发起网络请求；唯一的例外是**安装与升级**：`doorman upgrade` 与 install.sh 会访问 GitHub（release 元数据与资产，域名 `api.github.com`/`github.com`），下载后先按 release 附带的 SHA256SUMS 校验 sha256，通过才落盘。除此之外的外部通信来自被启动的 agent 会话。
+- 巡检、保活与续期都不发起网络请求，也不依赖任何第三方工具；唯一的例外是**安装与升级**：`doorman upgrade` 与 install.sh 经 gh 访问 GitHub 下载 release 元数据与资产，下载后先按 release 附带的 SHA256SUMS 校验 sha256，通过才落盘；release 资产由 GitHub Actions 在每次发版时从版本 tag 构建产出。除此之外的外部通信来自被启动的 agent 会话。
 
 ## 已知限制
 
@@ -166,7 +167,7 @@ doorman spawn 的预热会话进程环境里带 `DOORMAN_SESSION=1`（值严格�
 | 任务到点没有执行 | `doorman list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.doorman` 查看 last exit code |
 | 手动 `doorman run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错 |
 | `last exit code=2` | config.json 缺失、不是合法 JSON、顶层不是对象，或字段类型不对（如 `leadSeconds` 写成字符串）；无参数 `doorman` 总览的配置行或「需要留意」会给出具体原因 |
-| `doorman upgrade` 报「查询最新 release 失败」 | 多半是网络到不了 GitHub（或 API 限流）；已安装版本不受影响，网络恢复后重试 |
+| `doorman upgrade` 报「查询最新 release 失败」 | 先确认 gh 已安装且登录（`gh auth status`）；gh 的报错（未登录、网络不可达、release 不存在）会原样附在后面，已安装版本不受影响 |
 | `doorman upgrade` 报「sha256 校验失败」 | 下载内容与 release 的校验和不符，已中止且原二进制未动；重试一次仍失败则可能是发布资产损坏，到仓库提 issue |
 
 ## 测试

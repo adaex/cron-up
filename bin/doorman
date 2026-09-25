@@ -35,6 +35,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import unicodedata
 
@@ -1462,35 +1463,48 @@ def cmd_uninstall(args):
 GITHUB_REPO = "adaex/doorman"
 
 
+def _ensure_gh():
+    """升级依赖 gh 的登录态：仓库是私有的，匿名 HTTP 只会拿到 404。"""
+    if shutil.which("gh") is None:
+        print("升级需要 GitHub CLI（gh）：brew install gh 后运行 gh auth "
+              "login；release 下载走它的登录态，doorman 不自行管理 token",
+              file=sys.stderr)
+        sys.exit(1)
+
+
 def latest_release():
-    """GitHub 最新 release 的 (tag, doorman 资产 url, 校验和 url)。
-
-    只认这两个资产：发布流程保证它们同时存在。urllib 在函数内导入——
-    巡检每 5 分钟跑一次进程，不值得为几乎用不到的下载功能付导入开销。
-    """
-    import urllib.request
-
-    api = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
-    req = urllib.request.Request(api, headers={
-        "Accept": "application/vnd.github+json", "User-Agent": "doorman"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.load(resp)
-    assets = {a.get("name"): a.get("browser_download_url")
-              for a in data.get("assets") or []}
-    missing = [n for n in ("doorman", "SHA256SUMS") if not assets.get(n)]
+    """GitHub 最新 release 的 (tag, 资产名集合)。走 gh：私有仓库的匿名
+    API 一律 404，gh 自带认证，公开仓库同样适用。"""
+    r = subprocess.run(
+        ["gh", "release", "view", "--repo", GITHUB_REPO,
+         "--json", "tagName,assets"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh release view 失败")
+    data = json.loads(r.stdout)
+    names = {a.get("name") for a in data.get("assets") or []}
+    missing = {"doorman", "SHA256SUMS"} - names
     if missing:
-        raise RuntimeError(
-            f"最新 release {data.get('tag_name')!r} 缺少资产："
-            f"{'、'.join(missing)}")
-    return data.get("tag_name"), assets["doorman"], assets["SHA256SUMS"]
+        raise RuntimeError(f"最新 release {data.get('tagName')!r} 缺少资产："
+                           f"{'、'.join(sorted(missing))}")
+    return data.get("tagName"), names
 
 
-def _download(url):
-    import urllib.request
-
-    req = urllib.request.Request(url, headers={"User-Agent": "doorman"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return resp.read()
+def _download_release(tag, dest_dir):
+    """把 release 的 doorman 与 SHA256SUMS 下载到 dest_dir，返回
+    (二进制 bytes, 校验和 bytes)。"""
+    r = subprocess.run(
+        ["gh", "release", "download", tag, "--repo", GITHUB_REPO,
+         "--pattern", "doorman", "--pattern", "SHA256SUMS",
+         "--dir", dest_dir, "--clobber"],
+        capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or "gh release download 失败")
+    with open(os.path.join(dest_dir, "doorman"), "rb") as f:
+        blob = f.read()
+    with open(os.path.join(dest_dir, "SHA256SUMS"), "rb") as f:
+        sums = f.read()
+    return blob, sums
 
 
 def installed_version():
@@ -1516,8 +1530,9 @@ def cmd_upgrade(args):
         print(f"未检测到已安装的 doorman（{BIN_PATH} 不存在）；全新安装见 "
               f"README 的一行命令", file=sys.stderr)
         sys.exit(1)
+    _ensure_gh()
     try:
-        tag, bin_url, sums_url = latest_release()
+        tag, _ = latest_release()
     except (OSError, ValueError, RuntimeError) as e:
         print(f"查询最新 release 失败：{e}", file=sys.stderr)
         sys.exit(1)
@@ -1526,9 +1541,10 @@ def cmd_upgrade(args):
         return
     old = installed_version()
     try:
-        blob = _download(bin_url)
-        sums = _download(sums_url).decode("utf-8", "replace")
-    except OSError as e:
+        with tempfile.TemporaryDirectory() as td:
+            blob, sums_blob = _download_release(tag, td)
+        sums = sums_blob.decode("utf-8", "replace")
+    except (OSError, RuntimeError) as e:
         print(f"下载 {tag} 失败：{e}", file=sys.stderr)
         sys.exit(1)
     expected = next((ln.split()[0] for ln in sums.splitlines()

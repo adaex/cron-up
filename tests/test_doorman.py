@@ -1792,14 +1792,21 @@ class UpgradeTests(unittest.TestCase):
         self.bin = os.path.join(self.tmp, "doorman")
         with open(self.bin, "w") as f:
             f.write('VERSION = "0.1.9"\n')
-        for name in ("BIN_PATH", "latest_release", "_download"):
+        self.real_ensure_gh = d._ensure_gh
+        for name in ("BIN_PATH", "latest_release", "_download_release",
+                     "_ensure_gh"):
             self.addCleanup(setattr, d, name, getattr(d, name))
         d.BIN_PATH = self.bin
+        # 测试不依赖机器上真装没装 gh；_ensure_gh 有专门用例覆盖。
+        d._ensure_gh = lambda: None
 
     def good_blob(self):
         blob = b"#!/usr/bin/env python3\nVERSION = \"9.9.9\"\n"
         sums = f"{hashlib.sha256(blob).hexdigest()}  doorman\n".encode()
         return blob, sums
+
+    def release_info(self, tag):
+        return tag, {"doorman", "SHA256SUMS"}
 
     def run_upgrade(self):
         out, err = io.StringIO(), io.StringIO()
@@ -1813,8 +1820,8 @@ class UpgradeTests(unittest.TestCase):
 
     def test_upgrade_replaces_binary_after_checksum_verifies(self):
         blob, sums = self.good_blob()
-        d.latest_release = lambda: ("v9.9.9", "https://x/doorman", "https://x/s")
-        d._download = mock.Mock(side_effect=[blob, sums])
+        d.latest_release = lambda: self.release_info("v9.9.9")
+        d._download_release = mock.Mock(return_value=(blob, sums))
         with mock.patch.object(d.subprocess, "run", return_value=mock.Mock(
                 returncode=0, stdout="", stderr="")):
             code, out, _ = self.run_upgrade()
@@ -1827,8 +1834,8 @@ class UpgradeTests(unittest.TestCase):
     def test_checksum_mismatch_aborts_and_keeps_old_binary(self):
         blob, _ = self.good_blob()
         bad_sums = b"deadbeef" * 8 + b"  doorman\n"
-        d.latest_release = lambda: ("v9.9.9", "u1", "u2")
-        d._download = mock.Mock(side_effect=[blob, bad_sums])
+        d.latest_release = lambda: self.release_info("v9.9.9")
+        d._download_release = mock.Mock(return_value=(blob, bad_sums))
         code, _, err = self.run_upgrade()
         self.assertEqual(code, 1)
         self.assertIn("校验失败", err)
@@ -1836,12 +1843,20 @@ class UpgradeTests(unittest.TestCase):
             self.assertIn("0.1.9", f.read())
 
     def test_already_latest_skips_download(self):
-        d.latest_release = lambda: ("v0.1.9", "u1", "u2")
-        d._download = mock.Mock(
+        d.latest_release = lambda: self.release_info("v0.1.9")
+        d._download_release = mock.Mock(
             side_effect=AssertionError("已是最新时不该下载"))
         code, out, _ = self.run_upgrade()
         self.assertEqual(code, 0)
         self.assertIn("已是最新", out)
+
+    def test_missing_gh_explains_instead_of_failing_obscurely(self):
+        # 没有 gh 时给一条能操作的报错，而不是 FileNotFoundError 一行。
+        d._ensure_gh = self.real_ensure_gh
+        with mock.patch.object(d.shutil, "which", return_value=None):
+            code, _, err = self.run_upgrade()
+        self.assertEqual(code, 1)
+        self.assertIn("GitHub CLI", err)
 
     def test_api_failure_exits_with_one_line(self):
         d.latest_release = mock.Mock(side_effect=OSError("无网络"))
@@ -1857,8 +1872,8 @@ class UpgradeTests(unittest.TestCase):
 
     def test_failed_first_patrol_is_reported(self):
         blob, sums = self.good_blob()
-        d.latest_release = lambda: ("v9.9.9", "u1", "u2")
-        d._download = mock.Mock(side_effect=[blob, sums])
+        d.latest_release = lambda: self.release_info("v9.9.9")
+        d._download_release = mock.Mock(return_value=(blob, sums))
         with mock.patch.object(d.subprocess, "run", return_value=mock.Mock(
                 returncode=2, stdout="", stderr="配置损坏")):
             code, _, err = self.run_upgrade()
