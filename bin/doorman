@@ -39,7 +39,7 @@ import tempfile
 import time
 import unicodedata
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 LABEL = "local.doorman"
 
 HOME = os.path.expanduser("~")
