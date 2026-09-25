@@ -36,7 +36,7 @@ import sys
 import time
 import unicodedata
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 LABEL = "local.doorman"
 
 HOME = os.path.expanduser("~")
