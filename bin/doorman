@@ -1478,7 +1478,7 @@ def latest_release():
     r = subprocess.run(
         ["gh", "release", "view", "--repo", GITHUB_REPO,
          "--json", "tagName,assets"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "gh release view 失败")
     data = json.loads(r.stdout)
@@ -1497,7 +1497,7 @@ def _download_release(tag, dest_dir):
         ["gh", "release", "download", tag, "--repo", GITHUB_REPO,
          "--pattern", "doorman", "--pattern", "SHA256SUMS",
          "--dir", dest_dir, "--clobber"],
-        capture_output=True, text=True)
+        capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "gh release download 失败")
     with open(os.path.join(dest_dir, "doorman"), "rb") as f:
@@ -1564,9 +1564,10 @@ def cmd_upgrade(args):
     except OSError as e:
         print(f"替换 {BIN_PATH} 失败：{e}", file=sys.stderr)
         sys.exit(1)
-    print(f"已升级 {old or '?'} → {tag[1:]}：{BIN_PATH}")
+    print(f"已升级 {old or '?'} → {tag.removeprefix('v')}：{BIN_PATH}")
     # 用新二进制跑首轮巡检：既验证可执行，也让新版本立刻纳入服务。
-    r = subprocess.run([BIN_PATH, "run"], capture_output=True, text=True)
+    r = subprocess.run([BIN_PATH, "run"], capture_output=True, text=True,
+                       errors="replace")
     if r.stdout.strip():
         print(r.stdout.strip())
     if r.returncode:
@@ -1717,6 +1718,7 @@ def cmd_overview(args):
         ("logs [目录片段] [-f]", "查看巡检日志或后台会话记录"),
         ("run", "立即手动巡检一轮"),
         ("renew", "立即给所有周期任务补 permanent（跳过 7 天过期）"),
+        ("upgrade", "从 GitHub 最新 release 升级"),
         ("install --force", "更新配置并重新安装（全部参数见 --help）"),
     ]
     name_w = max(disp_width(n) for n, _ in commands)

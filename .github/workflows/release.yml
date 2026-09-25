@@ -25,7 +25,8 @@ jobs:
 
       - name: Verify VERSION matches the tag
         run: |
-          version="v$(sed -n 's/^VERSION = "\(.*\)"$/\1/p' bin/doorman)"
+          # [^"]* 而不是 .*：行尾加注释也不阻断发布，取首个引号对即可
+          version="v$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' bin/doorman)"
           if [ "$version" != "$GITHUB_REF_NAME" ]; then
             echo "bin/doorman 的 VERSION（$version）与 tag" \
               "（$GITHUB_REF_NAME）不一致：先改版本号再发版" >&2
