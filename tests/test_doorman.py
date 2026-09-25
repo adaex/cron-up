@@ -1805,9 +1805,6 @@ class UpgradeTests(unittest.TestCase):
         sums = f"{hashlib.sha256(blob).hexdigest()}  doorman\n".encode()
         return blob, sums
 
-    def release_info(self, tag):
-        return tag, {"doorman", "SHA256SUMS"}
-
     def run_upgrade(self):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), \
@@ -1820,7 +1817,7 @@ class UpgradeTests(unittest.TestCase):
 
     def test_upgrade_replaces_binary_after_checksum_verifies(self):
         blob, sums = self.good_blob()
-        d.latest_release = lambda: self.release_info("v9.9.9")
+        d.latest_release = lambda: "v9.9.9"
         d._download_release = mock.Mock(return_value=(blob, sums))
         with mock.patch.object(d.subprocess, "run", return_value=mock.Mock(
                 returncode=0, stdout="", stderr="")):
@@ -1834,7 +1831,7 @@ class UpgradeTests(unittest.TestCase):
     def test_checksum_mismatch_aborts_and_keeps_old_binary(self):
         blob, _ = self.good_blob()
         bad_sums = b"deadbeef" * 8 + b"  doorman\n"
-        d.latest_release = lambda: self.release_info("v9.9.9")
+        d.latest_release = lambda: "v9.9.9"
         d._download_release = mock.Mock(return_value=(blob, bad_sums))
         code, _, err = self.run_upgrade()
         self.assertEqual(code, 1)
@@ -1843,7 +1840,7 @@ class UpgradeTests(unittest.TestCase):
             self.assertIn("0.1.9", f.read())
 
     def test_already_latest_skips_download(self):
-        d.latest_release = lambda: self.release_info("v0.1.9")
+        d.latest_release = lambda: "v0.1.9"
         d._download_release = mock.Mock(
             side_effect=AssertionError("已是最新时不该下载"))
         code, out, _ = self.run_upgrade()
@@ -1872,7 +1869,7 @@ class UpgradeTests(unittest.TestCase):
 
     def test_failed_first_patrol_is_reported(self):
         blob, sums = self.good_blob()
-        d.latest_release = lambda: self.release_info("v9.9.9")
+        d.latest_release = lambda: "v9.9.9"
         d._download_release = mock.Mock(return_value=(blob, sums))
         with mock.patch.object(d.subprocess, "run", return_value=mock.Mock(
                 returncode=2, stdout="", stderr="配置损坏")):

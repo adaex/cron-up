@@ -1473,21 +1473,19 @@ def _ensure_gh():
 
 
 def latest_release():
-    """GitHub 最新 release 的 (tag, 资产名集合)。走 gh：私有仓库的匿名
-    API 一律 404，gh 自带认证，公开仓库同样适用。"""
+    """GitHub 最新 release 的 tag。走 gh：私有仓库的匿名 API 一律 404，
+    gh 自带认证，公开仓库同样适用。资产缺失不必在这里预检——下载阶段
+    gh 的报错同样是一行人能读的原因，少维护一条无人覆盖的分支。"""
     r = subprocess.run(
         ["gh", "release", "view", "--repo", GITHUB_REPO,
-         "--json", "tagName,assets"],
+         "--json", "tagName"],
         capture_output=True, text=True, errors="replace")
     if r.returncode != 0:
         raise RuntimeError(r.stderr.strip() or "gh release view 失败")
-    data = json.loads(r.stdout)
-    names = {a.get("name") for a in data.get("assets") or []}
-    missing = {"doorman", "SHA256SUMS"} - names
-    if missing:
-        raise RuntimeError(f"最新 release {data.get('tagName')!r} 缺少资产："
-                           f"{'、'.join(sorted(missing))}")
-    return data.get("tagName"), names
+    tag = json.loads(r.stdout).get("tagName")
+    if not tag:
+        raise RuntimeError("gh 返回的 release 数据里没有 tagName")
+    return tag
 
 
 def _download_release(tag, dest_dir):
@@ -1532,7 +1530,7 @@ def cmd_upgrade(args):
         sys.exit(1)
     _ensure_gh()
     try:
-        tag, _ = latest_release()
+        tag = latest_release()
     except (OSError, ValueError, RuntimeError) as e:
         print(f"查询最新 release 失败：{e}", file=sys.stderr)
         sys.exit(1)
