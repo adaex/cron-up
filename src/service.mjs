@@ -356,8 +356,34 @@ export function launcherHealth() {
 
 // ---- install / uninstall ----
 
+// 26.9.3 及更早把数据放在 ~/Library/Application Support/cron-up；新版统一
+// 到 ~/.local/share/cron-up。整体搬家（config、state 随行），随后 install
+// 照常重写脚本与 plist 并重启服务，用户无感。搬家只在 install 里发生：
+// 只升级 npm 包而不跑 install 的话，旧目录与旧 plist 依旧配套、照常巡检。
+function migrateLegacyDir() {
+  const legacy = deps.paths.legacyAppSupport;
+  if (!fs.existsSync(legacy) || fs.existsSync(deps.paths.dataDir)) return;
+  try {
+    fs.mkdirSync(path.dirname(deps.paths.dataDir), { recursive: true });
+    try {
+      fs.renameSync(legacy, deps.paths.dataDir);
+    } catch {
+      // rename 搬不动（目标异常等）：退化为复制，旧目录留着无害。
+      fs.cpSync(legacy, deps.paths.dataDir, { recursive: true });
+    }
+    deps.print(`已迁移数据目录：${legacy} → ${deps.paths.dataDir}`);
+  } catch {
+    // 迁移彻底失败必须当面说：不说的话 install 会按「全新安装」落默认
+    // 配置，用户收窄过的 roots 等手改就静默丢了。
+    deps.print(`提示：旧数据目录迁移失败（${legacy}），本次按新目录继续；`
+      + '如旧目录里还有你改过的配置，请手动复制到 '
+      + `${deps.paths.dataDir} 后重跑 cron-up install`);
+  }
+}
+
 export async function cmdInstall(args) {
-  fs.mkdirSync(deps.paths.appSupport, { recursive: true });
+  migrateLegacyDir();
+  fs.mkdirSync(deps.paths.dataDir, { recursive: true });
   fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
   try {
     fs.chmodSync(deps.paths.sessionLogDir, 0o700);
@@ -497,7 +523,8 @@ export async function cmdUninstall(args) {
   }
 
   if (args.purge) {
-    for (const p of [deps.paths.appSupport, deps.paths.logDir]) {
+    for (const p of [deps.paths.dataDir, deps.paths.legacyAppSupport,
+      deps.paths.logDir]) {
       fs.rmSync(p, { recursive: true, force: true });
       deps.print(`已删除 ${p}`);
     }

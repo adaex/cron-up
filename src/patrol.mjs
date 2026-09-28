@@ -58,8 +58,8 @@ function readLockPid(lockPath) {
 }
 
 export function acquireRunLock() {
-  fs.mkdirSync(deps.paths.appSupport, { recursive: true });
-  const lockPath = path.join(deps.paths.appSupport, 'run.lock');
+  fs.mkdirSync(deps.paths.dataDir, { recursive: true });
+  const lockPath = path.join(deps.paths.dataDir, 'run.lock');
   for (let attempt = 0; attempt < 3; attempt++) {
     const fd = tryCreateLock(lockPath);
     if (fd !== null) {

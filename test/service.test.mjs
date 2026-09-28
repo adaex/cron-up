@@ -473,9 +473,28 @@ test('keep-sessions leaves them running', async (t) => {
 test('purge removes data and points at npm for the binary', async (t) => {
   const s = await setupUninstall(t);
   fs.writeFileSync(s.deps.paths.plistPath, '<plist/>');
-  fs.writeFileSync(path.join(s.tmp, 'app/state.json'), '{}');
+  fs.writeFileSync(path.join(s.deps.paths.dataDir, 'state.json'), '{}');
+  // 迁移失败残留的旧目录也一并清掉。
+  fs.mkdirSync(s.deps.paths.legacyAppSupport, { recursive: true });
   await s.uninstall({ purge: true });
-  assert.equal(fs.existsSync(s.deps.paths.appSupport), false);
+  assert.equal(fs.existsSync(s.deps.paths.dataDir), false);
+  assert.equal(fs.existsSync(s.deps.paths.legacyAppSupport), false);
   assert.equal(fs.existsSync(s.deps.paths.logDir), false);
   assert.ok(s.lines.some((l) => l.includes('npm uninstall -g cron-up')));
+});
+
+test('install migrates the legacy Application Support dir', async (t) => {
+  const s = await setupInstall(t);
+  // 伪造 26.9.3 及更早的旧位置：config 直接写进旧目录，新目录不存在。
+  fs.rmSync(s.deps.paths.dataDir, { recursive: true, force: true });
+  writeJson(path.join(s.deps.paths.legacyAppSupport, 'config.json'), {
+    roots: [`${s.tmp}/kept`], maxDepth: 2, intervalSeconds: 660,
+    leadSeconds: 600, autoRenew: false,
+  });
+  // roots 不给命令行值，验证配置内容随迁移完整保留。
+  await s.install({ roots: undefined });
+  assert.equal(fs.existsSync(s.deps.paths.legacyAppSupport), false);
+  assert.equal(s.cfg().intervalSeconds, 660);
+  assert.deepEqual(s.cfg().roots, [`${s.tmp}/kept`]);
+  assert.ok(s.lines.some((l) => l.includes('已迁移数据目录')));
 });

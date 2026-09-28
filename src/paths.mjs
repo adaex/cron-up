@@ -16,7 +16,12 @@ export const TASK_REL = path.join('.claude', 'scheduled_tasks.json');
 // HOME。getter 让 sessionLogDir/configPath/statePath 跟随替换后的前缀。
 export const paths = {
   home: HOME,
-  appSupport: path.join(HOME, 'Library', 'Application Support', 'cron-up'),
+  // 数据目录用 XDG 风格的 ~/.local/share/cron-up：config、state 与启动脚本
+  // 集中一处，purge 一删全清。26.9.3 及更早放在
+  // ~/Library/Application Support/cron-up，install 时自动搬家（见
+  // service.mjs 的 migrateLegacyDir）。
+  dataDir: path.join(HOME, '.local', 'share', 'cron-up'),
+  legacyAppSupport: path.join(HOME, 'Library', 'Application Support', 'cron-up'),
   logDir: path.join(HOME, 'Library', 'Logs', 'cron-up'),
   plistPath: path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`),
   sessionDir: path.join(HOME, '.claude', 'sessions'),
@@ -25,16 +30,16 @@ export const paths = {
     return path.join(this.logDir, 'sessions');
   },
   get configPath() {
-    return path.join(this.appSupport, 'config.json');
+    return path.join(this.dataDir, 'config.json');
   },
   get statePath() {
-    return path.join(this.appSupport, 'state.json');
+    return path.join(this.dataDir, 'state.json');
   },
   // launchd 拉起的启动脚本。ProgramArguments[0] 直接指向它而非 node：
   // macOS 后台项目列表按可执行文件名显示条目，直连 node 会归到「Node.js
   // Foundation」名下（node 的签名者），自有脚本则显示脚本自己的名字。
   get serviceScriptPath() {
-    return path.join(this.appSupport, 'cron-up-service');
+    return path.join(this.dataDir, 'cron-up-service');
   },
 };
 

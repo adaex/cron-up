@@ -33,7 +33,8 @@ export function tmpPaths(tmp, overrides = {}) {
     // home 默认保持真实 HOME（expandHome 依赖它），只有显式
     // overrides.home 才重定向。
     home: os.homedir(),
-    appSupport: path.join(tmp, 'app'),
+    dataDir: path.join(tmp, 'app'),
+    legacyAppSupport: path.join(tmp, 'legacy-app'),
     logDir: path.join(tmp, 'logs'),
     plistPath: path.join(tmp, 'local.cron-up.plist'),
     sessionDir: path.join(tmp, 'sessions-registry'),
@@ -42,18 +43,18 @@ export function tmpPaths(tmp, overrides = {}) {
       return path.join(this.logDir, 'sessions');
     },
     get configPath() {
-      return path.join(this.appSupport, 'config.json');
+      return path.join(this.dataDir, 'config.json');
     },
     get statePath() {
-      return path.join(this.appSupport, 'state.json');
+      return path.join(this.dataDir, 'state.json');
     },
     get serviceScriptPath() {
-      return path.join(this.appSupport, 'cron-up-service');
+      return path.join(this.dataDir, 'cron-up-service');
     },
     ...overrides,
   };
   // 派生目录建出来，测试直接写 statePath/configPath 不会 ENOENT。
-  fs.mkdirSync(p.appSupport, { recursive: true });
+  fs.mkdirSync(p.dataDir, { recursive: true });
   fs.mkdirSync(p.logDir, { recursive: true });
   fs.mkdirSync(p.sessionDir, { recursive: true });
   return p;
