@@ -77,6 +77,22 @@ test('wanted without consumer is an alert', async (t) => {
   assert.ok(out.includes('需要留意'));
   assert.ok(out.includes('即将执行（或错过待补执行）'));
   assert.ok(out.includes('下轮巡检会自动启动'));
+  // 从未失败过就不预告冷却，避免告警噪音。
+  assert.ok(!out.includes('近期已失败'));
+});
+
+test('wanted without consumer surfaces recent fail count', async (t) => {
+  const s = await setup(t);
+  const fire = new Date(Date.now() + 2 * 60_000);
+  const out = await s.render([{
+    cron: `${fire.getMinutes()} ${fire.getHours()} ${fire.getDate()} `
+      + `${fire.getMonth() + 1} *`,
+    recurring: false,
+    createdAt: Date.now(),
+    prompt: '马上要跑的一次性任务',
+  }], { [WS]: { pid: null, fails: 2, deadSince: Math.floor(Date.now() / 1000) } });
+  assert.ok(out.includes('下轮巡检会自动启动'));
+  assert.ok(out.includes('近期已失败 2 次'));
 });
 
 test('pending task during cooldown gets one combined alert', async (t) => {

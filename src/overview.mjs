@@ -7,7 +7,6 @@ import path from 'node:path';
 
 import { deps } from './internals.mjs';
 import { loadConfig, loadState, validateConfig } from './config.mjs';
-import { FAIL_LIMIT } from './constants.mjs';
 import { packageVersion, TASK_REL } from './paths.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
 import {
@@ -82,10 +81,13 @@ function overviewTasks(cfg, cols, consumers, state) {
           + `请运行 cron-up logs ${path.basename(ws)} 排查`);
         coolingWarned.add(ws);
       } else {
+        // 失败计数放在句子中部：总览告警按终端宽度截尾，计数比尾部的
+        // 「下轮会自动启动」更该活下来；满额后的去向由「冷却中」那条合并
+        // 告警解释，这里不重复。
         const fails = (state[ws] ?? {}).fails ?? 0;
-        alerts.push(`${ws} 有任务即将执行（或错过待补执行），但当前没有交互`
-          + `会话，下轮巡检会自动启动${fails > 0 ? `（近期已失败 ${fails} 次，`
-            + `${FAIL_LIMIT} 次后进入冷却）` : ''}`);
+        const streak = fails > 0 ? `，近期已失败 ${fails} 次` : '';
+        alerts.push(`${ws} 有任务即将执行（或错过待补执行）${streak}，`
+          + '但当前没有交互会话，下轮巡检会自动启动');
       }
     }
   }
