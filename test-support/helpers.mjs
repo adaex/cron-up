@@ -31,7 +31,9 @@ export function mockDeps(t) {
 // 把产物路径全部重定向到 tmp：默认给一份完整 paths，测试可再覆盖单项。
 export function tmpPaths(tmp, overrides = {}) {
   const p = {
-    home: tmp,
+    // home 默认保持真实 HOME（expanduser 语义与 Python 测试一致），只有
+    // 显式 overrides.home 才重定向。
+    home: os.homedir(),
     appSupport: path.join(tmp, 'app'),
     logDir: path.join(tmp, 'logs'),
     plistPath: path.join(tmp, 'local.cron-ready.plist'),

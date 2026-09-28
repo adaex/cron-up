@@ -8,7 +8,7 @@ import path from 'node:path';
 import { deps } from './internals.mjs';
 import { loadConfig, loadState, validateConfig, isInt } from './config.mjs';
 import { packageVersion, TASK_REL } from './paths.mjs';
-import { serviceLine } from './service.mjs';
+import { serviceLine, launcherHealth } from './service.mjs';
 import {
   humanDelta,
   clip,
@@ -191,6 +191,10 @@ export async function cmdOverview(args) {
   deps.print(serviceLine(info, fs.existsSync(deps.paths.plistPath)));
 
   const alerts = [];
+  // plist 写死的 node/入口路径失效（Node 版本目录被清）时 launchd 每轮
+  // 都静默拉不起来，这是总览唯一能发现它的地方。
+  const health = launcherHealth();
+  if (health) alerts.push(health);
   const [consumers, registryAlert] = await deps.scanSessions();
   if (registryAlert) alerts.push(registryAlert);
   const state = loadState();
