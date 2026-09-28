@@ -1,0 +1,32 @@
+{
+  "name": "cron-ready",
+  "version": "0.3.0",
+  "description": "为命令行 AI agent 的 cron 定时任务提前预热并保活交互式会话",
+  "type": "module",
+  "bin": {
+    "cron-ready": "bin/cron-ready.mjs"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/adaex/doorman.git"
+  },
+  "keywords": [
+    "cron",
+    "claude-code",
+    "launchd",
+    "scheduler",
+    "session",
+    "macos"
+  ]
+}
