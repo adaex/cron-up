@@ -1,7 +1,5 @@
-// `cron-ready list`：逐工作区列出任务的下次触发、节奏、类型与摘要，标注
+// `cron-up list`：逐工作区列出任务的下次触发、节奏、类型与摘要，标注
 // 该目录当前有没有交互会话。
-
-import path from 'node:path';
 
 import { deps } from './internals.mjs';
 import { loadConfig } from './config.mjs';
@@ -86,17 +84,14 @@ export async function cmdList(args) {
         kind = '—';
         cadence = '—';
         summary = `原字段值：${JSON.stringify(v.expr)}；${v.summary}`;
-      } else if (v.missed) {
-        // 一次性任务触发点已过：下次会话启动时补执行。
-        status = '已错过';
-        cadence = v.cadence;
-        summary = v.summary;
-        kind = v.permanent ? '周期·永久' : v.kind;
       } else {
-        status = v.nxt ? fmtMDHM(v.nxt) : '一年内无';
+        // 已错过：一次性任务触发点已过，下次会话启动时补执行。missed 时
+        // permanent 恒为 false（taskView 对一次性任务剔除了该标记）。
+        status = v.missed ? '已错过'
+          : (v.nxt ? fmtMDHM(v.nxt) : '一年内无');
+        kind = v.permanent ? '周期·永久' : v.kind;
         cadence = v.cadence;
         summary = v.summary;
-        kind = v.permanent ? '周期·永久' : v.kind;
       }
       deps.print('  ' + pad(status, statusW) + '  ' + pad(kind, kindW) + '  '
         + pad(clip(cadence, cadW), cadW) + '  ' + clip(summary, summaryW));

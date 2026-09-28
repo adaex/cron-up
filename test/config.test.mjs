@@ -1,5 +1,3 @@
-// 翻译自 Python ConfigTests / ValidationTests / StateFileTests（trackedAlive
-// 相关的一条在 sessions 模块就绪后于 state 测试中补齐）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -100,13 +98,13 @@ test('non-object json config is corrupt for human pages', (t) => {
 
 test('missing config exits cleanly for launchd', () => {
   assert.throws(
-    () => loadConfig('/nonexistent/cron-ready-config.json'),
+    () => loadConfig('/nonexistent/cron-up-config.json'),
     (e) => e instanceof ExitError && e.code === 2);
 });
 
 test('overview sees a missing config as absent', () => {
   assert.throws(
-    () => loadConfig('/nonexistent/cron-ready-config.json', { missingOk: true }),
+    () => loadConfig('/nonexistent/cron-up-config.json', { missingOk: true }),
     (e) => e.code === 'ENOENT');
 });
 

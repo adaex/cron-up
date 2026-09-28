@@ -2,7 +2,7 @@
 // 与自动帮助，这里手写一层：子命令前只允许隐藏的 --config（前后都可放），
 // 定位子命令后按各命令的选项表解析。
 
-// 先引全量入口，保证所有业务模块都已向 deeps 自注册，再引命令函数。
+// 先引全量入口，保证所有业务模块都已向 deps 自注册，再引命令函数。
 import './index.mjs';
 import { deps, ExitError } from './internals.mjs';
 import { cmdRun, cmdRenew } from './patrol.mjs';
@@ -155,17 +155,18 @@ export function parseCli(argv) {
   return result;
 }
 
-export const USAGE = `cron-ready —— 为定时任务提前备好交互会话
+export const USAGE = `cron-up —— 为定时任务提前备好交互会话
 
 用法：
-  cron-ready                    查看总览（服务、配置、任务、会话）
-  cron-ready install            安装配置与 LaunchAgent（--roots --interval --lead --force --no-auto-renew）
-  cron-ready uninstall          卸载（--purge 连配置日志一起删，--keep-sessions 保留后台会话）
-  cron-ready list               逐个列出定时任务及下次执行时间
-  cron-ready run                执行一轮巡检（launchd 入口）
-  cron-ready renew              立即给所有周期任务补 permanent
-  cron-ready logs [目录片段]    查看巡检日志或后台会话记录（-f 跟踪）
-  cron-ready upgrade            升级到最新版：npm i -g cron-ready@latest`;
+  cron-up                    查看总览（服务、配置、任务、会话）
+  cron-up install            安装配置与 LaunchAgent（--roots --interval --lead --force --no-auto-renew）
+  cron-up uninstall          卸载（--purge 连配置日志一起删，--keep-sessions 保留后台会话）
+  cron-up list               逐个列出定时任务及下次执行时间
+  cron-up run                执行一轮巡检（launchd 入口）
+  cron-up renew              立即给所有周期任务补 permanent
+  cron-up logs [目录片段]    查看巡检日志或后台会话记录（-f 跟踪）
+
+升级：npm i -g cron-up@latest`;
 
 export async function main(argv = process.argv) {
   const parsed = parseCli(argv.slice(2));
@@ -173,8 +174,7 @@ export async function main(argv = process.argv) {
     deps.print(USAGE);
     return;
   }
-  // --config 缺失时键根本不存在（等价 argparse SUPPRESS），命令内部用
-  // args?.config ?? 默认路径 读取。
+  // --config 缺失时键根本不存在，命令内部用 args?.config ?? 默认路径读取。
   const args = { ...parsed.opts };
   if (parsed.config !== undefined) args.config = parsed.config;
   switch (parsed.command) {

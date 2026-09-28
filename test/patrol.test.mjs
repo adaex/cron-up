@@ -1,5 +1,3 @@
-// 翻译自 Python StateMachineTests（14 条）、TaskFileTests 的 patrol 两条、
-// PatrolLogRotateTests。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -51,8 +49,7 @@ async function setupMachine(t) {
     return { pid, procStart: `start-${pid}` };
   };
   deps.stopSession = async (ent) => { alivePids.delete(ent.pid); };
-  deps.acquireRunLock = () => 1;
-  deps.releaseLock = () => {};
+  deps.acquireRunLock = () => 1; // 假锁柄无 lockPath，真 releaseLock 会直接返回
   deps.rotatePatrolLogs = () => {};
   deps.log = () => {};
   const state = () => (fs.existsSync(deps.paths.statePath)

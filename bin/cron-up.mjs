@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// cron-ready 入口。launchd 以「node 绝对路径 + 本文件绝对路径 + run」直接
+// cron-up 入口。launchd 以「node 绝对路径 + 本文件绝对路径 + run」直接
 // 启动本文件（npm shim 的 /usr/bin/env node 在 launchd 最小 PATH 下找不
 // 到 node）。
 

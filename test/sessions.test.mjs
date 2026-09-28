@@ -1,5 +1,3 @@
-// 翻译自 Python SpawnEnvTest（重写为纯函数 + fakeSpawn 断言）与
-// SessionLogPathTests；另补 shellQuote 与 state 清洗后 trackedAlive 不抛。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -52,7 +50,7 @@ test('spawn: child env marked and claude markers stripped', (t) => {
   assert.equal(captured.opts.detached, true);
   assert.equal(captured.opts.stdio, 'ignore');
   assert.equal(captured.opts.cwd, ws);
-  assert.equal(captured.opts.env.CRON_READY_SESSION, '1');
+  assert.equal(captured.opts.env.CRON_UP_SESSION, '1');
   assert.equal('CLAUDE_CODE_CHILD_SESSION' in captured.opts.env, false);
   assert.ok(!Object.keys(captured.opts.env)
     .some((k) => k.startsWith('CLAUDE_CODE_')));
@@ -65,7 +63,7 @@ test('spawn: child env marked and claude markers stripped', (t) => {
 test('buildChildEnv is a pure function', () => {
   const env = { CLAUDE_CODE_X: '1', KEEP: '2' };
   const out = buildChildEnv(env);
-  assert.equal(out.CRON_READY_SESSION, '1');
+  assert.equal(out.CRON_UP_SESSION, '1');
   assert.equal('CLAUDE_CODE_X' in out, false);
   assert.equal(out.KEEP, '2');
   assert.equal('CLAUDE_CODE_X' in env, true); // 输入不被改
@@ -79,7 +77,7 @@ test('session argv quotes the workspace and runs login interactive zsh', () => {
   ]);
 });
 
-test('shellQuote matches shlex semantics', () => {
+test('shellQuote keeps the safe set bare and single-quotes the rest', () => {
   assert.equal(shellQuote(''), "''");
   assert.equal(shellQuote('abc-def.g'), 'abc-def.g');
   assert.equal(shellQuote('a b'), "'a b'");

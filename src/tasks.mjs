@@ -83,8 +83,8 @@ export function* discover(roots, maxDepth) {
         return;
       }
       const depth = dirpath.split('/').length - 1 - baseDepth;
-      // 先剪枝（os.walk 语义：depth==maxDepth 这一层本身仍要检查候选文
-      // 件，只是不再下降），再做候选检查。
+      // 先剪枝：depth==maxDepth 这一层本身仍要检查候选文件，只是不再下
+      // 降；再做候选检查。
       const subdirs = depth >= maxDepth
         ? []
         : entries.filter((e) => e.isDirectory() && !PRUNE_DIRS.has(e.name));
@@ -160,8 +160,7 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
     // 新文件用 0600。
   }
   const tmp = `${file}.tmp`;
-  // 与 Python json.dump(indent=2, ensure_ascii=False) 一致：无尾换行，中文
-  // 字面写出而不是 \u 转义。
+  // JSON.stringify 两空格缩进：中文按字面写出（不转 \u），无尾换行。
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), {
     flag: 'w',
     mode: 0o600,

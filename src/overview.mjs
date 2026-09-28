@@ -83,7 +83,7 @@ function overviewTasks(cfg, cols, consumers, state) {
         alerts.push(
           `${ws} 有任务即将执行（或错过待补执行），但保活会话连续失败 `
           + `${ent.fails ?? '?'} 次正处冷却中，约 ${eta} 分钟后才会重试；`
-          + `请运行 cron-ready logs ${path.basename(ws)} 排查`);
+          + `请运行 cron-up logs ${path.basename(ws)} 排查`);
         coolingWarned.add(ws);
       } else {
         alerts.push(`${ws} 有任务即将执行（或错过待补执行），但当前没有交互`
@@ -104,7 +104,7 @@ function overviewTasks(cfg, cols, consumers, state) {
   if (!cfg.autoRenew && unrenewed > 0) {
     alerts.push(
       `自动续期已关闭：${unrenewed} 个周期任务尚未标记 permanent，创建满 7 `
-      + '天后会末次执行并被删除。运行 cron-ready renew 立即续期，或在配置中'
+      + '天后会末次执行并被删除。运行 cron-up renew 立即续期，或在配置中'
       + '开启 autoRenew');
   }
   return [alerts, coolingWarned, discovered];
@@ -146,7 +146,7 @@ function overviewSessions(cols, state, suppressCooling = new Set(),
       if (!discovered.has(ws)) {
         alerts.push(
           `${ws} 的保活会话（pid ${ent.pid}）仍在运行，但该目录已不在巡检范`
-          + '围内（任务文件被删或已移出 roots），cron-ready 不会再回收或换代'
+          + '围内（任务文件被删或已移出 roots），cron-up 不会再回收或换代'
           + '它；不需要时请自行结束');
       }
     }
@@ -165,7 +165,7 @@ const COMMANDS = [
 export async function cmdOverview(args) {
   const cols = deps.terminalWidth();
   const v = packageVersion();
-  deps.print(`cron-ready ${v ?? ''} —— 为定时任务提前备好交互会话`);
+  deps.print(`cron-up ${v ?? ''} —— 为定时任务提前备好交互会话`);
 
   const cfgPath = args?.config ?? deps.paths.configPath;
   let cfg = null;
@@ -203,12 +203,12 @@ export async function cmdOverview(args) {
 
   if (cfgError !== null) {
     // 页面不能死在半路：损坏配置是「需要留意」的一种；巡检本身仍会以退出
-    // 码 2 失败，详情见 cron-ready logs。
+    // 码 2 失败，详情见 cron-up logs。
     deps.print(`配置：文件损坏，不是合法 JSON：${cfgPath}`);
     alerts.push(`配置损坏，当前每轮巡检都会失败退出；修复 ${cfgPath} 或重新`
-      + `运行 cron-ready install。解析错误：${cfgError.message}`);
+      + `运行 cron-up install。解析错误：${cfgError.message}`);
   } else if (cfg === null) {
-    deps.print('配置：缺失，运行 cron-ready install 生成');
+    deps.print('配置：缺失，运行 cron-up install 生成');
   } else if (badFields.length) {
     const vals = badFields.map((k) => `${k}=${JSON.stringify(cfg[k])}`).join('、');
     deps.print(`配置：${badFields.join('、')} 应为整数秒，当前 ${vals}`);
@@ -225,7 +225,7 @@ export async function cmdOverview(args) {
         + `会话${renewTag}`);
       if (actualIv !== cfg.intervalSeconds) {
         alerts.push(`launchd 实际间隔 ${actualIv} 秒与配置 ${cfg.intervalSeconds} `
-          + '秒不一致，重新运行 cron-ready install 后生效');
+          + '秒不一致，重新运行 cron-up install 后生效');
       }
     }
     const suffix = `（深度 ${cfg.maxDepth}）`;
@@ -255,6 +255,6 @@ export async function cmdOverview(args) {
   deps.print('常用命令：');
   const nameW = Math.max(...COMMANDS.map(([n]) => dispWidth(n)));
   for (const [name, desc] of COMMANDS) {
-    deps.print(`  cron-ready ${pad(name, nameW)}  ${desc}`);
+    deps.print(`  cron-up ${pad(name, nameW)}  ${desc}`);
   }
 }

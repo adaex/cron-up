@@ -1,5 +1,4 @@
-// 翻译自 Python CronTests / CronSatisfiabilityTests / CronFastForwardTests /
-// WantedTests。NOW 固定为 2026-09-20 15:47（周日）本地时间。
+// 测试的当前时间固定为 2026-09-20 15:47（周日）本地时间。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { performance } from 'node:perf_hooks';

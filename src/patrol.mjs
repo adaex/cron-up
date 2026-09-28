@@ -1,6 +1,6 @@
 // 一轮巡检：发现工作区 → 自动续期 → 保证该有会话的地方有一个健康会话。
-// 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。状态机全部细节与
-// Python 版一致：失败冷却、卡死退休、超龄换代、孤儿接管、空任务回收。
+// 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。状态机覆盖：失败
+// 冷却、卡死退休、超龄换代、孤儿接管、空任务回收。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -202,7 +202,7 @@ export async function patrolWorkspace(
     if (age <= WARMUP_GRACE_SECONDS) return;
     await deps.stopSession(ent);
     deps.log(`卡死 ${ws} pid=${ent.pid}：进程已存活 ${age} 秒仍未登记会话，`
-      + '已终止（排查：cron-ready logs '
+      + '已终止（排查：cron-up logs '
       + `${path.basename(ws)}）`);
   }
 
@@ -287,8 +287,8 @@ export async function cmdRun(args) {
     }
 
     const cur = Math.floor(Date.now() / 1000);
-    // 登记每轮只读一次：否则每个工作区都要 glob + ps 一遍，自检也归属这
-    // 里。
+    // 登记每轮只读一次：否则每个工作区都要 readdir + ps 一遍，自检也归
+    // 属这里。
     const [consumers, registryAlert] = await deps.scanSessions();
     if (registryAlert) deps.log(`告警：${registryAlert}`);
     const scriptProcs = deps.listScriptProcesses();
@@ -393,5 +393,4 @@ Object.assign(deps, {
   runPatrol: cmdRun,
   rotatePatrolLogs,
   acquireRunLock,
-  releaseLock,
 });

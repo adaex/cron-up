@@ -6,9 +6,8 @@
 //   node scripts/gen-east-asian-width.mjs /tmp/EastAsianWidth.txt \
 //     > src/east-asian-width.mjs
 //
-// 只取 W（Wide）与 F（Fullwidth）两档，对齐 Python unicodedata
-// east_asian_width(c) in ("W","F") 的判定；Ambiguous（含 U+2026 省略号）
-// 按 1 列计，不进表。
+// 只取 W（Wide）与 F（Fullwidth）两档；Ambiguous（含 U+2026 省略号）按
+// 1 列计，不进表。
 import fs from 'node:fs';
 
 const file = process.argv[2];
@@ -48,7 +47,6 @@ for (let i = 0; i < ranges.length; i++) {
   if (i % 6 === 5 || i === ranges.length - 1) out += '\n';
 }
 out += '];\n\n';
-out += `export const UNICODE_VERSION = ${JSON.stringify(version)};\n\n`;
 out += `export function isWide(cp) {\n`;
 out += '  let lo = 0, hi = WIDE_RANGES.length - 1;\n';
 out += '  while (lo <= hi) {\n';

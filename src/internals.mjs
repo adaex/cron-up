@@ -1,7 +1,7 @@
-// 可替换依赖容器：Python 版测试靠「给模块属性赋值再还原」打桩，ESM 命名导
-// 出不可改，因此把所有测试要替换的外部依赖集中到 deps。业务模块在文件末
-// 尾 Object.assign(deps, {...}) 自注册（internals 不反向 import 业务模块，
-// 避免循环依赖）；cli 先 import 所有业务模块保证注册完成后再 dispatch。
+// 可替换依赖容器：ESM 命名导出不可改，测试无法事后打桩，因此把所有要替换
+// 的外部依赖集中到 deps。业务模块在文件末尾 Object.assign(deps, {...})
+// 自注册（internals 不反向 import 业务模块，避免循环依赖）；cli 先 import
+// 全量入口保证注册完成后再 dispatch。
 //
 // 纯系统叶子的默认实现放这里；业务函数（discover、spawnSession…）由各自
 // 模块注册。
@@ -10,7 +10,7 @@ import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { paths } from './paths.mjs';
 
 export class ExitError extends Error {
-  // 等价 Python sys.exit(code)：CLI 入口捕获后按 code 退出。
+  // CLI 入口捕获后按 code 退出。
   constructor(code, message) {
     super(message);
     this.name = 'ExitError';
@@ -18,7 +18,7 @@ export class ExitError extends Error {
   }
 }
 
-// 非 0 退出不抛：全代码库调用 ps/launchctl 时实际都 check=False，抛了反而
+// 非 0 退出不抛：调用 ps/launchctl 的地方只关心 status 与输出，抛了反而
 // 要在每个调用点 catch。返回 {status, stdout, stderr}。
 function execFile(file, args, opts = {}) {
   try {

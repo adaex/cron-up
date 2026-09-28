@@ -1,4 +1,4 @@
-// 全部调参常量，集中一处，便于核对 Python 版行为。
+// 全部调参常量集中一处，改动时便于通盘核对。
 
 export const DEFAULT_CONFIG = {
   version: 1,

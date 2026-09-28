@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { deps } from './internals.mjs';
-import { pyInt } from './config.mjs';
+import { lenientInt } from './config.mjs';
 import { PID_T_MAX } from './constants.mjs';
 
 // npm/bun 形态的 claude 是解释器跑的脚本：进程 comm 是 node/bun/deno，
@@ -60,9 +60,8 @@ export async function readSessionFile(file) {
   return null;
 }
 
-// realpath 的宽容版：Python os.path.realpath 对不存在的路径只做词法规
-// 范化不抛错；Node realpathSync 会 ENOENT。语义对齐：失败时退回词法绝对
-// 路径（调用方已保证输入是绝对路径）。
+// 宽容版 realpath：fs.realpathSync 对不存在的路径抛 ENOENT，这里失败时退
+// 回词法绝对路径（调用方已保证输入是绝对路径）。
 function lexReal(p) {
   try {
     return fs.realpathSync(p);
@@ -102,7 +101,7 @@ export async function scanSessions() {
     // 部进程的权限探测，不是存在性检查）误读为存活。
     let pid;
     try {
-      pid = pyInt(s.pid);
+      pid = lenientInt(s.pid);
     } catch {
       suspect += 1; // 正常登记必带可解析 pid：缺失/变质即字段漂移
       continue;
@@ -137,13 +136,13 @@ export async function scanSessions() {
   if (files.length > 0 && interactive.length === 0) {
     alert = `会话登记目录 ${deps.paths.sessionDir} 下有 ${files.length} 个登记文件，`
       + '但没有一个是 interactive 会话；Claude Code 的会话登记格式可能已变更，'
-      + 'cron-ready 将识别不到任何现有会话';
+      + 'cron-up 将识别不到任何现有会话';
   } else if (liveOther > 0 && consumers.size === 0) {
     alert = '会话登记中的存活进程都不是 claude 命令；Claude Code 的启动形态可能'
-      + '已变更，cron-ready 可能反复重拉会话';
+      + '已变更，cron-up 可能反复重拉会话';
   } else if (suspect > 0 && consumers.size === 0) {
     alert = '会话登记中的 interactive 会话都读不出有效的 pid 或工作目录；'
-      + 'Claude Code 的会话登记字段可能已变更，cron-ready 会把已有会话误判为'
+      + 'Claude Code 的会话登记字段可能已变更，cron-up 会把已有会话误判为'
       + '不存在，在同目录重复拉起会话';
   }
   return [consumers, alert];

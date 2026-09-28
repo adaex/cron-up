@@ -82,13 +82,13 @@ export function taskView(task, now, leadMs = undefined) {
     permanent: Boolean(task.permanent) && !oneshot,
     cadence: typeof expr === 'string' ? expr : String(expr),
     summary: taskSummary(task),
-    // wanted 恒在：undefined（调用方没问）与 null（问不了）区分开，键的
-    // 形状不随参数变化。
+    // wanted 恒为 null 或布尔：没传 leadMs（不问）与 cron 无效（问不了）
+    // 都是 null，键的形状不随参数变化。
     wanted: leadMs !== undefined ? wanted(cron, task, now, leadMs) : null,
   };
 }
 
-// MM-DD HH:MM（任务触发点的统一展示格式，等价 Python strftime）。
+// MM-DD HH:MM（任务触发点的统一展示格式）。
 export function fmtMDHM(d) {
   const p = (n) => String(n).padStart(2, '0');
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:`

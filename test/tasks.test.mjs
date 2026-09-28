@@ -1,5 +1,3 @@
-// 翻译自 Python TaskFileTests（readTasks 部分）与 RenewTests。
-// patrol_workspace 的两条在 patrol 模块测试中。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';

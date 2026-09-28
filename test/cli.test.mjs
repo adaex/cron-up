@@ -1,10 +1,8 @@
-// 翻译自 Python CliTests，外加 parseCli 的新语义（否定布尔、严格整数、
-// --help、未知项退出码 2）。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 
-import { main, parseCli, USAGE } from '../src/cli.mjs';
+import { main, parseCli } from '../src/cli.mjs';
 import { ExitError } from '../src/internals.mjs';
 import { mkTmp, mockDeps, tmpPaths, writeJson } from '../test-support/helpers.mjs';
 
@@ -16,7 +14,7 @@ test('--config before the subcommand (end to end list)', async (t) => {
   writeJson(cfg, { roots: [], maxDepth: 2, intervalSeconds: 300, leadSeconds: 600 });
   const lines = [];
   deps.print = (m) => lines.push(m);
-  await main(['node', 'cron-ready', '--config', cfg, 'list']);
+  await main(['node', 'cron-up', '--config', cfg, 'list']);
   assert.ok(lines.join('\n').includes('没有发现定时任务文件'));
 });
 
@@ -28,7 +26,7 @@ test('--config after the subcommand', async (t) => {
   writeJson(cfg, { roots: [], maxDepth: 2, intervalSeconds: 300, leadSeconds: 600 });
   const lines = [];
   deps.print = (m) => lines.push(m);
-  await main(['node', 'cron-ready', 'list', '--config', cfg]);
+  await main(['node', 'cron-up', 'list', '--config', cfg]);
   assert.ok(lines.join('\n').includes('没有发现定时任务文件'));
 });
 
@@ -46,9 +44,9 @@ test('--help prints usage and exits 0 semantics', async (t) => {
   const deps = mockDeps(t);
   const lines = [];
   deps.print = (m) => lines.push(m);
-  await main(['node', 'cron-ready', '--help']);
-  assert.ok(lines.join('\n').startsWith('cron-ready ——'));
-  assert.ok(lines.join('\n').includes('cron-ready list'));
+  await main(['node', 'cron-up', '--help']);
+  assert.ok(lines.join('\n').startsWith('cron-up ——'));
+  assert.ok(lines.join('\n').includes('cron-up list'));
 });
 
 test('unknown subcommand exits 2', () => {
@@ -62,7 +60,7 @@ test('unknown subcommand exits 2', () => {
 test('legacy --stop-sessions flag is gone (exit 2)', async (t) => {
   mockDeps(t);
   await assert.rejects(
-    main(['node', 'cron-ready', 'uninstall', '--stop-sessions']),
+    main(['node', 'cron-up', 'uninstall', '--stop-sessions']),
     (e) => e instanceof ExitError && e.code === 2);
 });
 

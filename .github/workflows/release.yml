@@ -1,7 +1,7 @@
 name: release
 
 # 发布即打版本 tag：测试通过 → 校验 package.json version 与 tag 一致 →
-# npm publish。安装与升级都走 npm：npm i -g cron-ready。
+# npm publish。安装与升级都走 npm：npm i -g cron-up。
 on:
   push:
     tags: ["v*"]

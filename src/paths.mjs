@@ -6,7 +6,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-export const LABEL = 'local.cron-ready';
+export const LABEL = 'local.cron-up';
 export const OLD_LABEL = 'local.doorman';
 
 const HOME = os.homedir();
@@ -17,8 +17,8 @@ export const TASK_REL = path.join('.claude', 'scheduled_tasks.json');
 // HOME。getter 让 sessionLogDir/configPath/statePath 跟随替换后的前缀。
 export const paths = {
   home: HOME,
-  appSupport: path.join(HOME, 'Library', 'Application Support', 'cron-ready'),
-  logDir: path.join(HOME, 'Library', 'Logs', 'cron-ready'),
+  appSupport: path.join(HOME, 'Library', 'Application Support', 'cron-up'),
+  logDir: path.join(HOME, 'Library', 'Logs', 'cron-up'),
   plistPath: path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`),
   sessionDir: path.join(HOME, '.claude', 'sessions'),
 

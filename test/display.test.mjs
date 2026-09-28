@@ -1,4 +1,3 @@
-// 翻译自 Python DisplayTests：CJK 宽度、截断、补位。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 

@@ -1,6 +1,5 @@
-// resolveLauncher / renderPlist / launcherHealth 的新增单测，以及翻译自
-// Python InstallArgTests（删除二进制自拷贝两条、upgrade 指向一条）与
-// UninstallTests。
+// resolveLauncher / renderPlist / launcherHealth 与 install/uninstall 命令
+// 的测试。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -139,14 +138,14 @@ test('launcher priority: fnm beats volta', (t) => {
 test('renderPlist contains absolute node, entry, run and interval', (t) => {
   mockDeps(t).paths = tmpPaths(mkTmp(t));
   const xml = renderPlist(600, {
-    nodePath: '/usr/local/bin/node', entryPath: '/opt/pkg/cron-ready.mjs' });
-  assert.ok(xml.includes('<string>local.cron-ready</string>'));
+    nodePath: '/usr/local/bin/node', entryPath: '/opt/pkg/cron-up.mjs' });
+  assert.ok(xml.includes('<string>local.cron-up</string>'));
   assert.ok(xml.includes('<string>/usr/local/bin/node</string>'));
-  assert.ok(xml.includes('<string>/opt/pkg/cron-ready.mjs</string>'));
+  assert.ok(xml.includes('<string>/opt/pkg/cron-up.mjs</string>'));
   assert.ok(xml.includes('<string>run</string>'));
   assert.ok(xml.includes('<integer>600</integer>'));
   const args = readPlistProgramArgsFrom(xml);
-  assert.deepEqual(args, ['/usr/local/bin/node', '/opt/pkg/cron-ready.mjs', 'run']);
+  assert.deepEqual(args, ['/usr/local/bin/node', '/opt/pkg/cron-up.mjs', 'run']);
 });
 
 test('renderPlist XML-escapes ampersands in paths', (t) => {
@@ -200,7 +199,7 @@ test('launcherHealth is null when both paths exist', (t) => {
 async function setupInstall(t) {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp, { plistPath: path.join(tmp, 'cron-ready.plist') });
+  deps.paths = tmpPaths(tmp, { plistPath: path.join(tmp, 'cron-up.plist') });
   const launchCalls = [];
   deps.launchctl = (...a) => {
     launchCalls.push(a);
@@ -235,7 +234,7 @@ test('install writes config, plist, bootstraps and runs first patrol', async (t)
     && c[1].includes('local.doorman'))); // 顺手踢旧 doorman
   assert.ok(s.lines.some((l) => l.includes('已加载到 launchd')));
   assert.ok(s.lines.some((l) => l.includes('首轮巡检完成')));
-  assert.equal(LABEL, 'local.cron-ready');
+  assert.equal(LABEL, 'local.cron-up');
 });
 
 test('first patrol message matches what actually happened', async (t) => {
@@ -270,6 +269,19 @@ test('non-object legacy config is ignored on force', async (t) => {
   await s.install();
   assert.equal(s.cfg().intervalSeconds, 300);
   assert.deepEqual(s.cfg().roots, [s.tmp]);
+});
+
+test('corrupt config without force points to --force and force recovers', async (t) => {
+  const s = await setupInstall(t);
+  fs.writeFileSync(s.deps.paths.configPath, '{ not json');
+  await assert.rejects(s.install({ force: false }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('--force'));
+    return true;
+  });
+  await s.install();
+  assert.equal(s.cfg().intervalSeconds, 300);
 });
 
 test('bool interval in config is rejected loudly', async (t) => {
@@ -374,5 +386,5 @@ test('purge removes data and points at npm for the binary', async (t) => {
   await s.uninstall({ purge: true });
   assert.equal(fs.existsSync(s.deps.paths.appSupport), false);
   assert.equal(fs.existsSync(s.deps.paths.logDir), false);
-  assert.ok(s.lines.some((l) => l.includes('npm uninstall -g cron-ready')));
+  assert.ok(s.lines.some((l) => l.includes('npm uninstall -g cron-up')));
 });

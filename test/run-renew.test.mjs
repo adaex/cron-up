@@ -1,5 +1,3 @@
-// 翻译自 Python RunRenewTests：autoRenew 接入 cmdRun、cmdRenew 独立工作、
-// 锁等待、cmdRun 返回值。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -24,8 +22,7 @@ async function setup(t) {
   fs.mkdirSync(root, { recursive: true });
   const cfgPath = path.join(tmp, 'config.json');
   deps.scanSessions = () => [new Set(), null];
-  deps.acquireRunLock = () => 1;
-  deps.releaseLock = () => {};
+  deps.acquireRunLock = () => 1; // 假锁柄无 lockPath，真 releaseLock 会直接返回
   deps.rotatePatrolLogs = () => {};
   deps.listScriptProcesses = () => [];
   const output = [];

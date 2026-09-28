@@ -27,8 +27,6 @@ const WIDE_RANGES = [
   [129736],[129740,129757],[129759,129771],[129775,129786],[131072,196605],[196608,262141]
 ];
 
-export const UNICODE_VERSION = "18.0.0";
-
 export function isWide(cp) {
   let lo = 0, hi = WIDE_RANGES.length - 1;
   while (lo <= hi) {

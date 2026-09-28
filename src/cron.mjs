@@ -6,8 +6,8 @@ import { SEARCH_DAYS, MISSED_LOOKBACK_DAYS } from './constants.mjs';
 const MS_DAY = 86400_000;
 const MS_MINUTE = 60_000;
 
-// 严格十进制整数：Python int("5x") 会抛，JS parseInt("5x") 却返回 5，必须
-// 自己卡。仅接受可选负号加纯数字。
+// 严格十进制整数：parseInt("5x") 会静默返回 5，必须自己卡。仅接受可选负号
+// 加纯数字。
 function strictInt(s) {
   if (!/^-?\d+$/.test(s)) throw new Error(`不是整数：${s}`);
   return parseInt(s, 10);
@@ -53,7 +53,7 @@ export function parseCronField(expr, lo, hi) {
 export class Cron {
   constructor(expr) {
     if (typeof expr !== 'string') throw new Error('cron 表达式必须是字符串');
-    const parts = expr.trim().split(/\s+/); // Python split() 折叠任意空白
+    const parts = expr.trim().split(/\s+/); // 折叠任意空白
     if (parts.length !== 5) throw new Error(`cron 字段数应为 5：${expr}`);
     const [m, h, dom, mon, dow] = parts;
     this.minutes = parseCronField(m, 0, 59);
@@ -75,8 +75,7 @@ export class Cron {
     );
   }
 
-  // JS Date 的 getDay() 本身就是周日=0，与 cron 同构，无需 Python 版的
-  // (weekday+1)%7 换算。
+  // Date 的 getDay() 本身就是周日=0，与 cron 同构，无需额外换算。
   matches(t) {
     if (!this.minutes.has(t.getMinutes()) || !this.hours.has(t.getHours())) {
       return false;
@@ -146,7 +145,7 @@ export function parseCronOrNone(expr) {
 
 function createdAtDate(task) {
   const v = task.createdAt;
-  if (!v || typeof v !== 'number') return null; // 等价 Python 的 truthy 检查
+  if (!v || typeof v !== 'number') return null;
   const d = new Date(v); // 字段是毫秒时间戳
   return Number.isFinite(d.getTime()) ? d : null;
 }

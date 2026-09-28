@@ -1,9 +1,9 @@
-# cron-ready
+# cron-up
 
-为命令行 AI agent 的 cron 定时任务**提前启动并保持一个可用的交互会话**。任务本身仍由 agent 自己的定时机制执行，cron-ready 只负责保证：任务到点时，对应目录里已经有一个开着的会话。它是个「门房」——不替客人办事，只负责到点把门打开、让会话一直候着。（本工具前身为 Python 单文件版 doorman，0.3 起改为 Node/npm 分发。）
+为命令行 AI agent 的 cron 定时任务**提前启动并保持一个可用的交互会话**。任务本身仍由 agent 自己的定时机制执行，cron-up 只负责保证：任务到点时，对应目录里已经有一个开着的会话。
 
 > [!WARNING]
-> cron-ready 建立在 Claude Code **未公开文档的内部机制**之上（`.claude/scheduled_tasks.json` 文件格式、`~/.claude/sessions/*.json` 会话登记、定时任务只在交互界面里执行、周期任务创建满 7 天后失效、任务的 `permanent` 字段可豁免该失效、登记的会话进程其进程命令行可识别为 claude——原生安装是可执行名含 claude 的二进制，npm/bun 安装是解释器执行 claude 入口脚本）。这些行为可能随版本变化。会话保活已在 **Claude Code 2.1.278** 实测；7 天判定与 `permanent` 豁免的代码逻辑核对自 **2.1.280**（均为 macOS）。升级 Claude Code 后建议重新核对。
+> cron-up 建立在 Claude Code **未公开文档的内部机制**之上（`.claude/scheduled_tasks.json` 文件格式、`~/.claude/sessions/*.json` 会话登记、定时任务只在交互界面里执行、周期任务创建满 7 天后失效、任务的 `permanent` 字段可豁免该失效、登记的会话进程其进程命令行可识别为 claude——原生安装是可执行名含 claude 的二进制，npm/bun 安装是解释器执行 claude 入口脚本）。这些行为可能随版本变化。会话保活已在 **Claude Code 2.1.278** 实测；7 天判定与 `permanent` 豁免的代码逻辑核对自 **2.1.280**（均为 macOS）。升级 Claude Code 后建议重新核对。
 
 ## 平台要求
 
@@ -18,7 +18,7 @@
 - 会话一直开着 → 一切正常；
 - 会话被关掉 → 一次性任务会在下次打开该目录的会话时补执行一次，**周期任务则直接跳过**，没有任何提示。
 
-cron-ready 是一个由 launchd 每 5 分钟运行一次的巡检进程，逻辑只有一条：
+cron-up 是一个由 launchd 每 5 分钟运行一次的巡检进程，逻辑只有一条：
 
 > 某个工作目录里存在「10 分钟内即将执行」的定时任务（或有错过补执行的一次性任务），而该目录当前没有运行中的交互会话 → 在后台启动一个无窗口的 Claude Code 会话。
 
@@ -30,18 +30,18 @@ cron-ready 是一个由 launchd 每 5 分钟运行一次的巡检进程，逻辑
 |---|---|
 | 任务登记 | Claude Code 原生命令 `CronCreate(durable: true)`，写入工作目录下的 `.claude/scheduled_tasks.json` |
 | 定时执行 | Claude Code 交互会话自身（包括 cron 时间计算、随机延迟、一次性任务执行后自动删除） |
-| 保证有会话在场 | launchd 每 5 分钟调用一次 `cron-ready run`（以「node 绝对路径 + 入口脚本绝对路径」启动，不依赖 shell PATH），运行完立即退出，不常驻 |
+| 保证有会话在场 | launchd 每 5 分钟调用一次 `cron-up run`（以「node 绝对路径 + 入口脚本绝对路径」启动，不依赖 shell PATH），运行完立即退出，不常驻 |
 | 周期任务续期 | 巡检时给周期任务补 `permanent: true`（默认开启、可关），使其不受 7 天过期限制；见下 |
 | 后台会话 | 通过 macOS 自带的 `script(1)` 启动无窗口交互界面，输出写入日志，可随时恢复 |
-| 安装与升级 | 一律走 npm：`npm i -g cron-ready` / `npm i -g cron-ready@latest` |
+| 安装与升级 | 一律走 npm：`npm i -g cron-up` / `npm i -g cron-up@latest` |
 
-各部分互不影响：卸载 cron-ready 后，定时任务文件依然有效，只是没人保证会话在场；删除任务文件后，cron-ready 巡检发现没有任务，什么都不会启动。
+各部分互不影响：卸载 cron-up 后，定时任务文件依然有效，只是没人保证会话在场；删除任务文件后，cron-up 巡检发现没有任务，什么都不会启动。
 
 ## 安装
 
 ```bash
-npm i -g cron-ready
-cron-ready install --roots ~/code,~/work --interval 300 --lead 600
+npm i -g cron-up
+cron-up install --roots ~/code,~/work --interval 300 --lead 600
 ```
 
 第二步会写入配置与 LaunchAgent 并立即跑首轮巡检；参数都可省略，不带参数则用默认扫描范围与间隔。安装不需要 sudo（前提是你的 npm 全局目录在用户家目录下，fnm/volta/nvm/Homebrew 默认都满足）。
@@ -54,20 +54,20 @@ launchd 的环境变量极少（PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`）�
 
 ```bash
 doorman uninstall --keep-sessions   # 卸掉旧的 Python 版 LaunchAgent（会话可保留）
-npm i -g cron-ready
-cron-ready install                 # 新服务接管；配置从头生成即可
+npm i -g cron-up
+cron-up install                 # 新服务接管；配置从头生成即可
 ```
 
-新旧 label 不同（`local.doorman` / `local.cron-ready`），安装新版时也会顺手 best-effort 踢掉旧服务，避免两个巡检并行。旧的 `~/Library/Application Support/doorman` 等目录不会被自动删除，确认无误后可手动清掉。
+新旧 label 不同（`local.doorman` / `local.cron-up`），安装新版时也会顺手 best-effort 踢掉旧服务，避免两个巡检并行。旧的 `~/Library/Application Support/doorman` 等目录不会被自动删除，确认无误后可手动清掉。
 
 ### 自动续期（默认开启）
 
-Claude Code 的周期任务在**创建满 7 天**后会末次执行、随即被删除（起算点是创建时间，不随每次触发顺延）。cron-ready 默认在每轮巡检时给扫描到的周期任务补一个 `permanent: true` 字段——Claude Code 见到该字段就跳过 7 天回收，任务因此长期有效。安装后的**首轮巡检**就会处理 roots 下现有的周期任务；也可以随时手动跑一次 `cron-ready renew` 立即处理。
+Claude Code 的周期任务在**创建满 7 天**后会末次执行、随即被删除（起算点是创建时间，不随每次触发顺延）。cron-up 默认在每轮巡检时给扫描到的周期任务补一个 `permanent: true` 字段——Claude Code 见到该字段就跳过 7 天回收，任务因此长期有效。安装后的**首轮巡检**就会处理 roots 下现有的周期任务；也可以随时手动跑一次 `cron-up renew` 立即处理。
 
 关闭自动续期：把配置文件中的 `autoRenew` 改为 `false`（最多 5 分钟后的下一轮巡检生效，无需重装），或重装时显式指定：
 
 ```bash
-cron-ready install --force --no-auto-renew
+cron-up install --force --no-auto-renew
 ```
 
 > 续期会**改写各工作目录的 `.claude/scheduled_tasks.json`**：原子写入、保留原权限与中文，只新增 `permanent` 一个字段，绝不改动任务的 prompt、cron 或 id。被续期的任务不再被自动删除，为它保活的后台会话也会因此**长期常驻**——这等于关闭了 Claude Code 对自主会话的寿命护栏。相关风险见「安全说明」。
@@ -76,11 +76,11 @@ cron-ready install --force --no-auto-renew
 
 | 产物 | 位置 |
 |---|---|
-| 命令行与代码 | npm 全局目录（位置因安装方式而异，如 fnm 是 `~/.local/share/fnm/aliases/default/lib/node_modules/cron-ready/`，命令在同级 `bin/cron-ready`） |
-| launchd 配置 | `~/Library/LaunchAgents/local.cron-ready.plist` |
-| 配置文件 | `~/Library/Application Support/cron-ready/config.json` |
+| 命令行与代码 | npm 全局目录（位置因安装方式而异，如 fnm 是 `~/.local/share/fnm/aliases/default/lib/node_modules/cron-up/`，命令在同级 `bin/cron-up`） |
+| launchd 配置 | `~/Library/LaunchAgents/local.cron-up.plist` |
+| 配置文件 | `~/Library/Application Support/cron-up/config.json` |
 | 运行状态 | 同目录下的 `state.json` |
-| 日志 | `~/Library/Logs/cron-ready/`（巡检日志；各后台会话的界面记录在 `sessions/` 子目录下，该目录权限 700、日志文件 600） |
+| 日志 | `~/Library/Logs/cron-up/`（巡检日志；各后台会话的界面记录在 `sessions/` 子目录下，该目录权限 700、日志文件 600） |
 
 ### 安装前的三个前提
 
@@ -91,32 +91,32 @@ cron-ready install --force --no-auto-renew
 ## 日常使用
 
 ```bash
-cron-ready                        # 总览：服务、配置、最近任务、保活会话明细，以及需要留意的告警
-cron-ready list                   # 逐任务列出：下次执行时间、周期/一次性、cron 表达式、内容摘要、会话状态
-cron-ready run                    # 立即手动巡检一次（与定时巡检互斥，同时运行时后到者自动退出）
-cron-ready renew                  # 立即给所有周期任务补 permanent（手动执行，不受 autoRenew 开关影响）
-cron-ready logs                   # 查看巡检日志（stderr 有内容时在开头提示一行）
-cron-ready logs <目录名片段> -f    # 实时查看某个后台会话的界面输出
-cron-ready uninstall              # 停止并卸载服务，结束后台保活会话，保留配置和日志
-cron-ready uninstall --keep-sessions   # 卸载但保留后台会话（例如马上重装）
-cron-ready uninstall --purge      # 结束后台会话并删除配置与日志（命令行本身用 npm 卸载）
+cron-up                        # 总览：服务、配置、最近任务、保活会话明细，以及需要留意的告警
+cron-up list                   # 逐任务列出：下次执行时间、周期/一次性、cron 表达式、内容摘要、会话状态
+cron-up run                    # 立即手动巡检一次（与定时巡检互斥，同时运行时后到者自动退出）
+cron-up renew                  # 立即给所有周期任务补 permanent（手动执行，不受 autoRenew 开关影响）
+cron-up logs                   # 查看巡检日志（stderr 有内容时在开头提示一行）
+cron-up logs <目录名片段> -f    # 实时查看某个后台会话的界面输出
+cron-up uninstall              # 停止并卸载服务，结束后台保活会话，保留配置和日志
+cron-up uninstall --keep-sessions   # 卸载但保留后台会话（例如马上重装）
+cron-up uninstall --purge      # 结束后台会话并删除配置与日志（命令行本身用 npm 卸载）
 ```
 
 升级就是再装一次最新版：
 
 ```bash
-npm i -g cron-ready@latest
+npm i -g cron-up@latest
 ```
 
 launchd 每轮按 plist 里写死的路径重新拉起 node 与入口文件，npm 替换包文件后下一轮巡检自然跑新版，无需重载服务；配置与任务文件都不动。
 
-`cron-ready list` 按工作区分组，每个任务一行：状态列可能是下次执行时间、`已错过`（一次性任务触发点已过，下次会话启动时会补执行）、`一年内无`（一年的展示查找窗口内没有触发点，如 2 月 30 日这类永不满足的合法表达式）或 `cron 无效`（表达式无法解析，或字段越界、反向区间等任何分钟都不可能匹配的写法）；内容摘要取任务 prompt 的首个非空行；已续期的周期任务类型列显示为 `周期·永久`。自动续期关闭且仍有周期任务未打标时，无参数总览的「需要留意」会提示这些任务将于创建满 7 天后失效。不带任何参数的 `cron-ready` 是一页总览，把「任务已进入提前启动窗口却没有会话」「保活冷却中（若同时有任务待执行，会合并成一条带排查指引的告警，不会再承诺『下轮启动』）」「cron 无效」「配置与 launchd 实际间隔不一致」「launchd 配置里的 node/入口路径已失效」「会话登记格式疑似变更」等需要处理的情况集中列在「需要留意」里。
+`cron-up list` 按工作区分组，每个任务一行：状态列可能是下次执行时间、`已错过`（一次性任务触发点已过，下次会话启动时会补执行）、`一年内无`（一年的展示查找窗口内没有触发点，如 2 月 30 日这类永不满足的合法表达式）或 `cron 无效`（表达式无法解析，或字段越界、反向区间等任何分钟都不可能匹配的写法）；内容摘要取任务 prompt 的首个非空行；已续期的周期任务类型列显示为 `周期·永久`。自动续期关闭且仍有周期任务未打标时，无参数总览的「需要留意」会提示这些任务将于创建满 7 天后失效。不带任何参数的 `cron-up` 是一页总览，把「任务已进入提前启动窗口却没有会话」「保活冷却中（若同时有任务待执行，会合并成一条带排查指引的告警，不会再承诺『下轮启动』）」「cron 无效」「配置与 launchd 实际间隔不一致」「launchd 配置里的 node/入口路径已失效」「会话登记格式疑似变更」等需要处理的情况集中列在「需要留意」里。
 
 ## 使用定时任务时的三个约定
 
 1. **创建方式不变**：照常在用着的会话里口头让 Claude 创建定时任务（`durable: true`），任务记录仍然只存在 Claude Code 自己的文件里。
-2. **让一次性任务结束后自动退出**：在任务描述末尾固定加一句「按本仓工作流存好结果后，执行 `/exit` 退出会话」。这样一次性任务执行完会从任务文件自动删除，后台会话随即退出，整个过程有始有终。即使忘了加这句也不会留下常驻进程——cron-ready 巡检发现任务列表清空（一次性任务执行后被删、周期任务 7 天过期、手动删除任务）时，会自动结束**自己启动的**会话；加 `/exit` 仍然更推荐，任务结束当刻就退出，不用等下一轮巡检，也避免会话空跑。用户本人在该目录打开的会话不受影响，cron-ready 只停自己登记过的进程。
-3. **超过 7 天的周期任务默认由 cron-ready 自动续期**：Claude Code 的周期任务本会在创建满 7 天后末次执行并被删除；cron-ready 默认在巡检时给它们补 `permanent: true` 来豁免这条规则（见上文「自动续期」），正常使用无需手动续签。只有在关闭了 autoRenew、又不使用 cron-ready 时，才需要旧办法兜底——在任务描述里要求每次执行结束时用 `CronCreate` 重新登记下一个周期；这会生成新的任务 id，需同时让它删掉旧任务，否则同一节奏会有两条任务重复执行。
+2. **让一次性任务结束后自动退出**：在任务描述末尾固定加一句「按本仓工作流存好结果后，执行 `/exit` 退出会话」。这样一次性任务执行完会从任务文件自动删除，后台会话随即退出，整个过程有始有终。即使忘了加这句也不会留下常驻进程——cron-up 巡检发现任务列表清空（一次性任务执行后被删、周期任务 7 天过期、手动删除任务）时，会自动结束**自己启动的**会话；加 `/exit` 仍然更推荐，任务结束当刻就退出，不用等下一轮巡检，也避免会话空跑。用户本人在该目录打开的会话不受影响，cron-up 只停自己登记过的进程。
+3. **超过 7 天的周期任务默认由 cron-up 自动续期**：Claude Code 的周期任务本会在创建满 7 天后末次执行并被删除；cron-up 默认在巡检时给它们补 `permanent: true` 来豁免这条规则（见上文「自动续期」），正常使用无需手动续签。只有在关闭了 autoRenew、又不使用 cron-up 时，才需要旧办法兜底——在任务描述里要求每次执行结束时用 `CronCreate` 重新登记下一个周期；这会生成新的任务 id，需同时让它删掉旧任务，否则同一节奏会有两条任务重复执行。
 
 ## 恢复或接管后台会话
 
@@ -129,65 +129,65 @@ claude --resume <会话ID>      # 或 claude -r 在列表中选择
 
 对话记录在第一条消息后写入 `~/.claude/projects/<目录编码>/<会话ID>.jsonl`，即使后台进程被结束也能恢复。
 
-cron-ready spawn 的预热会话进程环境里带 `CRON_READY_SESSION=1`（值严格为字符串 `"1"`），供外部观察工具识别为「定时任务预热会话」并自动归组。这是公开契约：键名刻意不带 `CLAUDE_CODE_` 前缀——那批变量在 spawn 时会被统一清掉。
+cron-up spawn 的预热会话进程环境里带 `CRON_UP_SESSION=1`（值严格为字符串 `"1"`），供外部观察工具识别为「定时任务预热会话」并自动归组。这是公开契约：键名刻意不带 `CLAUDE_CODE_` 前缀——那批变量在 spawn 时会被统一清掉。
 
 ## 维护
 
 - **修改扫描范围**：直接编辑配置文件的 `roots`、`maxDepth`，最多 5 分钟后的下一轮巡检自动生效，无需重新加载服务。
-- **开关自动续期**：编辑配置文件的 `autoRenew`（`true`/`false`）同样在下一轮巡检生效；或运行 `cron-ready install --force --auto-renew`（`--no-auto-renew` 关闭）。想立即处理一次而不改长期开关，用 `cron-ready renew`。
-- **修改巡检间隔或提前量**：重新运行 `cron-ready install --force --interval 600`，会重新生成 launchd 配置。`--force` 只更新命令行里显式给出的字段，其余配置（如 `roots`）保留；路径参数建议都加引号书写，例如 `--roots "$HOME/code,$HOME/work"`，避免 shell 对逗号后的波浪号不展开。
-- **升级**：`npm i -g cron-ready@latest`。发布在公开 npm，打 `v*` tag 即由 GitHub Actions 跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致后 publish；版本不符时发布直接失败，杜绝「代码是 0.3.1、tag 叫 0.3.2」这类漂移。push 到 main 的每次提交也会先跑一遍测试（ci workflow）。
-- **配置校验**：安装时会校验配置——间隔或提前量不是合法数字（布尔值也不行，`true` 不会被当成 1 秒）会中止安装；提前量小于间隔（可能来不及在任务前启动会话）、扫描目录不存在会给出明确警告。无参数的 `cron-ready` 总览随时也会显示这些问题；其中 interval 显示的是 launchd **实际生效**的间隔，手动改过 config 但与实际不一致时会提示需要重新 install。
-- **路径大小写**：macOS 默认文件系统大小写不敏感，而 `realpath` 并不规范化大小写。扫描入口会把 `roots` 认回磁盘上的真实写法，`cron-ready logs` 给绝对路径时也一样——大小写敲错不再是「警告一声然后匹配失效」，而是直接按同一路径工作。
+- **开关自动续期**：编辑配置文件的 `autoRenew`（`true`/`false`）同样在下一轮巡检生效；或运行 `cron-up install --force --auto-renew`（`--no-auto-renew` 关闭）。想立即处理一次而不改长期开关，用 `cron-up renew`。
+- **修改巡检间隔或提前量**：重新运行 `cron-up install --force --interval 600`，会重新生成 launchd 配置。`--force` 只更新命令行里显式给出的字段，其余配置（如 `roots`）保留；路径参数建议都加引号书写，例如 `--roots "$HOME/code,$HOME/work"`，避免 shell 对逗号后的波浪号不展开。
+- **升级**：`npm i -g cron-up@latest`。版本号按「年.月.序号」：两位年份、月份、月内发布序号（序号每月重置），如 2026 年 9 月第一次发布是 `26.9.1`，同月再发是 `26.9.2`，到 10 月是 `26.10.1`。发布方式：先把 package.json 的 version 改成新版本并合入 main，再打同名 `v<version>` tag（如 `v26.9.1`）；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致后 publish，版本不符直接失败，杜绝「代码是 26.9.2、tag 叫 26.9.3」这类漂移。push 到 main 的每次提交也会先跑一遍测试（ci workflow）。
+- **配置校验**：安装时会校验配置——间隔或提前量不是合法数字（布尔值也不行，`true` 不会被当成 1 秒）会中止安装；提前量小于间隔（可能来不及在任务前启动会话）、扫描目录不存在会给出明确警告。无参数的 `cron-up` 总览随时也会显示这些问题；其中 interval 显示的是 launchd **实际生效**的间隔，手动改过 config 但与实际不一致时会提示需要重新 install。
+- **路径大小写**：macOS 默认文件系统大小写不敏感，而 `realpath` 并不规范化大小写。扫描入口会把 `roots` 认回磁盘上的真实写法，`cron-up logs` 给绝对路径时也一样——大小写敲错不再是「警告一声然后匹配失效」，而是直接按同一路径工作。
 - **提前量与间隔的关系**：请保持 `leadSeconds ≥ intervalSeconds`，否则极端情况下任务会在两轮巡检之间到期而来不及启动。默认 600 ≥ 300 有一倍余量。`--lead 0` 是合法取值（表示不提前，只靠错过补执行兜底），会如实写入配置；`--interval 0` 非法，安装时直接报错中止。
 - **长驻会话自动换代**：被续期任务保活的会话会长期常驻，但常驻不等于长生不老——连续运行超过 7 天、且界面记录静默超过 1 小时（没有任务在执行、没有界面活动的证据）的会话会被主动结束，任务需要时自然重拉。换代让会话用上新的 claude 版本、界面记录从头写起，也让长期累积的上下文回到干净起点。日志静默是「没在跑任务」的判据，执行中的任务不会被砍；换代不计入失败次数。
-- **连续失败自动暂停**：cron-ready 能区分「自己启动的后台会话」和「你本人打开的会话」，只跟踪前者。后台会话有两种失败会被计入：**启动后立即退出**（通常是 shell 环境损坏），以及**进程活着但 3 分钟内始终没有登记成会话**（停在信任确认或工具授权提问上——这种进程不会自己退出，会被 cron-ready 主动终止）。同一目录连续失败 3 次后暂停重试 30 分钟，无参数 `cron-ready` 总览显示「冷却中」；会话只要成功登记过一次，失败计数就清零；暂停结束后会给一次全新的重试机会，不会无限期停摆。健康会话实测约 1 秒完成登记，距 3 分钟的判定线有充足余量。
+- **连续失败自动暂停**：cron-up 能区分「自己启动的后台会话」和「你本人打开的会话」，只跟踪前者。后台会话有两种失败会被计入：**启动后立即退出**（通常是 shell 环境损坏），以及**进程活着但 3 分钟内始终没有登记成会话**（停在信任确认或工具授权提问上——这种进程不会自己退出，会被 cron-up 主动终止）。同一目录连续失败 3 次后暂停重试 30 分钟，无参数 `cron-up` 总览显示「冷却中」；会话只要成功登记过一次，失败计数就清零；暂停结束后会给一次全新的重试机会，不会无限期停摆。健康会话实测约 1 秒完成登记，距 3 分钟的判定线有充足余量。
 - **日志大小**：后台会话的界面输出是持续的全屏渲染流。单次运行产生的日志超过 10MB 时，会在下次启动该目录会话时轮转成 `.log.1`；而 `script(1)` 每次启动会清空旧日志，所以反复重启不会造成堆积。长驻会话的单代日志总量由自动换代（见上条）约束；唯一无法覆盖的是连续 7 天一直在输出、从不空闲的会话——受 macOS `script(1)` 能力限制，运行中不能切割日志。巡检日志（`launchd.out.log`/`.err.log`）只在有事件时才有输出（安静的一轮巡检一行都不写），超过 1MB 时同样轮转为 `.1`，只保留上一份。
-- **会话登记自检**：「有没有交互会话」的判断完全依赖 `~/.claude/sessions/` 的登记格式（见开头的 WARNING）。若升级 Claude Code 后该格式变化，cron-ready 会把所有会话都误判为「不存在」，陷入反复重拉。总览页对此有三重烟雾告警：登记目录里有文件却一个 interactive 会话都识别不出、存活进程都不像 claude、或 interactive 登记的 pid/工作目录字段集体无法解读时，「需要留意」会明确提示登记格式疑似变更；看到这条后，在重新核对目录结构之前不要相信「当前没有会话」的判断。进程识别同时覆盖两种安装形态：原生安装看进程可执行名（含 claude），npm/bun 安装（进程名是 node/bun）看命令行里的 claude 入口路径；只有命令行里完全找不到 claude 痕迹的启动形态才会误触这条告警。
+- **会话登记自检**：「有没有交互会话」的判断完全依赖 `~/.claude/sessions/` 的登记格式（见开头的 WARNING）。若升级 Claude Code 后该格式变化，cron-up 会把所有会话都误判为「不存在」，陷入反复重拉。总览页对此有三重烟雾告警：登记目录里有文件却一个 interactive 会话都识别不出、存活进程都不像 claude、或 interactive 登记的 pid/工作目录字段集体无法解读时，「需要留意」会明确提示登记格式疑似变更；看到这条后，在重新核对目录结构之前不要相信「当前没有会话」的判断。进程识别同时覆盖两种安装形态：原生安装看进程可执行名（含 claude），npm/bun 安装（进程名是 node/bun）看命令行里的 claude 入口路径；只有命令行里完全找不到 claude 痕迹的启动形态才会误触这条告警。
 
 ## 安全说明
 
-- 后台会话拥有你在 Claude Code 中的全部权限（bypass permissions 模式下执行任何操作都无需确认）。**请只把 `roots` 指向你本人信任的工作目录**；cron-ready 读取 `~/.claude/sessions/`（判断目录里是否已有会话）与 roots 下的任务文件，并写入自己的配置、状态与日志目录。**开启 autoRenew（默认）时，它还会改写 roots 下各工作目录的 `.claude/scheduled_tasks.json`**：在同目录写临时文件（先按 0600 创建）再原子替换、保留原文件权限，且只给周期任务新增 `permanent: true`，绝不改动 prompt、cron、id；每个任务只在首次打标时写一次，之后幂等不再重写。写入采用乐观锁：若读出之后、写回之前 Claude Code 也改了该文件（例如任务刚触发、更新了 `lastFiredAt`，或一次性任务执行后被删除），cron-ready 放弃本次写入、下轮巡检再续（否则可能让刚执行完被删的一次性任务复活、被再执行一次）。需要说明：乐观锁是在写回前比对文件 mtime，检查与替换之间不存在真正的互斥，竞态窗口只能收窄到微秒级、无法在原理上消除——这是改写另一个程序的文件固有的代价。
+- 后台会话拥有你在 Claude Code 中的全部权限（bypass permissions 模式下执行任何操作都无需确认）。**请只把 `roots` 指向你本人信任的工作目录**；cron-up 读取 `~/.claude/sessions/`（判断目录里是否已有会话）与 roots 下的任务文件，并写入自己的配置、状态与日志目录。**开启 autoRenew（默认）时，它还会改写 roots 下各工作目录的 `.claude/scheduled_tasks.json`**：在同目录写临时文件（先按 0600 创建）再原子替换、保留原文件权限，且只给周期任务新增 `permanent: true`，绝不改动 prompt、cron、id；每个任务只在首次打标时写一次，之后幂等不再重写。写入采用乐观锁：若读出之后、写回之前 Claude Code 也改了该文件（例如任务刚触发、更新了 `lastFiredAt`，或一次性任务执行后被删除），cron-up 放弃本次写入、下轮巡检再续（否则可能让刚执行完被删的一次性任务复活、被再执行一次）。需要说明：乐观锁是在写回前比对文件 mtime，检查与替换之间不存在真正的互斥，竞态窗口只能收窄到微秒级、无法在原理上消除——这是改写另一个程序的文件固有的代价。
 - **续期会改变三条生命周期/边界**：
-  1. 被打 `permanent` 的周期任务不再被 Claude Code 在创建满 7 天后删除，cron-ready 为它保活的后台会话随之**长期常驻**，不再随任务过期被回收——这等于主动关闭了 Claude Code 对自主会话的寿命护栏。
+  1. 被打 `permanent` 的周期任务不再被 Claude Code 在创建满 7 天后删除，cron-up 为它保活的后台会话随之**长期常驻**，不再随任务过期被回收——这等于主动关闭了 Claude Code 对自主会话的寿命护栏。
   2. 7 天上限本也是一道**自动淘汰**防线：一个你没留意、随 `git pull` 或他人提交进入工作目录的周期任务，原本最多存活 7 天；autoRenew 会无差别把它也永久化。因此**不要把他人可写、或你不完全掌控的仓库纳入 roots**（与下一条任务文件即执行输入的警告同理）；拉取外部代码后先检查 `.claude/scheduled_tasks.json` 里有没有意料之外的周期任务，必要时先关闭 autoRenew。
   3. 若某个仓库把 `.claude/scheduled_tasks.json` 纳入了版本控制，首次续期会让该文件因新增 `"permanent": true`（及按统一的两空格缩进排版）出现 diff，提交前请知悉；本机自用仓通常已在 `.git/info/exclude` 忽略它，不受影响。
-- **任务文件本身就是执行输入，而不只是数据**：任何能在 roots 下某个已信任目录落盘 `.claude/scheduled_tasks.json` 的主体，等于登记了一条定时指令——最快 5 分钟后，cron-ready 就会为该目录拉起一个以你的身份运行、自动执行其中 prompt 的会话。这包括一次普通的 `git pull`（任务文件随提交进入工作树）和共享仓库的协作者。因此不要把他人可写仓库的父目录放进 roots；拉取外部代码后若发现 `.claude/scheduled_tasks.json` 被新增或改动，先看内容再让它留在那里。
+- **任务文件本身就是执行输入，而不只是数据**：任何能在 roots 下某个已信任目录落盘 `.claude/scheduled_tasks.json` 的主体，等于登记了一条定时指令——最快 5 分钟后，cron-up 就会为该目录拉起一个以你的身份运行、自动执行其中 prompt 的会话。这包括一次普通的 `git pull`（任务文件随提交进入工作树）和共享仓库的协作者。因此不要把他人可写仓库的父目录放进 roots；拉取外部代码后若发现 `.claude/scheduled_tasks.json` 被新增或改动，先看内容再让它留在那里。
 - 会话日志可能包含任务执行过程和输出，默认仅本人可读（600），对外分享或截图前请留意内容。
 - 巡检、保活与续期都不发起网络请求，也不依赖任何第三方 npm 包；唯一的网络活动发生在**安装与升级**，即 npm 访问 registry.npmjs.org 拉取包本身（由你本机的 npm 配置与凭证负责）。除此之外的外部通信全部来自被启动的 agent 会话。
 
 ## 已知限制
 
 - 仅支持 macOS。电脑休眠期间错过的周期任务不会补执行；唤醒后 launchd 会立即跑一轮巡检，错过的**一次性**任务会在后台会话启动时由 Claude Code 补执行。
-- Claude Code 的周期任务本会在创建满 7 天后失效；cron-ready 默认已通过给任务补 `permanent` 字段自动续期，仅在关闭 autoRenew 后才需要按「使用定时任务时的三个约定」手动续签。`permanent` 是未公开字段，若新版 Claude Code 改变其语义需重新核对（见开头 WARNING）。
+- Claude Code 的周期任务本会在创建满 7 天后失效；cron-up 默认已通过给任务补 `permanent` 字段自动续期，仅在关闭 autoRenew 后才需要按「使用定时任务时的三个约定」手动续签。`permanent` 是未公开字段，若新版 Claude Code 改变其语义需重新核对（见开头 WARNING）。
 - 周期任务预热成功后，后台会话会一直保留到任务清空、进程退出或自动换代（连续运行超 7 天且静默超 1 小时，见「维护」），**不会在每次触发后回收**：同一周期内每次触发都追加进同一条会话记录，上下文随时间累积（反复 compact、每轮执行都携带全部历史），每个有周期任务的工作区也因此常驻一个 claude 进程。autoRenew 默认开启使这成为常态；自动换代把累积周期约束在 7 天空闲以内，更细粒度的「触发后回收、下次执行前重新预热」仍是后续方向。
 - 手写的任务文件若缺 `createdAt` 字段，错过补执行的判定不生效：错过的一次性任务不会被预热补救，`list` 也不显示「已错过」。`CronCreate` 创建的任务始终带该字段，不受影响。
-- 工作区从巡检视野里消失（`.claude/scheduled_tasks.json` 被整个删除，或目录被移出 `roots`）后，cron-ready 不再巡检它：其中仍在运行的保活会话不会被回收或换代，会一直驻留到进程自己退出。无参数 `cron-ready` 的「需要留意」会列出这类会话，不需要时请手动结束对应进程（`kill <pid>`）。
-- 同一目录同时存在两个交互会话时，定时任务是否会被各执行一次，官方没有明确说明。cron-ready 的策略是「只在没有任何会话时才启动」，正常流程不会制造第二个会话。
-- 若升级 Node 时删掉了 plist 引用的版本目录（多见于手动删除 nvm/fnm 版本），launchd 会静默拉不起巡检；总览页会报「Node 或入口路径已失效」，重跑一次 `cron-ready install` 即可修复。
+- 工作区从巡检视野里消失（`.claude/scheduled_tasks.json` 被整个删除，或目录被移出 `roots`）后，cron-up 不再巡检它：其中仍在运行的保活会话不会被回收或换代，会一直驻留到进程自己退出。无参数 `cron-up` 的「需要留意」会列出这类会话，不需要时请手动结束对应进程（`kill <pid>`）。
+- 同一目录同时存在两个交互会话时，定时任务是否会被各执行一次，官方没有明确说明。cron-up 的策略是「只在没有任何会话时才启动」，正常流程不会制造第二个会话。
+- 若升级 Node 时删掉了 plist 引用的版本目录（多见于手动删除 nvm/fnm 版本），launchd 会静默拉不起巡检；总览页会报「Node 或入口路径已失效」，重跑一次 `cron-up install` 即可修复。
 
 ## 故障排查
 
 | 现象 | 排查方法 |
 |---|---|
-| 总览提示「冷却中」 | 运行 `cron-ready logs <目录名>` 查看启动界面：要么停在信任确认或工具授权提问（日志里能看到提问界面），要么 shell 环境缺少命令（日志里是 `command not found`） |
-| 总览提示「Node 或入口路径已失效」 | Node 版本目录被删或移动后 plist 里的绝对路径失效，重跑 `cron-ready install` 重新解析即可 |
+| 总览提示「冷却中」 | 运行 `cron-up logs <目录名>` 查看启动界面：要么停在信任确认或工具授权提问（日志里能看到提问界面），要么 shell 环境缺少命令（日志里是 `command not found`） |
+| 总览提示「Node 或入口路径已失效」 | Node 版本目录被删或移动后 plist 里的绝对路径失效，重跑 `cron-up install` 重新解析即可 |
 | 日志里出现「卡死」 | 会话进程起来了但没能变成可用会话，绝大多数是停在信任确认或授权提问。先手动 `cd <目录> && claude` 走完确认，再等下一轮巡检 |
 | 日志里出现「任务文件读不出 \<目录\>」 | 该目录的 `.claude/scheduled_tasks.json` 存在却解析不了（格式损坏），巡检跳过这一个目录，**其中的定时任务一个都不会执行**；其余目录照常。检查该文件 |
-| 日志里出现「错误 \<目录\>」 | 巡检该目录时抛出未预期的异常，已按目录隔离、不影响其余目录。这通常意味着 cron-ready 自身的 bug，请带上该行反馈 |
-| 任务到点没有执行 | `cron-ready list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.cron-ready` 查看 last exit code |
-| 手动 `cron-ready run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错；注意 plist 用的是安装时解析的绝对 node 路径，换 Node 安装方式后要重跑 install |
-| `last exit code=2` | config.json 缺失、不是合法 JSON、顶层不是对象，或字段类型不对（如 `leadSeconds` 写成字符串）；无参数 `cron-ready` 总览的配置行或「需要留意」会给出具体原因 |
+| 日志里出现「错误 \<目录\>」 | 巡检该目录时抛出未预期的异常，已按目录隔离、不影响其余目录。这通常意味着 cron-up 自身的 bug，请带上该行反馈 |
+| 任务到点没有执行 | `cron-up list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.cron-up` 查看 last exit code |
+| 手动 `cron-up run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错；注意 plist 用的是安装时解析的绝对 node 路径，换 Node 安装方式后要重跑 install |
+| `last exit code=2` | config.json 缺失、不是合法 JSON、顶层不是对象，或字段类型不对（如 `leadSeconds` 写成字符串）；无参数 `cron-up` 总览的配置行或「需要留意」会给出具体原因 |
 
 ## 开发与测试
 
 ```bash
 git clone git@github.com:adaex/doorman.git && cd doorman   # 仓库名仍为 doorman
 node --test                 # 全部测试（需要 Node 22+；进程/launchctl 相关用例在 macOS 上运行）
-npm link                    # 本机把开发版链接成全局 cron-ready，迭代即生效
+npm link                    # 本机把开发版链接成全局 cron-up，迭代即生效
 ```
 
-`npm link` 后运行 `cron-ready install` 会把指向工作副本的 LaunchAgent 装进系统，适合端到端调试；日常使用直接装公开 npm 的版本即可。
+`npm link` 后运行 `cron-up install` 会把指向工作副本的 LaunchAgent 装进系统，适合端到端调试；日常使用直接装公开 npm 的版本即可。
 
 用例名自说明覆盖面，不再这里另抄一份清单（抄来的清单只会腐化）。东亚显示宽度的码点表由 `scripts/gen-east-asian-width.mjs` 从 Unicode 官方数据生成（当前 Unicode 18.0.0，见文件头注释里的重生成方法）。
 

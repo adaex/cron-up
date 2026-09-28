@@ -7,17 +7,16 @@ import path from 'node:path';
 // 引全量入口：保证所有业务模块都已向 deps 自注册。
 import '../src/index.mjs';
 import { deps } from '../src/internals.mjs';
-import { paths } from '../src/paths.mjs';
 
 // 创建 realpath 后的临时目录（macOS /tmp 是 /private/tmp 的符号链接）。
 export function mkTmp(t) {
-  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cr-')));
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cronup-')));
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
   return dir;
 }
 
-// 快照整个 deps 容器，测试结束后还原（等价 Python addCleanup(setattr,...)）。
-// paths 是带 getter 的对象，保存引用即可——测试通常整体替换 deps.paths。
+// 快照整个 deps 容器，测试结束后还原（t.after 注册清理）。paths 是带
+// getter 的对象，保存引用即可——测试通常整体替换 deps.paths。
 export function mockDeps(t) {
   const snapshot = {};
   for (const k of Object.keys(deps)) snapshot[k] = deps[k];
@@ -31,12 +30,12 @@ export function mockDeps(t) {
 // 把产物路径全部重定向到 tmp：默认给一份完整 paths，测试可再覆盖单项。
 export function tmpPaths(tmp, overrides = {}) {
   const p = {
-    // home 默认保持真实 HOME（expanduser 语义与 Python 测试一致），只有
-    // 显式 overrides.home 才重定向。
+    // home 默认保持真实 HOME（expandHome 依赖它），只有显式
+    // overrides.home 才重定向。
     home: os.homedir(),
     appSupport: path.join(tmp, 'app'),
     logDir: path.join(tmp, 'logs'),
-    plistPath: path.join(tmp, 'local.cron-ready.plist'),
+    plistPath: path.join(tmp, 'local.cron-up.plist'),
     sessionDir: path.join(tmp, 'sessions-registry'),
     // 与生产 paths 同形的派生 getter。
     get sessionLogDir() {
@@ -65,5 +64,3 @@ export function writeJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data));
 }
-
-export { paths };

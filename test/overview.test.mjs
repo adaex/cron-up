@@ -1,4 +1,3 @@
-// 翻译自 Python OverviewTests。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -42,7 +41,7 @@ async function setup(t) {
 
 test('empty world renders cleanly', async (t) => {
   const out = await (await setup(t)).render();
-  assert.ok(out.includes('cron-ready'));
+  assert.ok(out.includes('cron-up'));
   assert.ok(out.includes('launchd 已加载'));
   assert.ok(out.includes('任务：暂无'));
   assert.ok(out.includes('无保活会话'));

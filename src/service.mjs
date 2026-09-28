@@ -62,9 +62,9 @@ export function serviceLine(info, plistExists) {
       + `上次退出码 ${info['last exit code'] ?? '?'}`;
   }
   if (plistExists) {
-    return '服务：plist 文件存在但未加载，运行 cron-ready install 重新加载';
+    return '服务：plist 文件存在但未加载，运行 cron-up install 重新加载';
   }
-  return '服务：未安装，运行 cron-ready install 安装';
+  return '服务：未安装，运行 cron-up install 安装';
 }
 
 // ---- node 启动路径解析 ----
@@ -139,7 +139,7 @@ export function resolveLauncher(opts = {}) {
   const home = opts.home ?? paths.home;
   const execPath = opts.execPath ?? process.execPath;
   const entryPath = opts.entryPath
-    ?? fileURLToPath(new URL('../bin/cron-ready.mjs', import.meta.url));
+    ?? fileURLToPath(new URL('../bin/cron-up.mjs', import.meta.url));
 
   // 1. fnm：aliases/default 是跟随 `fnm default` 切换的稳定 symlink，切勿
   //    realpath 到版本化目录（fnm 升级后那里会失效）。包含 FNM_DIR 与新
@@ -185,7 +185,7 @@ export function resolveLauncher(opts = {}) {
     entryPath,
     manager: 'exec-path',
     note: '未能定位版本无关的 node 路径，已使用当前 node 的绝对路径；'
-      + '切换 Node 版本后请重新运行 cron-ready install',
+      + '切换 Node 版本后请重新运行 cron-up install',
   };
 }
 
@@ -213,7 +213,7 @@ function xmlUnescape(s) {
     .replace(/&amp;/g, '&');
 }
 
-// 字段顺序与 plistlib FMT_XML 一致（key 字母序）。ProgramArguments 是
+// key 按字母序排列。ProgramArguments 是
 // [node 绝对路径, 入口脚本绝对路径, 'run']——launchd 的最小 PATH 里没有
 // node，不能写 npm shim。
 export function renderPlist(intervalSeconds, launcher) {
@@ -271,7 +271,7 @@ export function launcherHealth() {
   if (missing.length === 0) return null;
   return 'launchd 配置中的 Node 或入口路径已失效（'
     + `${missing.map((p) => path.basename(p)).join('、')} 不存在），巡检当前拉不`
-    + '起来；请重新运行 cron-ready install';
+    + '起来；请重新运行 cron-up install';
 }
 
 // ---- install / uninstall ----
@@ -287,7 +287,17 @@ export async function cmdInstall(args) {
 
   let cfg;
   if (fs.existsSync(deps.paths.configPath) && !args.force) {
-    cfg = loadConfig(deps.paths.configPath);
+    try {
+      cfg = loadConfig(deps.paths.configPath);
+    } catch (e) {
+      // 损坏配置最自然的修复动作就是重跑 install——当面给出 --force 出口，
+      // 而不是只丢下一行解析错误。
+      if (e instanceof ExitError) {
+        throw new ExitError(e.code,
+          `${e.message}\n  丢弃损坏配置重新安装：cron-up install --force`);
+      }
+      throw e;
+    }
     deps.print(`保留现有配置：${deps.paths.configPath}（需要更新时加 --force）`);
   } else {
     // 即使 --force 也从现有配置（全新安装则默认值）起步，只覆盖命令行给
@@ -354,8 +364,7 @@ export async function cmdInstall(args) {
     renderPlist(cfg.intervalSeconds, launcher));
   deps.print(`已写入 LaunchAgent：${deps.paths.plistPath}`);
 
-  // 新旧同名的旧 label 若还在（从 doorman 迁来），先踢掉，避免两个巡检
-  // 并行互相换代/回收。
+  // doorman 旧 label 若还在，先踢掉，避免两个巡检并行互相换代/回收。
   deps.launchctl('bootout', `${guiTarget()}/${OLD_LABEL}`);
   deps.launchctl('bootout', `${guiTarget()}/${LABEL}`);
   const r = deps.launchctl('bootstrap', guiTarget(), deps.paths.plistPath);
@@ -368,10 +377,10 @@ export async function cmdInstall(args) {
 
   // install 与巡检撞车时首轮会被跳过，不能照常说「完成」。
   if (await deps.runPatrol({ config: undefined })) {
-    deps.print('首轮巡检完成，查看状态：cron-ready');
+    deps.print('首轮巡检完成，查看状态：cron-up');
   } else {
     deps.print('首轮巡检暂未执行（已有一轮在进行），launchd 会在下个间隔自动'
-      + '补跑；查看状态：cron-ready');
+      + '补跑；查看状态：cron-up');
   }
 }
 
@@ -401,7 +410,7 @@ export async function cmdUninstall(args) {
       deps.print(`已删除 ${p}`);
     }
     // npm 管的文件不能手删：命令行本身交给 npm 卸载。
-    deps.print('命令行本身请运行 npm uninstall -g cron-ready 卸载');
+    deps.print('命令行本身请运行 npm uninstall -g cron-up 卸载');
   } else {
     deps.print('配置与日志已保留（--purge 删除全部产物，--keep-sessions 保留'
       + '保活会话）');

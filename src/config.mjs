@@ -32,9 +32,10 @@ export function isInt(x) {
   return typeof x === 'number' && Number.isInteger(x);
 }
 
-// 仿真 Python int() 对手改 state 的宽容度：数字字符串按纯十进制接受，浮点
-// 截断，布尔拒绝；非法输入抛错由调用方按「字段不存在」处理。
-export function pyInt(v) {
+// 宽容整型化（手改的 state/登记文件里字段可能是字符串或浮点）：纯十进制
+// 字符串接受，浮点截断，布尔拒绝；非法输入抛错由调用方按「字段不存在」
+// 处理。
+export function lenientInt(v) {
   if (typeof v === 'boolean') throw new Error('布尔不是整数字段');
   if (typeof v === 'number') {
     if (!Number.isFinite(v)) throw new Error('数值越界');
@@ -57,7 +58,7 @@ export function loadConfig(file, opts = {}) {
     if (e.code === 'ENOENT') {
       if (opts.missingOk) throw e;
       throw new ExitError(2,
-        `配置文件读不到：${file}\n  运行 cron-ready install 生成，`
+        `配置文件读不到：${file}\n  运行 cron-up install 生成，`
         + '或用 --config 指定路径');
     }
     if (opts.corruptOk) throw e;
@@ -70,7 +71,7 @@ export function loadConfig(file, opts = {}) {
     }
     throw new ExitError(2,
       `配置文件顶层应是 JSON 对象而不是${Array.isArray(cfg) ? '数组' : typeof cfg}：`
-      + `${file}\n  运行 cron-ready install 生成，或用 --config 指定路径`);
+      + `${file}\n  运行 cron-up install 生成，或用 --config 指定路径`);
   }
   const merged = { ...DEFAULT_CONFIG, ...cfg };
   if (!Array.isArray(merged.roots)) merged.roots = DEFAULT_CONFIG.roots;
@@ -85,8 +86,8 @@ export function loadConfig(file, opts = {}) {
 }
 
 // 自己的文件也可能被手改或截断：非对象读成「没有 state」，数值字段入口处
-// 整型化并卡范围——否则 waitpid/killpg 收到字符串会抛、负数 pid 会被当成
-// 进程组号误伤无辜进程组、超 pid_t 上界的整数直到 kill 才炸。
+// 整型化并卡范围——否则 kill 收到字符串会抛、负数 pid 会被当成进程组号
+// 误伤无辜进程组、超 pid_t 上界的整数直到 kill 才炸。
 export function loadState() {
   let state;
   try {
@@ -101,7 +102,7 @@ export function loadState() {
     const ent = { ...raw };
     let pid = null;
     try {
-      pid = pyInt(ent.pid);
+      pid = lenientInt(ent.pid);
     } catch {
       pid = null;
     }
@@ -109,7 +110,7 @@ export function loadState() {
     for (const k of ['startedAt', 'cooldownUntil', 'fails']) {
       if (ent[k] !== null && ent[k] !== undefined) {
         try {
-          ent[k] = pyInt(ent[k]);
+          ent[k] = lenientInt(ent[k]);
         } catch {
           delete ent[k];
         }
@@ -139,7 +140,7 @@ export function saveConfig(cfg) {
 export function validateConfig(cfg, announce = () => {}) {
   const warnings = [];
   if (!cfg.roots || cfg.roots.length === 0) {
-    warnings.push('扫描目录 roots 为空：巡检不会发现任何工作区，cron-ready 形同空转');
+    warnings.push('扫描目录 roots 为空：巡检不会发现任何工作区，cron-up 形同空转');
   }
   const interval = cfg.intervalSeconds;
   const lead = cfg.leadSeconds;

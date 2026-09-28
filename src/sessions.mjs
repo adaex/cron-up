@@ -55,8 +55,8 @@ export function sessionLogPath(ws) {
   return path.join(deps.paths.sessionLogDir, `${slug}.log`);
 }
 
-// shlex.quote 的等价实现：安全字符白名单内原样返回，否则单引号包裹，内
-// 部单引号写成 '"'"'。
+// POSIX shell 引用：安全字符白名单内原样返回，否则单引号包裹，内部单引
+// 号写成 '"'"'。
 export function shellQuote(s) {
   if (s === '') return "''";
   if (/^[-@%+=:,./\w]+$/.test(s)) return s;
@@ -85,7 +85,7 @@ export function buildChildEnv(parentEnv) {
   }
   // 刻意不带 CLAUDE_CODE_ 前缀（上一步刚把那批 strip 掉）；值必须严格是
   // 字符串 '1'（观察侧 === '1' 判定）。
-  env.CRON_READY_SESSION = '1';
+  env.CRON_UP_SESSION = '1';
   return env;
 }
 
@@ -109,9 +109,8 @@ export function spawnSession(ws) {
   } catch {
     // 轮转失败不阻断拉起。
   }
-  // Node 的 spawn 没有 umask 选项（不能像 Python fork 后子内 umask 0o077），
-  // 而 typescript 可能含任务输出，必须 0600：先以 0600 预创建，script 随后
-  // 以 O_TRUNC 打开已存在文件时模式位不变。
+  // spawn 没有 umask 选项，而 typescript 可能含任务输出、必须 0600：先以
+  // 0600 预创建，script 随后以 O_TRUNC 打开已存在文件时模式位不变。
   const fd = fs.openSync(logPath, 'a', 0o600);
   fs.closeSync(fd);
   try {
@@ -185,5 +184,4 @@ Object.assign(deps, {
   spawnSession,
   stopSession,
   listScriptProcesses,
-  sessionLogPath,
 });

@@ -1,5 +1,3 @@
-// 翻译自 Python SessionScanTests / ClaudeProcessDetectionTests /
-// ProcessFingerprintTests。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -97,9 +95,8 @@ test('live non-claude process alerts', async (t) => {
 });
 
 test('malformed pid entries are skipped', async (t) => {
-  // 必须用真实存活判定跑——这几道关是 scanSessions 唯一的防线。裸
-  // Infinity 在 JS 里 JSON.parse 直接抛，按「损坏登记」忽略，语义等价于
-  // Python 版「读不进有效 pid 而跳过」。
+  // 必须用真实存活判定跑——这几道关是 scanSessions 唯一的防线。损坏登记
+  // （如裸 Infinity 过不了 JSON.parse）一律按「读不进有效 pid 而跳过」。
   const { tmp, deps, writeReg } = await setup(t);
   const me = process.pid;
   deps.alive = (p) => p === me;
