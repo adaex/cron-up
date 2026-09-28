@@ -34,7 +34,6 @@ export function tmpPaths(tmp, overrides = {}) {
     // overrides.home 才重定向。
     home: os.homedir(),
     dataDir: path.join(tmp, 'app'),
-    legacyAppSupport: path.join(tmp, 'legacy-app'),
     logDir: path.join(tmp, 'logs'),
     plistPath: path.join(tmp, 'local.cron-up.plist'),
     sessionDir: path.join(tmp, 'sessions-registry'),

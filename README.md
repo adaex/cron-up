@@ -8,7 +8,7 @@
 ## 平台要求
 
 - **macOS**（依赖 launchd、`script(1)`、zsh 登录配置；暂不支持其他系统）
-- **Node.js 22 以上**（零运行时依赖，巡检本身只调系统自带工具）。fnm、volta、nvm、Homebrew 与官网安装包都支持——安装时会自动解析版本无关的 node 稳定路径写进 launchd 配置，不依赖 shell 的 PATH
+- **Node.js 22 以上**（零运行时依赖，巡检本身只调系统自带工具）。fnm、volta、Homebrew、官网安装包与其他版本管理器都支持——安装时把 node 与 cron-up 所在的 bin 目录写进启动脚本的 PATH，不依赖 shell 的 PATH
 - Claude Code 命令行（在交互登录 shell 里能直接运行 `claude`）
 
 ## 它解决什么问题
@@ -30,7 +30,7 @@ cron-up 是一个由 launchd 每 5 分钟运行一次的巡检进程，逻辑只
 |---|---|
 | 任务登记 | Claude Code 原生命令 `CronCreate(durable: true)`，写入工作目录下的 `.claude/scheduled_tasks.json` |
 | 定时执行 | Claude Code 交互会话自身（包括 cron 时间计算、随机延迟、一次性任务执行后自动删除） |
-| 保证有会话在场 | launchd 每 5 分钟调用一次 `cron-up run`（以「node 绝对路径 + 入口脚本绝对路径」启动，不依赖 shell PATH），运行完立即退出，不常驻 |
+| 保证有会话在场 | launchd 每 5 分钟调用一次 `cron-up run`（经自有启动脚本拉起，PATH 指向安装时解析的 node bin 目录），运行完立即退出，不常驻 |
 | 周期任务续期 | 巡检时给周期任务补 `permanent: true`（默认开启、可关），使其不受 7 天过期限制；见下 |
 | 后台会话 | 通过 macOS 自带的 `script(1)` 启动无窗口交互界面，输出写入日志，可随时恢复 |
 | 安装与升级 | 一律走 npm：`npm i -g cron-up` / `npm i -g cron-up@latest` |
@@ -48,7 +48,7 @@ cron-up install --roots ~/code,~/work --interval 300 --lead 600
 
 `--roots` 填写存放 agent 工作目录的父目录（逗号分隔）。不填时默认扫描家目录下两层以内（`~/` 自身、`~/*` 与 `~/*/*`），并自动跳过 `Library`、`Documents` 等系统目录和 `.git`、`node_modules`、`.cache` 等目录；建议显式指定，范围越小越安全、越快。使用默认范围安装时 install 会再打印一次安全提示：今后 clone 进家目录的任何仓库都会进入巡检，其中的周期任务会被自动续期永久化（原理见「安全说明」）。
 
-launchd 的环境变量极少（PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`），npm 全局命令那个 `#!/usr/bin/env node` 壳在它下面找不到 node。因此安装时把**跟随默认版本的 bin 目录**（fnm 是 `~/.local/share/fnm/aliases/default/bin`——`fnm default` 切换时这个 symlink 自己跟着切；volta 是 `~/.volta/bin`；Homebrew/官网是系统 bin 目录）写进一个自有的启动脚本（`cron-up-service`）的 PATH，脚本直接 `exec cron-up run`——cron-up 与 node 每轮从 PATH 解析，**npm 升级、fnm/volta 切换默认版本都自动跟随，无需重跑 install**，且 node 与包永远同版本。切换默认版本后只需在新版本里装过一次 `npm i -g cron-up`，忘了装的话总览页会提示。例外：**nvm 的 default 只是个文本别名**（要解析到具体版本目录，没有跟随切换的 symlink），其启动脚本写死绝对路径，切换默认版本后需重跑 `cron-up install`，总览会检测路径失效与版本分叉。自建启动脚本的另一个原因是显示名：macOS 系统设置「允许在后台」按 launchd 拉起的第一个可执行文件给条目归组，直连 node 会显示在「Node.js Foundation」（node 的签名者）名下，指向自有脚本则显示 **cron-up-service**。
+launchd 的环境变量极少（PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`），npm 全局命令那个 `#!/usr/bin/env node` 壳在它下面找不到 node。因此安装时把**node 与 cron-up 所在的 bin 目录**（fnm 是 `~/.local/share/fnm/aliases/default/bin`——`fnm default` 切换时这个 symlink 自己跟着切；volta 是 `~/.volta/bin`；Homebrew/官网是系统 bin 目录；其余安装方式取当前 node 的 bin 目录）写进一个自有的启动脚本（`cron-up-service`）的 PATH，脚本直接 `exec cron-up run`——cron-up 与 node 每轮从 PATH 解析，**npm 升级自动跟随，无需重跑 install**，且 node 与包永远同版本。fnm/volta 切换默认版本后只需在新版本里装过一次 `npm i -g cron-up`，忘了装的话总览页会提示；nvm 等按版本目录安装的形态则绑定装包时的目录，切换默认版本后重跑一次 `cron-up install` 才切过去。自建启动脚本的另一个原因是显示名：macOS 系统设置「允许在后台」按 launchd 拉起的第一个可执行文件给条目归组，直连 node 会显示在「Node.js Foundation」（node 的签名者）名下，指向自有脚本则显示 **cron-up-service**。
 
 ### 自动续期（默认开启）
 
@@ -68,7 +68,7 @@ cron-up install --force --no-auto-renew
 |---|---|
 | 命令行与代码 | npm 全局目录（位置因安装方式而异，如 fnm 是 `~/.local/share/fnm/aliases/default/lib/node_modules/cron-up/`，命令在同级 `bin/cron-up`） |
 | launchd 配置 | `~/Library/LaunchAgents/local.cron-up.plist` |
-| 启动脚本 | `~/.local/share/cron-up/cron-up-service`（launchd 拉起的入口，内含 node 与包入口的绝对路径；后台列表显示名即来自它） |
+| 启动脚本 | `~/.local/share/cron-up/cron-up-service`（launchd 拉起的入口，PATH 里写有 node 与 cron-up 所在的 bin 目录；后台列表显示名即来自它） |
 | 配置文件 | `~/.local/share/cron-up/config.json` |
 | 运行状态 | 同目录下的 `state.json` |
 | 日志 | `~/Library/Logs/cron-up/`（巡检日志；各后台会话的界面记录在 `sessions/` 子目录下，该目录权限 700、日志文件 600） |
@@ -99,9 +99,9 @@ cron-up uninstall --purge      # 结束后台会话并删除配置与日志（�
 npm i -g cron-up@latest
 ```
 
-launchd 每轮按 plist 里写死的路径重新拉起 node 与入口文件，npm 替换包文件后下一轮巡检自然跑新版，无需重载服务；配置与任务文件都不动（fnm/nvm 切换默认 Node 版本是例外，见「维护」）。
+launchd 每轮经启动脚本从 PATH 重新解析 cron-up 与 node，npm 替换包文件后下一轮巡检自然跑新版，无需重载服务；配置与任务文件都不动。
 
-`cron-up list` 按工作区分组，每个任务一行：状态列可能是下次执行时间、`已错过`（一次性任务触发点已过，下次会话启动时会补执行）、`一年内无`（一年的展示查找窗口内没有触发点，如 2 月 30 日这类永不满足的合法表达式）或 `cron 无效`（表达式无法解析，或字段越界、反向区间等任何分钟都不可能匹配的写法）；内容摘要取任务 prompt 的首个非空行；已续期的周期任务类型列显示为 `周期·永久`。自动续期关闭且仍有周期任务未打标时，无参数总览的「需要留意」会提示这些任务将于创建满 7 天后失效。不带任何参数的 `cron-up` 是一页总览，把「任务已进入提前启动窗口却没有会话」「保活冷却中（若同时有任务待执行，会合并成一条带排查指引的告警，不会再承诺『下轮启动』）」「cron 无效」「配置与 launchd 实际间隔不一致」「launchd 配置里的 node/入口路径已失效或分属不同 node 版本目录」「会话登记格式疑似变更」等需要处理的情况集中列在「需要留意」里。
+`cron-up list` 按工作区分组，每个任务一行：状态列可能是下次执行时间、`已错过`（一次性任务触发点已过，下次会话启动时会补执行）、`一年内无`（一年的展示查找窗口内没有触发点，如 2 月 30 日这类永不满足的合法表达式）或 `cron 无效`（表达式无法解析，或字段越界、反向区间等任何分钟都不可能匹配的写法）；内容摘要取任务 prompt 的首个非空行；已续期的周期任务类型列显示为 `周期·永久`。自动续期关闭且仍有周期任务未打标时，无参数总览的「需要留意」会提示这些任务将于创建满 7 天后失效。不带任何参数的 `cron-up` 是一页总览，把「任务已进入提前启动窗口却没有会话」「保活冷却中（若同时有任务待执行，会合并成一条带排查指引的告警，不会再承诺『下轮启动』）」「cron 无效」「配置与 launchd 实际间隔不一致」「启动脚本的 PATH 里解析不到 cron-up 或 node」「会话登记格式疑似变更」等需要处理的情况集中列在「需要留意」里。
 
 ## 使用定时任务时的三个约定
 
@@ -127,7 +127,7 @@ cron-up spawn 的预热会话进程环境里带 `CRON_UP_SESSION=1`（值严格�
 - **修改扫描范围**：直接编辑配置文件的 `roots`、`maxDepth`，最多 5 分钟后的下一轮巡检自动生效，无需重新加载服务。
 - **开关自动续期**：编辑配置文件的 `autoRenew`（`true`/`false`）同样在下一轮巡检生效；或运行 `cron-up install --force --auto-renew`（`--no-auto-renew` 关闭）。想立即处理一次而不改长期开关，用 `cron-up renew`。
 - **修改巡检间隔或提前量**：重新运行 `cron-up install --force --interval 600`，会重新生成 launchd 配置。`--force` 只更新命令行里显式给出的字段，其余配置（如 `roots`）保留；路径参数建议都加引号书写，例如 `--roots "$HOME/code,$HOME/work"`，避免 shell 对逗号后的波浪号不展开。
-- **升级**：`npm i -g cron-up@latest`，下一轮巡检自然跑新版；fnm/volta 下切换默认 Node 版本同样自动跟随（在新版本里装过一次 `npm i -g cron-up` 即可，忘了装总览会提示），全程无需重跑 install。**例外**：nvm 的启动脚本写死绝对路径，切换默认版本后重跑一次 `cron-up install`。从 26.9.4 及更早升级后建议重跑一次 `cron-up install --force` 把启动脚本切到 PATH 形态（26.9.4 及更早还会顺带把数据目录从 `~/Library/Application Support/cron-up` 迁到 `~/.local/share/cron-up`）；不重跑的话旧形态照常巡检。版本号按「年.月.序号」：两位年份、月份、月内发布序号（序号每月重置），如 2026 年 9 月第一次发布是 `26.9.1`，同月再发是 `26.9.2`，到 10 月是 `26.10.1`。发布方式：先把 package.json 的 version 改成新版本并合入 main，再打同名 `v<version>` tag（如 `v26.9.1`）；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致后 publish，版本不符直接失败，杜绝「代码是 26.9.2、tag 叫 26.9.3」这类漂移。push 到 main 的每次提交也会先跑一遍测试（ci workflow）。
+- **升级**：`npm i -g cron-up@latest`，下一轮巡检自然跑新版。fnm/volta/Homebrew 下切换默认 Node 版本同样自动跟随（在新版本里装过一次 `npm i -g cron-up` 即可，忘了装总览会提示），全程无需重跑 install；nvm 等按版本目录安装的形态绑定装包时的目录，切换默认版本后重跑一次 `cron-up install` 才切到新版本。版本号按「年.月.序号」：两位年份、月份、月内发布序号（序号每月重置），如 2026 年 9 月第一次发布是 `26.9.1`，同月再发是 `26.9.2`，到 10 月是 `26.10.1`。发布方式：先把 package.json 的 version 改成新版本并合入 main，再打同名 `v<version>` tag（如 `v26.9.1`）；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致后 publish，版本不符直接失败，杜绝「代码是 26.9.2、tag 叫 26.9.3」这类漂移。push 到 main 的每次提交也会先跑一遍测试（ci workflow）。
 - **配置校验**：手改配置时字段类型写错（`roots` 不是数组、数值字段写成字符串或布尔、`autoRenew` 不是布尔）不会静默回退默认值——巡检会以退出码 2 响亮失败并在总览页列出具体字段，修好或重跑 `cron-up install --force`（坏字段回默认，其余保留）。软问题只警告不中止：提前量小于间隔（可能来不及在任务前启动会话）、扫描目录不存在。无参数的 `cron-up` 总览随时也会显示这些问题；其中 interval 显示的是 launchd **实际生效**的间隔，手动改过 config 但与实际不一致时会提示需要重新 install。
 - **路径大小写**：macOS 默认文件系统大小写不敏感，而 `realpath` 并不规范化大小写。扫描入口会把 `roots` 认回磁盘上的真实写法，`cron-up logs` 给绝对路径时也一样——大小写敲错不再是「警告一声然后匹配失效」，而是直接按同一路径工作。
 - **提前量与间隔的关系**：请保持 `leadSeconds ≥ intervalSeconds`，否则极端情况下任务会在两轮巡检之间到期而来不及启动。默认 600 ≥ 300 有一倍余量。`--lead 0` 是合法取值（表示不提前，只靠错过补执行兜底），会如实写入配置；`--interval 0` 非法，安装时直接报错中止。
@@ -156,22 +156,21 @@ cron-up spawn 的预热会话进程环境里带 `CRON_UP_SESSION=1`（值严格�
 - 工作区从巡检视野里消失（`.claude/scheduled_tasks.json` 被整个删除，或目录被移出 `roots`）后，cron-up 不再巡检它：其中仍在运行的保活会话不会被回收或换代，会一直驻留到进程自己退出。无参数 `cron-up` 的「需要留意」会列出这类会话，不需要时请手动结束对应进程（`kill <pid>`）。
 - 同一目录同时存在两个交互会话时，定时任务是否会被各执行一次，官方没有明确说明。cron-up 的策略是「只在没有任何会话时才启动」，正常流程不会制造第二个会话。
 - 系统设置「登录项与扩展 → 允许在后台」里，巡检条目显示为 **cron-up-service**：macOS 按 launchd 拉起的第一个可执行文件（启动脚本）给条目起名。条目小字可能标注「来自未识别的开发者」——启动脚本没有 Apple 签发证书的签名，这行小字没有本地手段改；主名称与开关行为不受影响。
-- 若升级 Node 时删掉了 plist 引用的版本目录（多见于手动删除 nvm/fnm 版本），launchd 会静默拉不起巡检；总览页会报「Node 或入口路径已失效」，重跑一次 `cron-up install` 即可修复。fnm/nvm 切换默认版本但旧版本还在时更隐蔽：路径都有效、巡检照跑，只是跑的是旧版本目录里的旧包，总览页会报「入口路径属于另一个 node 版本目录」。
+- 若升级 Node 时删掉了启动脚本 PATH 指向的版本目录（多见于手动删除 nvm/fnm 版本），launchd 会静默拉不起巡检；总览页会报「PATH 目录里找不到 node」，重跑一次 `cron-up install` 即可修复。
 
 ## 故障排查
 
 | 现象 | 排查方法 |
 |---|---|
 | 总览提示「冷却中」 | 运行 `cron-up logs <目录名>` 查看启动界面：要么停在信任确认或工具授权提问（日志里能看到提问界面），要么 shell 环境缺少命令（日志里是 `command not found`） |
-| 总览提示「Node 或入口路径已失效」 | 写死路径形态（nvm 或旧版脚本）下 Node 版本目录被删或移动，重跑 `cron-up install` 重新解析即可 |
 | 总览提示「启动脚本已失效 / 内容无法解读」 | 启动脚本（`~/.local/share/cron-up/cron-up-service`）被删或手改，重跑 `cron-up install` 覆盖重生成 |
-| 总览提示「PATH 目录里找不到 cron-up」 | fnm/volta 切换了默认 Node 版本，新版本里还没装包：在新版本里 `npm i -g cron-up` 即可 |
-| 总览提示「入口路径属于另一个 node 版本目录」 | 写死路径形态（nvm 或旧版脚本）下切换了默认 Node 版本，巡检在跑旧版本目录里的旧包；重跑 `cron-up install` 更新路径 |
+| 总览提示「PATH 目录里找不到 cron-up」 | 切换了默认 Node 版本，新版本里还没装包：在新版本里 `npm i -g cron-up` 即可 |
+| 总览提示「PATH 目录里找不到 node」 | 启动脚本 PATH 指向的版本目录被删或移动（多见于手动删除 nvm/fnm 版本），重跑 `cron-up install` 重新解析 |
 | 日志里出现「卡死」 | 会话进程起来了但没能变成可用会话，绝大多数是停在信任确认或授权提问。先手动 `cd <目录> && claude` 走完确认，再等下一轮巡检 |
 | 日志里出现「任务文件读不出 \<目录\>」 | 该目录的 `.claude/scheduled_tasks.json` 存在却解析不了（格式损坏），巡检跳过这一个目录，**其中的定时任务一个都不会执行**；其余目录照常。检查该文件 |
 | 日志里出现「错误 \<目录\>」 | 巡检该目录时抛出未预期的异常，已按目录隔离、不影响其余目录。这通常意味着 cron-up 自身的 bug，请带上该行反馈 |
 | 任务到点没有执行 | `cron-up list` 查看下次执行时间和是否有会话；`launchctl print gui/$(id -u)/local.cron-up` 查看 last exit code |
-| 手动 `cron-up run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错；注意 plist 用的是安装时解析的绝对 node 路径，换 Node 安装方式后要重跑 install |
+| 手动 `cron-up run` 正常、定时执行不正常 | 基本都是 launchd 环境下 shell 初始化不一致（PATH、fnm、模型路由），会话日志里会有直接报错；换过 Node 安装方式的话重跑一次 `cron-up install` |
 | `last exit code=2` | config.json 缺失、不是合法 JSON、顶层不是对象，或字段类型不对（如 `leadSeconds` 写成字符串、`autoRenew` 写成字符串）；无参数 `cron-up` 总览的配置行或「需要留意」会给出具体原因 |
 
 ## 开发与测试
@@ -184,7 +183,7 @@ npm link                    # 本机把开发版链接成全局 cron-up，迭代
 
 `npm link` 后运行 `cron-up install` 会把指向工作副本的 LaunchAgent 装进系统，适合端到端调试；日常使用直接装公开 npm 的版本即可。
 
-用例名自说明覆盖面，不再这里另抄一份清单（抄来的清单只会腐化）。东亚显示宽度的码点表由 `scripts/gen-east-asian-width.mjs` 从 Unicode 官方数据生成（当前 Unicode 18.0.0，见文件头注释里的重生成方法）。
+用例名自说明覆盖面，不再这里另抄一份清单（抄来的清单只会腐化）。终端展示的东亚字符宽度用 `src/display.mjs` 里的一张 CJK 区间启发式判定，只覆盖任务摘要里真实出现的形态。
 
 ## License
 

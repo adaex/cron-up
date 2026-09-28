@@ -17,11 +17,8 @@ export const TASK_REL = path.join('.claude', 'scheduled_tasks.json');
 export const paths = {
   home: HOME,
   // 数据目录用 XDG 风格的 ~/.local/share/cron-up：config、state 与启动脚本
-  // 集中一处，purge 一删全清。26.9.3 及更早放在
-  // ~/Library/Application Support/cron-up，install 时自动搬家（见
-  // service.mjs 的 migrateLegacyDir）。
+  // 集中一处，purge 一删全清。
   dataDir: path.join(HOME, '.local', 'share', 'cron-up'),
-  legacyAppSupport: path.join(HOME, 'Library', 'Application Support', 'cron-up'),
   logDir: path.join(HOME, 'Library', 'Logs', 'cron-up'),
   plistPath: path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`),
   sessionDir: path.join(HOME, '.claude', 'sessions'),

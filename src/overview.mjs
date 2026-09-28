@@ -35,12 +35,7 @@ function overviewTasks(cfg, cols, consumers, state) {
   let soonest = null;
   for (const [ws] of deps.discover(cfg.roots, cfg.maxDepth)) {
     discovered.add(ws);
-    let tasks;
-    try {
-      tasks = deps.readTasks(ws);
-    } catch {
-      continue;
-    }
+    const tasks = deps.readTasks(ws);
     if (tasks === null) {
       // 与巡检同一条规则：文件还在却读不出，总览页要把它摆进「需要留
       // 意」，而不是装作这个工作区不存在。

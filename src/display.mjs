@@ -1,10 +1,23 @@
 // 等宽终端展示原语与任务的展示视图。
 
-import { isWide } from './east-asian-width.mjs';
 import { parseCronOrNone, taskIsOneshot, wanted } from './cron.mjs';
 import { DISPLAY_SEARCH_DAYS, ZERO_LEAD_MS } from './constants.mjs';
 
-// 等宽终端里的显示宽度：东亚宽字符（中文、全角标点）占两列。
+// 等宽终端里的宽字符区间（CJK 文字、全角标点、谚文、常用 emoji）：启发式
+// 只覆盖任务摘要里真实出现的形态，区间外一律按 1 列——判错的代价仅是对
+// 齐偏一列，不值得为此维护全量 Unicode 码点表。
+const WIDE_RANGES = [
+  [0x1100, 0x115f], [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf],
+  [0x4e00, 0x9fff], [0xa000, 0xa4cf], [0xac00, 0xd7a3], [0xf900, 0xfaff],
+  [0xfe30, 0xfe4f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x1f300, 0x1faff],
+  [0x20000, 0x2fffd], [0x30000, 0x3fffd],
+];
+
+function isWide(cp) {
+  return WIDE_RANGES.some(([lo, hi]) => cp >= lo && cp <= hi);
+}
+
+// 等宽终端里的显示宽度：宽字符（中文、全角标点）占两列。
 export function dispWidth(s) {
   let n = 0;
   for (const ch of String(s)) n += isWide(ch.codePointAt(0)) ? 2 : 1;

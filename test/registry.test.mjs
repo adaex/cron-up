@@ -54,19 +54,18 @@ test('all corrupt files alert', async (t) => {
 });
 
 test('transiently unreadable registration is retried', async (t) => {
-  const { tmp, deps, live, claude, writeReg } = await setup(t);
+  const { tmp, deps, live, claude } = await setup(t);
   live.add(101);
   claude.add(101);
-  writeReg('a.json', 1, '/placeholder'); // 内容被 parseJson 接管
+  // Claude Code 就地重写登记：第一次读撞上写一半的文件，重试前写完。
+  const file = path.join(deps.paths.sessionDir, 'a.json');
+  fs.writeFileSync(file, '{ truncated');
   const good = { kind: 'interactive', pid: 101, cwd: fs.realpathSync(tmp) };
-  let calls = 0;
   const sleeps = [];
-  deps.parseJson = () => {
-    calls += 1;
-    if (calls === 1) throw new SyntaxError('mid-write');
-    return good;
+  deps.sleep = async (ms) => {
+    sleeps.push(ms);
+    fs.writeFileSync(file, JSON.stringify(good));
   };
-  deps.sleep = async (ms) => { sleeps.push(ms); };
   const [consumers, alert] = await scanSessions();
   assert.deepEqual(consumers, new Set([fs.realpathSync(tmp)]));
   assert.equal(alert, null);
@@ -74,10 +73,9 @@ test('transiently unreadable registration is retried', async (t) => {
 });
 
 test('permanently corrupt registration gives up after one retry', async (t) => {
-  const { deps, writeReg } = await setup(t);
-  writeReg('bad.json', 1, '/placeholder');
+  const { deps } = await setup(t);
+  fs.writeFileSync(path.join(deps.paths.sessionDir, 'bad.json'), '{ truncated');
   const sleeps = [];
-  deps.parseJson = () => { throw new SyntaxError('corrupt'); };
   deps.sleep = async (ms) => { sleeps.push(ms); };
   const [consumers, alert] = await scanSessions();
   assert.equal(consumers.size, 0);

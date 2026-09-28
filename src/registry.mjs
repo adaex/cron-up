@@ -50,7 +50,7 @@ export async function readSessionFile(file) {
       return null; // 文件消失不是竞态，不重试
     }
     try {
-      return deps.parseJson(text);
+      return JSON.parse(text);
     } catch {
       if (attempt === 1) return null;
     }
@@ -149,7 +149,6 @@ export async function scanSessions() {
 }
 
 Object.assign(deps, {
-  parseJson: (text) => JSON.parse(text),
   pidIsClaude,
   scanSessions,
 });

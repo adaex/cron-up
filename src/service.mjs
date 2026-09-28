@@ -1,14 +1,14 @@
-// launchd 服务面：launchctl 封装、服务状态查询、node 启动路径的通用解析、
-// plist 渲染、install/uninstall，以及「Node 路径是否失效」的健康检查。
+// launchd 服务面：launchctl 封装、服务状态查询、node bin 目录解析、plist
+// 渲染、install/uninstall，以及启动链的健康检查。
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { deps, ExitError } from './internals.mjs';
 import { paths, LABEL } from './paths.mjs';
 // paths.home 仅用于 resolveLauncher 的默认 HOME；其余产物路径一律走
 // deps.paths（测试要整体重定向）。
+import { scriptProcLogPath } from './sessions.mjs';
 import {
   DEFAULT_CONFIG,
 } from './constants.mjs';
@@ -71,9 +71,9 @@ export function serviceLine(info, plistExists) {
 // ---- node 启动路径解析 ----
 //
 // npm 全局 bin 的 shebang 是 #!/usr/bin/env node，而 launchd 的最小 PATH
-// （/usr/bin:/bin:/usr/sbin:/sbin）里没有 node，所以 plist 必须写死
-// 「node 绝对路径 + 入口脚本绝对路径」。不同 node 安装方式的稳定路径各
-// 不相同，按固定布局逐个探测；都不认识时退回本次安装进程的 execPath。
+// （/usr/bin:/bin:/usr/sbin:/sbin）里没有 node。安装时把「node 与 cron-up
+// 所在的 bin 目录」写进启动脚本的 PATH，之后每轮由脚本自己解析：npm 升
+// 级、切换默认版本都自动跟随，且 node 与包永远同版本。
 
 function isExecutable(p) {
   try {
@@ -84,132 +84,38 @@ function isExecutable(p) {
   }
 }
 
-function semverCompare(a, b) {
-  const pa = a.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
-  const pb = b.replace(/^v/, '').split('.').map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] ?? 0) !== (pb[i] ?? 0)) return (pa[i] ?? 0) - (pb[i] ?? 0);
-  }
-  return 0;
-}
-
-// nvm 的 default 别名是文本文件（'node'、'lts/*' 或 'v22.2.0'），不是
-// 符号链接；解析不出具体版本时取已安装的最高版本目录（lts/* 的近似）。
-function nvmNodePath(nvmDir) {
-  const versionsDir = path.join(nvmDir, 'versions', 'node');
-  const pick = (v) => {
-    const p = path.join(versionsDir, v, 'bin', 'node');
-    return isExecutable(p) ? p : null;
-  };
-  let pref = null;
-  try {
-    pref = fs.readFileSync(path.join(nvmDir, 'alias', 'default'), 'utf-8').trim();
-  } catch {
-    pref = null;
-  }
-  if (/^v/.test(pref ?? '')) {
-    const p = pick(pref);
-    if (p) return p;
-  }
-  if (pref === 'lts/*') {
-    try {
-      const v = fs.readFileSync(path.join(nvmDir, 'alias', 'lts', '*'), 'utf-8').trim();
-      const p = pick(v);
-      if (p) return p;
-    } catch {
-      // 落到最高版本兜底。
-    }
-  }
-  let all = [];
-  try {
-    all = fs.readdirSync(versionsDir);
-  } catch {
-    return null;
-  }
-  const versions = all.filter((d) => /^v/.test(d)).sort(semverCompare);
-  for (let i = versions.length - 1; i >= 0; i--) {
-    const p = pick(versions[i]);
-    if (p) return p;
-  }
-  return null;
-}
-
-// 返回 {nodePath, entryPath, manager}。注入 home/execPath/entryPath 仅为
-// 测试在临时 HOME 里伪造各安装形态。pathDirs 是该安装形态下「跟随默认版
-// 本的 bin 目录」（fnm 的 aliases/default/bin——fnm default 切换时 symlink
-// 跟着切；volta 的 ~/.volta/bin；brew/pkg 的系统 bin）：启动脚本把它放进
-// PATH 后 cron-up 与 node 都从 PATH 解析，npm 升级与切换默认版本自动跟
-// 随。nvm 与 exec-path 兜底没有这种目录（nvm 的 default 是文本别名，要解
-// 析到具体版本），pathDirs 为 null，启动脚本退回写死绝对路径。
+// 返回 {pathDirs}：启动脚本要写进 PATH 的 bin 目录。注入 home/execPath/
+// systemPaths 仅为测试在临时 HOME 里伪造各安装形态。fnm 的
+// aliases/default/bin 是跟随 `fnm default` 切换的稳定 symlink（切勿
+// realpath 到版本化目录，fnm 升级后那里会失效）；volta 的 ~/.volta/bin、
+// Homebrew 与官网 pkg 的系统 bin 同理是版本无关的稳定入口。都不认识时退
+// 回当前安装进程自己的 bin 目录：nvm 等按版本目录安装的形态由此覆盖（node
+// 与 cron-up 同目录，npm 升级自动跟随），代价是绑定装包时的版本目录——切
+// 换默认版本后要重跑 install 才切过去。
 export function resolveLauncher(opts = {}) {
   const home = opts.home ?? paths.home;
   const execPath = opts.execPath ?? process.execPath;
-  const entryPath = opts.entryPath
-    ?? fileURLToPath(new URL('../bin/cron-up.mjs', import.meta.url));
+  const systemPaths = opts.systemPaths
+    ?? ['/opt/homebrew/bin/node', '/usr/local/bin/node'];
 
-  // 1. fnm：aliases/default 是跟随 `fnm default` 切换的稳定 symlink，切勿
-  //    realpath 到版本化目录（fnm 升级后那里会失效）。包含 FNM_DIR 与新
-  //    旧两个默认位置。
   const fnmDirs = [
     process.env.FNM_DIR,
     path.join(home, '.local', 'share', 'fnm'),
     path.join(home, '.fnm'),
   ].filter(Boolean);
-  for (const d of fnmDirs) {
-    const nodePath = path.join(d, 'aliases', 'default', 'bin', 'node');
-    if (isExecutable(nodePath)) {
-      return {
-        nodePath, entryPath, manager: 'fnm',
-        pathDirs: [path.dirname(nodePath)],
-      };
-    }
+  const candidates = [
+    ...fnmDirs.map((d) => path.join(d, 'aliases', 'default', 'bin')),
+    path.join(home, '.volta', 'bin'),
+    ...systemPaths.map((p) => path.dirname(p)),
+  ];
+  for (const dir of candidates) {
+    if (isExecutable(path.join(dir, 'node'))) return { pathDirs: [dir] };
   }
-
-  // 2. volta：~/.volta/bin/node 是稳定的版本无关 shim。
-  const voltaNode = path.join(home, '.volta', 'bin', 'node');
-  if (isExecutable(voltaNode)) {
-    return {
-      nodePath: voltaNode, entryPath, manager: 'volta',
-      pathDirs: [path.dirname(voltaNode)],
-    };
-  }
-
-  // 3. nvm。
-  const nvmPath = nvmNodePath(path.join(home, '.nvm'));
-  if (nvmPath) return { nodePath: nvmPath, entryPath, manager: 'nvm' };
-
-  // 4. Homebrew（Apple silicon 与 Intel）与官网 pkg 共用的系统路径。这些
-  //    本身就是版本无关的稳定 symlink。systemPaths 仅供测试注入。
-  const systemPaths = opts.systemPaths
-    ?? ['/opt/homebrew/bin/node', '/usr/local/bin/node'];
-  for (const cand of systemPaths) {
-    if (isExecutable(cand)) {
-      return {
-        nodePath: cand,
-        entryPath,
-        manager: cand.includes('homebrew') || isBrewCellar(cand) ? 'brew' : 'pkg',
-        pathDirs: [path.dirname(cand)],
-      };
-    }
-  }
-
-  // 5. 兜底：当前安装进程的 node 至少现在能跑；可能是 fnm 多 shell 的易变
-  //    路径，标记 note 提示日后核对。
   return {
-    nodePath: execPath,
-    entryPath,
-    manager: 'exec-path',
-    note: '未能定位版本无关的 node 路径，已使用当前 node 的绝对路径；'
-      + '切换 Node 版本后请重新运行 cron-up install',
+    pathDirs: [path.dirname(execPath)],
+    note: '未能定位版本无关的 node bin 目录，已使用当前 node 所在目录；'
+      + '该目录失效（如版本目录被删）时请重新运行 cron-up install',
   };
-}
-
-function isBrewCellar(p) {
-  try {
-    return fs.realpathSync(p).includes(`${path.sep}Cellar${path.sep}`);
-  } catch {
-    return false;
-  }
 }
 
 // ---- plist ----
@@ -228,35 +134,27 @@ function xmlUnescape(s) {
     .replace(/&amp;/g, '&');
 }
 
-// key 按字母序排列。ProgramArguments 是
 // 生成 launchd 拉起的启动脚本：ProgramArguments[0] 指向它而非 node。
 // macOS 的后台项目列表（系统设置 → 登录项与扩展 → 允许在后台）按
 // ProgramArguments[0] 的文件名归组条目：直连 node 会与所有 node 系后台服务
 // 合并显示在「Node.js Foundation」（node 的签名者）名下；指向自有脚本则
-// 显示 cron-up-service。
-// 有跟随默认版本的 bin 目录的安装形态（fnm/volta/brew/pkg）把目录放进
-// PATH 后直接 exec cron-up run：npm 升级、切换默认版本都自动跟随，无需
-// 重跑 install（node 与 cron-up 同目录，天然同版本）。nvm 与 exec-path
-// 兜底没有这种目录，写死绝对路径，失效与版本分叉由总览检测兜底。
+// 显示 cron-up-service。脚本把 node 所在 bin 目录放进 PATH 后直接
+// exec cron-up run：npm 升级自动跟随，无需重跑 install（node 与 cron-up
+// 同目录，天然同版本）。
 export function writeServiceScript(launcher) {
   const script = deps.paths.serviceScriptPath;
   fs.mkdirSync(path.dirname(script), { recursive: true });
-  let body;
-  if (launcher.pathDirs) {
-    const dirs = launcher.pathDirs.map((d) => `"${d}"`).join(':');
-    body = `export PATH=${dirs}:"$PATH"\nexec cron-up run\n`;
-  } else {
-    body = `exec "${launcher.nodePath}" "${launcher.entryPath}" run\n`;
-  }
+  const dirs = launcher.pathDirs.map((d) => `"${d}"`).join(':');
   fs.writeFileSync(script,
     '#!/bin/bash\n'
     + '# 由 cron-up install 生成；重跑 cron-up install --force 覆盖重生成\n'
-    + body);
+    + `export PATH=${dirs}:"$PATH"\n`
+    + 'exec cron-up run\n');
   fs.chmodSync(script, 0o755);
   return script;
 }
 
-// ProgramArguments 单参数（启动脚本路径）——node 与入口路径在脚本里。
+// ProgramArguments 单参数（启动脚本路径）。
 export function renderPlist(intervalSeconds, scriptPath) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -282,9 +180,7 @@ export function renderPlist(intervalSeconds, scriptPath) {
 }
 
 // 从已安装 plist 的 ProgramArguments 里抠出参数（plist 是我们自己写的，
-// 正则足够，不引 plist 解析器）。两种形态：单参数（当前，启动脚本路径）
-// 与三参数 [node, 入口, 'run']（旧版 plist，升级后重跑 install 前的过渡
-// 形态）。
+// 正则足够，不引 plist 解析器）。
 export function readPlistProgramArgs() {
   let text;
   try {
@@ -300,24 +196,9 @@ export function readPlistProgramArgs() {
   return parts.length > 0 ? parts : null;
 }
 
-// 从启动脚本内容里解出 [node 路径, 入口路径]；脚本是我们生成的固定格
-// 式，解不出（手改坏）返回 null。PATH 形态的脚本没有写死的路径，返回
-// 'path' 标记。
-function readServiceScriptShape(scriptPath) {
-  let text;
-  try {
-    text = fs.readFileSync(scriptPath, 'utf-8');
-  } catch {
-    return null;
-  }
-  if (/^export PATH=.+"\$PATH"$/m.test(text)) return 'path';
-  const m = text.match(/^exec "(.+)" "(.+)" run$/m);
-  return m ? [m[1], m[2]] : null;
-}
-
-// PATH 形态健康检查：跟随默认版本的 bin 目录里要能找到 cron-up 与
-// node。典型断点是 fnm/volta 切换默认版本后忘了在新版本里装包。
-function pathResolveHealth(scriptPath) {
+// 从启动脚本内容里解出 PATH 目录；脚本是我们生成的固定格式，解不出（手改
+// 坏）返回 null。
+function scriptPathDirs(scriptPath) {
   let text;
   try {
     text = fs.readFileSync(scriptPath, 'utf-8');
@@ -325,8 +206,27 @@ function pathResolveHealth(scriptPath) {
     return null;
   }
   const m = text.match(/^export PATH=(.+):"\$PATH"$/m);
-  if (!m) return null;
-  const dirs = m[1].split('":"').map((s) => s.replace(/"/g, ''));
+  return m ? m[1].split('":"').map((s) => s.replace(/"/g, '')) : null;
+}
+
+// 总览页健康检查：launchd 每轮按启动脚本拉起巡检，脚本丢失、被手改或
+// PATH 目录里解析不到 cron-up/node（典型断点：切换默认 Node 版本后忘了
+// 在新版本里装包、版本目录被删）时都会静默拉不起来，这是总览唯一能发现
+// 它的地方。
+export function launcherHealth() {
+  if (!fs.existsSync(deps.paths.plistPath)) return null;
+  const args = readPlistProgramArgs();
+  if (!args || args.length !== 1) return null;
+  const [scriptPath] = args;
+  if (!fs.existsSync(scriptPath)) {
+    return `launchd 配置中的启动脚本已失效（${path.basename(scriptPath)} `
+      + '不存在），巡检当前拉不起来；请重新运行 cron-up install';
+  }
+  const dirs = scriptPathDirs(scriptPath);
+  if (dirs === null) {
+    return `启动脚本 ${scriptPath} 内容无法解读（可能被手改），`
+      + '重跑 cron-up install 覆盖重生成';
+  }
   const has = (name) => dirs.some((d) => isExecutable(path.join(d, name)));
   if (!has('cron-up')) {
     return `启动脚本的 PATH 目录（${dirs.join('、')}）里找不到 cron-up：切换`
@@ -340,99 +240,9 @@ function pathResolveHealth(scriptPath) {
   return null;
 }
 
-// fnm 与 nvm 的全局包装在版本化目录里（…/node-versions/v<X>/… 与
-// …/versions/node/v<X>/…）。default 别名切换后 node 路径依然有效，但入口
-// 路径仍指向装包时的旧版本目录——巡检会静默继续跑旧版 cron-up，直到旧版
-// 本被卸载才表现为「路径失效」。这里提前一步提示。版本段固定以 v 开头
-// （fnm/nvm 的目录命名），避免路径里恰好出现 node-versions 字样的普通目
-// 录误报；volta/brew/pkg 的包路径不含版本化目录，返回 null 跳过检查
-// （npm link 的工作副本同理）。
-function nodeVersionRoot(p) {
-  const m = p.match(/(?:node-versions|versions\/node)\/v[^/]+/);
-  return m ? m[0] : null;
-}
-
-// node/入口路径的存在性与版本分叉检查，新（启动脚本内）旧（plist 三参
-// 数）两种形态共用。
-function pathHealthAlert(nodePath, entryPath) {
-  const missing = [nodePath, entryPath].filter((p) => !fs.existsSync(p));
-  if (missing.length > 0) {
-    return 'launchd 配置中的 Node 或入口路径已失效（'
-      + `${missing.map((p) => path.basename(p)).join('、')} 不存在），巡检当前拉不`
-      + '起来；请重新运行 cron-up install';
-  }
-  let nodeReal = nodePath;
-  try {
-    nodeReal = fs.realpathSync(nodePath);
-  } catch {
-    // 存在性已确认，保留原路径。
-  }
-  const nodeRoot = nodeVersionRoot(nodeReal);
-  const entryRoot = nodeVersionRoot(entryPath);
-  if (nodeRoot !== null && entryRoot !== null && nodeRoot !== entryRoot) {
-    return 'launchd 配置里的入口路径属于另一个 node 版本目录'
-      + `（${entryRoot}），而当前 node 是 ${nodeReal}；巡检可能在运行旧版`
-      + ' cron-up，重跑 cron-up install 更新路径';
-  }
-  return null;
-}
-
-// 总览页健康检查：plist 指定的启动链若已断（脚本丢失、PATH 里解析不到
-// cron-up/node、写死路径失效如 nvm 版本目录被清），launchd 每轮都会静默
-// 拉不起来；写死路径的形态还检查 fnm/nvm 版本分叉。
-export function launcherHealth() {
-  if (!fs.existsSync(deps.paths.plistPath)) return null;
-  const args = readPlistProgramArgs();
-  if (!args) return null;
-  if (args.length === 1) {
-    const [scriptPath] = args;
-    if (!fs.existsSync(scriptPath)) {
-      return `launchd 配置中的启动脚本已失效（${path.basename(scriptPath)} `
-        + '不存在），巡检当前拉不起来；请重新运行 cron-up install';
-    }
-    const shape = readServiceScriptShape(scriptPath);
-    if (shape === 'path') return pathResolveHealth(scriptPath);
-    if (Array.isArray(shape)) return pathHealthAlert(...shape);
-    return `启动脚本 ${scriptPath} 内容无法解读（可能被手改），`
-      + '重跑 cron-up install 覆盖重生成';
-  }
-  if (args.length === 3) {
-    // 旧版 plist（ProgramArguments 直写 node 与入口）：升级后重跑
-    // install 前的过渡形态，照常检查。
-    return pathHealthAlert(args[0], args[1]);
-  }
-  return null;
-}
-
 // ---- install / uninstall ----
 
-// 26.9.3 及更早把数据放在 ~/Library/Application Support/cron-up；新版统一
-// 到 ~/.local/share/cron-up。整体搬家（config、state 随行），随后 install
-// 照常重写脚本与 plist 并重启服务，用户无感。搬家只在 install 里发生：
-// 只升级 npm 包而不跑 install 的话，旧目录与旧 plist 依旧配套、照常巡检。
-function migrateLegacyDir() {
-  const legacy = deps.paths.legacyAppSupport;
-  if (!fs.existsSync(legacy) || fs.existsSync(deps.paths.dataDir)) return;
-  try {
-    fs.mkdirSync(path.dirname(deps.paths.dataDir), { recursive: true });
-    try {
-      fs.renameSync(legacy, deps.paths.dataDir);
-    } catch {
-      // rename 搬不动（目标异常等）：退化为复制，旧目录留着无害。
-      fs.cpSync(legacy, deps.paths.dataDir, { recursive: true });
-    }
-    deps.print(`已迁移数据目录：${legacy} → ${deps.paths.dataDir}`);
-  } catch {
-    // 迁移彻底失败必须当面说：不说的话 install 会按「全新安装」落默认
-    // 配置，用户收窄过的 roots 等手改就静默丢了。
-    deps.print(`提示：旧数据目录迁移失败（${legacy}），本次按新目录继续；`
-      + '如旧目录里还有你改过的配置，请手动复制到 '
-      + `${deps.paths.dataDir} 后重跑 cron-up install`);
-  }
-}
-
 export async function cmdInstall(args) {
-  migrateLegacyDir();
   fs.mkdirSync(deps.paths.dataDir, { recursive: true });
   fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
   try {
@@ -524,7 +334,7 @@ export async function cmdInstall(args) {
   }
 
   // npm 包没有「安装二进制」这一步：node 与入口文件已由 npm 就位，这里只
-  // 解析它们的稳定绝对路径，写进启动脚本（plist 只指向脚本，让后台项目
+  // 解析它们所在的 bin 目录，写进启动脚本（plist 只指向脚本，让后台项目
   // 列表显示 cron-up-service 而非 node 的签名者）。
   const launcher = resolveLauncher();
   if (launcher.note) deps.print(`提示：${launcher.note}`);
@@ -565,6 +375,17 @@ export async function cmdUninstall(args) {
         await deps.stopSession(ent);
       }
     }
+    // state 丢失时的兜底：没进登记的孤儿会话（卡在提问界面就不会出现在
+    // state 里）从进程表按日志目录精确认领。
+    for (const [pid, procArgs] of deps.listScriptProcesses()) {
+      const log = scriptProcLogPath(procArgs);
+      if (log === null
+          || !log.startsWith(`${deps.paths.sessionLogDir}${path.sep}`)) continue;
+      const ent = { pid, procStart: deps.procStartedAt(pid) };
+      if (!deps.trackedAlive(ent)) continue;
+      deps.print(`正在结束保活会话（state 已丢失） pid=${pid}`);
+      await deps.stopSession(ent);
+    }
   }
 
   if (fs.existsSync(deps.paths.plistPath)) {
@@ -573,8 +394,7 @@ export async function cmdUninstall(args) {
   }
 
   if (args.purge) {
-    for (const p of [deps.paths.dataDir, deps.paths.legacyAppSupport,
-      deps.paths.logDir]) {
+    for (const p of [deps.paths.dataDir, deps.paths.logDir]) {
       fs.rmSync(p, { recursive: true, force: true });
       deps.print(`已删除 ${p}`);
     }

@@ -1,6 +1,6 @@
 {
   "name": "cron-up",
-  "version": "26.9.5",
+  "version": "26.9.6",
   "description": "为命令行 AI agent 的 cron 定时任务提前预热并保活交互式会话",
   "type": "module",
   "bin": {

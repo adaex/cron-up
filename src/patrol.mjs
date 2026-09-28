@@ -20,6 +20,7 @@ import { taskWanted } from './cron.mjs';
 import {
   sessionLogPath,
   sessionLogIdleSeconds,
+  scriptProcLogPath,
 } from './sessions.mjs';
 import { TASK_REL } from './paths.mjs';
 
@@ -236,7 +237,7 @@ export async function patrolWorkspace(
     for (const [procPid, procArgs] of scriptProcs) {
       // alive 复核：快照拍于本轮开头，可能含着刚被换代/回收杀掉的 pid——
       // 把死人认回来会白记一次失败。
-      if (procArgs.includes(`-q ${logPath} `) && deps.alive(procPid)) {
+      if (scriptProcLogPath(procArgs) === logPath && deps.alive(procPid)) {
         state[ws] = {
           pid: procPid,
           startedAt: cur,

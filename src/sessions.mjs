@@ -177,6 +177,14 @@ export function listScriptProcesses() {
   return out;
 }
 
+// 从 ps 的 args 输出里解出 script(1) 的 typescript 路径（-q 与固定后缀
+// /bin/zsh 之间的参数，非贪婪，路径含空格也成立）。不是本工具拉起形态的
+// script 进程返回 null。
+export function scriptProcLogPath(procArgs) {
+  const m = procArgs.match(/ -q (.+?) \/bin\/zsh /);
+  return m ? m[1] : null;
+}
+
 Object.assign(deps, {
   alive,
   procStartedAt,
