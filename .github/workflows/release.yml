@@ -1,48 +1,48 @@
 name: release
 
-# 发布即打版本 tag：测试通过 → 校验 VERSION 与 tag 一致 → 产出资产并发布
-# GitHub Release。upgrade 命令与 install.sh 都从 release 资产下载。
+# 发布即打版本 tag：测试通过 → 校验 package.json version 与 tag 一致 →
+# npm publish。安装与升级都走 npm：npm i -g cron-ready。
 on:
   push:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24]
     steps:
       - uses: actions/checkout@v4
-      - name: Run tests
-        run: /usr/bin/python3 -m unittest discover -s tests
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test
 
-  release:
+  publish:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Verify VERSION matches the tag
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Verify package version matches the tag
         run: |
-          # [^"]* 而不是 .*：行尾加注释也不阻断发布，取首个引号对即可
-          version="v$(sed -n 's/^VERSION = "\([^"]*\)".*/\1/p' bin/doorman)"
+          version="v$(node -p "require('./package.json').version")"
           if [ "$version" != "$GITHUB_REF_NAME" ]; then
-            echo "bin/doorman 的 VERSION（$version）与 tag" \
-              "（$GITHUB_REF_NAME）不一致：先改版本号再发版" >&2
+            echo "package.json 的版本（$version）与 tag（$GITHUB_REF_NAME）" \
+              "不一致：先改版本号再发版" >&2
             exit 1
           fi
-
-      - name: Package release assets
-        run: |
-          mkdir -p dist
-          cp bin/doorman dist/doorman
-          chmod 0755 dist/doorman
-          (cd dist && sha256sum doorman > SHA256SUMS)
-
-      - name: Create GitHub Release
+      - name: npm pack dry run (sanity check)
+        run: npm pack --dry-run
+      - name: Publish to npm
+        run: npm publish
         env:
-          GH_TOKEN: ${{ github.token }}
-        # 单行书写：YAML 会把纯标量里的换行折叠成空格，行尾 \ 续行在
-        # bash 里反而变成「\ + 空格」的转义空格，资产名会带前导空格。
-        run: gh release create "$GITHUB_REF_NAME" dist/doorman dist/SHA256SUMS --generate-notes
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

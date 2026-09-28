@@ -2,6 +2,8 @@
 // 与自动帮助，这里手写一层：子命令前只允许隐藏的 --config（前后都可放），
 // 定位子命令后按各命令的选项表解析。
 
+// 先引全量入口，保证所有业务模块都已向 deeps 自注册，再引命令函数。
+import './index.mjs';
 import { deps, ExitError } from './internals.mjs';
 import { cmdRun, cmdRenew } from './patrol.mjs';
 import { cmdInstall, cmdUninstall } from './service.mjs';
@@ -176,7 +178,7 @@ export async function main(argv = process.argv) {
   const args = { ...parsed.opts };
   if (parsed.config !== undefined) args.config = parsed.config;
   switch (parsed.command) {
-    case undefined:
+    case null:
       return cmdOverview(args);
     case 'install':
       return cmdInstall(args);
@@ -190,7 +192,5 @@ export async function main(argv = process.argv) {
       return cmdRenew(args);
     case 'logs':
       return cmdLogs({ ...args, workspace: parsed.positional[0] });
-    default:
-      usageExit(`未知子命令：${parsed.command}`);
   }
 }

@@ -23,6 +23,9 @@ export class ExitError extends Error {
 function execFile(file, args, opts = {}) {
   try {
     const stdout = execFileSync(file, args, {
+      // execFileSync 的默认 stdio 会让非零退出子进程的 stderr 继承父进程
+      // （launchctl print 未加载服务时错误会直接糊到终端），显式 pipe 住。
+      stdio: ['ignore', 'pipe', 'pipe'],
       ...opts,
       encoding: 'utf-8',
       maxBuffer: 64 * 1024 * 1024,
