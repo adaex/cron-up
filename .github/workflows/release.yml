@@ -26,12 +26,19 @@ jobs:
   publish:
     needs: test
     runs-on: macos-latest
+    # trusted publishing：npm 经 GitHub OIDC 验证本 workflow 身份后放行发布，
+    # 不再使用长期有效的 NPM_TOKEN。前提（一次性）：npmjs.com 包设置里登记
+    # Trusted Publisher = adaex/cron-up + .github/workflows/release.yml。
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
+      # trusted publishing 需要 npm ≥ 11.5；显式升级，不受 runner 镜像差异影响。
+      - run: npm install -g npm@latest
       - name: Verify package version matches the tag
         run: |
           version="v$(node -p "require('./package.json').version")"
@@ -43,6 +50,4 @@ jobs:
       - name: npm pack dry run (sanity check)
         run: npm pack --dry-run
       - name: Publish to npm
-        run: npm publish
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance
