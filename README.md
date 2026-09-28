@@ -182,7 +182,7 @@ cron-up spawn 的预热会话进程环境里带 `CRON_UP_SESSION=1`（值严格�
 ## 开发与测试
 
 ```bash
-git clone git@github.com:adaex/doorman.git && cd doorman   # 仓库名仍为 doorman
+git clone git@github.com:adaex/cron-up.git && cd cron-up
 node --test                 # 全部测试（需要 Node 22+；进程/launchctl 相关用例在 macOS 上运行）
 npm link                    # 本机把开发版链接成全局 cron-up，迭代即生效
 ```
