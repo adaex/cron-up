@@ -12,9 +12,7 @@ import { PRUNE_DIRS } from './constants.mjs';
 export function expandHome(p) {
   const home = deps.paths.home;
   if (p === '~') return home;
-  if (p.startsWith('~/') || p.startsWith('~\\')) {
-    return home + p.slice(1);
-  }
+  if (p.startsWith('~/')) return home + p.slice(1);
   return p; // ~user 形式不支持（macOS 实践中不会出现）
 }
 

@@ -47,10 +47,41 @@ export function lenientInt(v) {
   throw new Error(`无法整型化：${String(v)}`);
 }
 
+// 配置字段的类型规则，loadConfig 与 install --force 继承旧配置共用。返回
+// [字段名, 人话错误][]：手改把字段写坏时绝不静默回退——回退的两个可能方向
+// （roots 坏 → 回扫整个家目录、autoRenew 坏 → 回开续期）都比停机更危险。
+export function configFieldErrors(cfg) {
+  const errs = [];
+  if (!Array.isArray(cfg.roots)) {
+    errs.push(['roots', `roots 应是字符串数组，当前为 ${JSON.stringify(cfg.roots)}`]);
+  }
+  if (!isInt(cfg.maxDepth) || cfg.maxDepth < 0) {
+    errs.push(['maxDepth', `maxDepth 应是非负整数，当前为 ${JSON.stringify(cfg.maxDepth)}`]);
+  }
+  if (!isInt(cfg.intervalSeconds) || cfg.intervalSeconds <= 0) {
+    errs.push(['intervalSeconds',
+      `intervalSeconds 应是正整数秒，当前为 ${JSON.stringify(cfg.intervalSeconds)}`]);
+  }
+  if (!isInt(cfg.leadSeconds) || cfg.leadSeconds < 0) {
+    errs.push(['leadSeconds',
+      `leadSeconds 应是非负整数秒，当前为 ${JSON.stringify(cfg.leadSeconds)}`]);
+  }
+  if (typeof cfg.autoRenew !== 'boolean') {
+    errs.push(['autoRenew',
+      `autoRenew 应是布尔值（true/false），当前为 ${JSON.stringify(cfg.autoRenew)}`]);
+  }
+  return errs;
+}
+
 // opts.missingOk：缺失文件把异常抛给调用方（总览页把「缺失」当页面内容的
-// 一部分）；opts.corruptOk：损坏 JSON/非对象抛错而不是 exit。launchd 的
-// run 入口两个都不要——它该死成一行原因而不是 traceback。
+// 一部分）；opts.corruptOk：损坏 JSON/顶层非对象/字段类型错抛普通错误而非
+// exit（总览页把它们当页面内容展示）。launchd 的 run 入口两个都不要——它
+// 该死成一行原因而不是 traceback。
 export function loadConfig(file, opts = {}) {
+  const fail = (message) => {
+    if (opts.corruptOk) throw new Error(message);
+    throw new ExitError(2, message);
+  };
   let cfg;
   try {
     cfg = JSON.parse(fs.readFileSync(file, 'utf-8'));
@@ -66,22 +97,19 @@ export function loadConfig(file, opts = {}) {
   }
   if (!isPlainObject(cfg)) {
     // 合法 JSON 但顶层不是对象（123、["a"]）：与「不是合法 JSON」同等对待。
-    if (opts.corruptOk) {
-      throw new Error(`配置文件顶层应是 JSON 对象：${file}`);
-    }
-    throw new ExitError(2,
-      `配置文件顶层应是 JSON 对象而不是${Array.isArray(cfg) ? '数组' : typeof cfg}：`
-      + `${file}\n  运行 cron-up install 生成，或用 --config 指定路径`);
+    // 单行消息：总览页按宽度截断展示，断行会失去告警前缀。
+    fail(`配置文件顶层应是 JSON 对象而不是${Array.isArray(cfg) ? '数组' : typeof cfg}：`
+      + `${file}；运行 cron-up install 生成，或用 --config 指定路径`);
   }
   const merged = { ...DEFAULT_CONFIG, ...cfg };
-  if (!Array.isArray(merged.roots)) merged.roots = DEFAULT_CONFIG.roots;
+  const errs = configFieldErrors(merged);
+  if (errs.length > 0) {
+    // 单行消息（字段在前、修复指引在后）：总览页按宽度截断展示，截尾只
+    // 伤修复指引，不伤字段清单。
+    fail(`配置字段类型不对：${errs.map(([, m]) => m).join('；')}`
+      + `；修复 ${file} 或重跑 cron-up install --force`);
+  }
   merged.roots = normalizeRoots(merged.roots);
-  if (!isInt(merged.maxDepth) || merged.maxDepth < 0) {
-    merged.maxDepth = DEFAULT_CONFIG.maxDepth;
-  }
-  if (typeof merged.autoRenew !== 'boolean') {
-    merged.autoRenew = DEFAULT_CONFIG.autoRenew;
-  }
   return merged;
 }
 

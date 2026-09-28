@@ -246,6 +246,20 @@ test('missed one-shot created long ago is still wanted', () => {
   assert.equal(taskWanted(task, NOW, LEAD_MS), true);
 });
 
+test('missed one-shot with a far creation-to-fire span is wanted', () => {
+  // 「下个月某天」的一次性任务：创建到触发跨 50 天，错过仅 3 天——
+  // 创建向前的搜索不封顶，照样判定错过。
+  const created = new Date(NOW.getTime() - 53 * 86400_000);
+  const fire = new Date(NOW.getTime() - 3 * 86400_000);
+  const task = {
+    cron: `${fire.getMinutes()} ${fire.getHours()} ${fire.getDate()} `
+      + `${fire.getMonth() + 1} *`,
+    createdAt: created.getTime(),
+    recurring: false,
+  };
+  assert.equal(taskWanted(task, NOW, LEAD_MS), true);
+});
+
 test('ancient unmatchable one-shot stays cheap', () => {
   const created = new Date(NOW.getTime() - 3650 * 86400_000);
   const task = {

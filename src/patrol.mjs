@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, ExitError } from './internals.mjs';
+import { deps } from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
@@ -14,7 +14,7 @@ import {
   SESSION_IDLE_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
 } from './constants.mjs';
-import { loadConfig, loadState, saveState, isInt } from './config.mjs';
+import { loadConfig, loadState, saveState } from './config.mjs';
 import { renewWorkspace, TaskFileChanged } from './tasks.mjs';
 import { taskWanted } from './cron.mjs';
 import {
@@ -187,7 +187,6 @@ export async function patrolWorkspace(
     if (ent !== null) {
       if (mineAlive) {
         ent.fails = 0;
-        state[ws] = ent;
       } else if (!cooling) {
         delete state[ws];
       }
@@ -273,11 +272,6 @@ export async function cmdRun(args) {
   try {
     deps.rotatePatrolLogs();
     const cfg = loadConfig(args?.config ?? deps.paths.configPath);
-    if (!isInt(cfg.leadSeconds) || cfg.leadSeconds < 0) {
-      deps.printErr('配置错误：leadSeconds 必须是非负整数秒，当前为 '
-        + `${cfg.leadSeconds}`);
-      throw new ExitError(2);
-    }
     const now = new Date();
     const leadMs = cfg.leadSeconds * 1000;
     const state = loadState();

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { deps, ExitError } from './internals.mjs';
-import { paths, LABEL, OLD_LABEL } from './paths.mjs';
+import { paths, LABEL } from './paths.mjs';
 // paths.home 仅用于 resolveLauncher 的默认 HOME；其余产物路径一律走
 // deps.paths（测试要整体重定向）。
 import {
@@ -19,6 +19,7 @@ import {
   validateConfig,
   normalizeRoots,
   isInt,
+  configFieldErrors,
 } from './config.mjs';
 
 export function guiTarget() {
@@ -260,18 +261,46 @@ export function readPlistProgramArgs() {
   return parts.length === 3 ? parts : null;
 }
 
+// fnm 与 nvm 的全局包装在版本化目录里（…/node-versions/v<X>/… 与
+// …/versions/node/v<X>/…）。default 别名切换后 node 路径依然有效，但入口
+// 路径仍指向装包时的旧版本目录——巡检会静默继续跑旧版 cron-up，直到旧版
+// 本被卸载才表现为「路径失效」。这里提前一步提示。版本段固定以 v 开头
+// （fnm/nvm 的目录命名），避免路径里恰好出现 node-versions 字样的普通目
+// 录误报；volta/brew/pkg 的包路径不含版本化目录，返回 null 跳过检查
+// （npm link 的工作副本同理）。
+function nodeVersionRoot(p) {
+  const m = p.match(/(?:node-versions|versions\/node)\/v[^/]+/);
+  return m ? m[0] : null;
+}
+
 // 总览页健康检查：plist 里写死的 node/入口路径若已不存在（fnm default 被
-// 删、nvm 版本目录被清），launchd 每轮都会静默拉不起来。
+// 删、nvm 版本目录被清），launchd 每轮都会静默拉不起来；路径都在但分属不
+// 同 node 版本目录时，巡检跑的多半是旧版包。
 export function launcherHealth() {
   if (!fs.existsSync(deps.paths.plistPath)) return null;
   const args = readPlistProgramArgs();
   if (!args) return null;
   const [nodePath, entryPath] = args;
   const missing = [nodePath, entryPath].filter((p) => !fs.existsSync(p));
-  if (missing.length === 0) return null;
-  return 'launchd 配置中的 Node 或入口路径已失效（'
-    + `${missing.map((p) => path.basename(p)).join('、')} 不存在），巡检当前拉不`
-    + '起来；请重新运行 cron-up install';
+  if (missing.length > 0) {
+    return 'launchd 配置中的 Node 或入口路径已失效（'
+      + `${missing.map((p) => path.basename(p)).join('、')} 不存在），巡检当前拉不`
+      + '起来；请重新运行 cron-up install';
+  }
+  let nodeReal = nodePath;
+  try {
+    nodeReal = fs.realpathSync(nodePath);
+  } catch {
+    // 存在性已确认，保留原路径。
+  }
+  const nodeRoot = nodeVersionRoot(nodeReal);
+  const entryRoot = nodeVersionRoot(entryPath);
+  if (nodeRoot !== null && entryRoot !== null && nodeRoot !== entryRoot) {
+    return 'launchd 配置里的入口路径属于另一个 node 版本目录'
+      + `（${entryRoot}），而当前 node 是 ${nodeReal}；巡检可能在运行旧版`
+      + ' cron-up，重跑 cron-up install 更新路径';
+  }
+  return null;
 }
 
 // ---- install / uninstall ----
@@ -303,6 +332,7 @@ export async function cmdInstall(args) {
     // 即使 --force 也从现有配置（全新安装则默认值）起步，只覆盖命令行给
     // 的字段——否则 --force --interval 600 会悄悄把 roots 重置成默认。
     cfg = { ...DEFAULT_CONFIG };
+    let inherited = false;
     if (fs.existsSync(deps.paths.configPath)) {
       let old = null;
       try {
@@ -312,7 +342,15 @@ export async function cmdInstall(args) {
       }
       // 手改成非对象（123、["a"]）：没有可继承的旧值，静默按默认走。
       if (old && typeof old === 'object' && !Array.isArray(old)) {
+        // 类型坏的字段不继承（回到默认值）并当面说明，其余照旧——force 不
+        // 该把类型错误写进新配置，也不该因一个字段坏了丢掉其余设置。
+        const errs = configFieldErrors({ ...DEFAULT_CONFIG, ...old });
+        for (const [key, msg] of errs) {
+          delete old[key];
+          deps.print(`提示：旧配置的 ${msg}，未继承，采用默认值`);
+        }
         cfg = { ...cfg, ...old };
+        inherited = true;
       }
     }
     const overrides = {};
@@ -332,12 +370,15 @@ export async function cmdInstall(args) {
     cfg = { ...cfg, ...overrides };
     cfg.roots = normalizeRoots(cfg.roots ?? []);
     saveConfig(cfg);
-    const updated = Object.keys(overrides).join('、') || '全部默认值';
-    deps.print(`已写入配置：${deps.paths.configPath}（更新字段：${updated}）`);
+    const updated = Object.keys(overrides).join('、') || '无';
+    const rest = inherited ? '其余继承现有配置' : '全部默认值';
+    deps.print(`已写入配置：${deps.paths.configPath}（更新字段：${updated}，${rest}）`);
   }
 
-  // 动系统前先校验生效配置：非法值中止；软问题（提前量过小、目录缺失）
-  // 只警告。
+  // 动系统前先校验生效配置：文件继承的值由 loadConfig / configFieldErrors
+  // 保证类型，但命令行给的 --interval/--lead 只经过整数解析，取值范围要在
+  // 这里拦（--interval 0 非法、--lead 0 是合法选择）；软问题（提前量过
+  // 小、目录缺失）只警告。
   if (!isInt(cfg.intervalSeconds) || cfg.intervalSeconds <= 0) {
     deps.printErr(`intervalSeconds 必须是正整数秒，当前为 ${JSON.stringify(cfg.intervalSeconds)}`);
     throw new ExitError(1);
@@ -364,8 +405,6 @@ export async function cmdInstall(args) {
     renderPlist(cfg.intervalSeconds, launcher));
   deps.print(`已写入 LaunchAgent：${deps.paths.plistPath}`);
 
-  // doorman 旧 label 若还在，先踢掉，避免两个巡检并行互相换代/回收。
-  deps.launchctl('bootout', `${guiTarget()}/${OLD_LABEL}`);
   deps.launchctl('bootout', `${guiTarget()}/${LABEL}`);
   const r = deps.launchctl('bootstrap', guiTarget(), deps.paths.plistPath);
   if (r.status !== 0) {

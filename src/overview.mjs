@@ -6,7 +6,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { deps } from './internals.mjs';
-import { loadConfig, loadState, validateConfig, isInt } from './config.mjs';
+import { loadConfig, loadState, validateConfig } from './config.mjs';
 import { packageVersion, TASK_REL } from './paths.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
 import {
@@ -175,17 +175,6 @@ export async function cmdOverview(args) {
   } catch (e) {
     if (e.code !== 'ENOENT') cfgError = e;
   }
-  // 数值字段被手改成非整数：巡检入口会以退出码 2 失败，总览若不先挡下会
-  // 在 leadMs 计算处炸掉。判定式与 cmdRun 的守卫保持一致。
-  const badFields = [];
-  if (cfg !== null) {
-    if (!isInt(cfg.intervalSeconds) || cfg.intervalSeconds <= 0) {
-      badFields.push('intervalSeconds');
-    }
-    if (!isInt(cfg.leadSeconds) || cfg.leadSeconds < 0) {
-      badFields.push('leadSeconds');
-    }
-  }
 
   const info = deps.launchctlInfo();
   deps.print(serviceLine(info, fs.existsSync(deps.paths.plistPath)));
@@ -202,18 +191,12 @@ export async function cmdOverview(args) {
   let discovered = null;
 
   if (cfgError !== null) {
-    // 页面不能死在半路：损坏配置是「需要留意」的一种；巡检本身仍会以退出
-    // 码 2 失败，详情见 cron-up logs。
-    deps.print(`配置：文件损坏，不是合法 JSON：${cfgPath}`);
-    alerts.push(`配置损坏，当前每轮巡检都会失败退出；修复 ${cfgPath} 或重新`
-      + `运行 cron-up install。解析错误：${cfgError.message}`);
+    // 页面不能死在半路：损坏或字段类型不对的配置是「需要留意」的一种；巡
+    // 检本身仍会以退出码 2 失败（loadConfig 与这里共用同一套校验）。
+    deps.print(`配置：无法生效（${cfgPath}）`);
+    alerts.push(`配置无法生效（巡检将以退出码 2 失败）：${cfgError.message}`);
   } else if (cfg === null) {
     deps.print('配置：缺失，运行 cron-up install 生成');
-  } else if (badFields.length) {
-    const vals = badFields.map((k) => `${k}=${JSON.stringify(cfg[k])}`).join('、');
-    deps.print(`配置：${badFields.join('、')} 应为整数秒，当前 ${vals}`);
-    alerts.push(`配置字段类型不对（${vals}），请修复 ${cfgPath}；leadSeconds `
-      + '不对时每轮巡检都会以退出码 2 失败');
   } else {
     const actualIv = info ? info.interval : null;
     const renewTag = cfg.autoRenew ? '，自动续期开' : '，自动续期关';

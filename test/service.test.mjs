@@ -194,6 +194,50 @@ test('launcherHealth is null when both paths exist', (t) => {
   assert.equal(launcherHealth(), null);
 });
 
+// 在 tmp 里伪造 fnm/nvm 的版本化目录布局（路径中出现 node-versions/<v> 段
+// 即触发检测），文件真实存在，只有版本目录分属两个版本。
+function writeVersioned(tmp, version, file) {
+  const p = path.join(tmp, 'fnm', 'node-versions', version,
+    'installation', file);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, '');
+  return p;
+}
+
+test('launcherHealth flags entry path in another node version dir', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  const node = writeVersioned(tmp, 'v26.0.0', 'bin/node');
+  const entry = writeVersioned(tmp, 'v24.20.0',
+    path.join('lib', 'node_modules', 'cron-up', 'bin', 'cron-up.mjs'));
+  fs.writeFileSync(deps.paths.plistPath,
+    renderPlist(300, { nodePath: node, entryPath: entry }));
+  const alert = launcherHealth();
+  assert.ok(alert && alert.includes('另一个 node 版本'));
+  assert.ok(alert.includes('cron-up install'));
+});
+
+test('launcherHealth is quiet when versions agree or path is unversioned', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  // 同一版本目录下的 node 与入口：正常。
+  const node = writeVersioned(tmp, 'v26.0.0', 'bin/node');
+  const entry = writeVersioned(tmp, 'v26.0.0',
+    path.join('lib', 'node_modules', 'cron-up', 'bin', 'cron-up.mjs'));
+  // 入口在版本化目录外（npm link 的工作副本）：不检查。
+  const linked = path.join(tmp, 'worktree', 'bin', 'cron-up.mjs');
+  fs.mkdirSync(path.dirname(linked), { recursive: true });
+  fs.writeFileSync(linked, '');
+  fs.writeFileSync(deps.paths.plistPath,
+    renderPlist(300, { nodePath: node, entryPath: entry }));
+  assert.equal(launcherHealth(), null);
+  fs.writeFileSync(deps.paths.plistPath,
+    renderPlist(300, { nodePath: node, entryPath: linked }));
+  assert.equal(launcherHealth(), null);
+});
+
 // ---- install ----
 
 async function setupInstall(t) {
@@ -230,8 +274,6 @@ test('install writes config, plist, bootstraps and runs first patrol', async (t)
   assert.equal(s.cfg().intervalSeconds, 300);
   assert.ok(fs.existsSync(s.deps.paths.plistPath));
   assert.ok(s.launchCalls.some((c) => c[0] === 'bootstrap'));
-  assert.ok(s.launchCalls.some((c) => c[0] === 'bootout'
-    && c[1].includes('local.doorman'))); // 顺手踢旧 doorman
   assert.ok(s.lines.some((l) => l.includes('已加载到 launchd')));
   assert.ok(s.lines.some((l) => l.includes('首轮巡检完成')));
   assert.equal(LABEL, 'local.cron-up');
@@ -285,11 +327,14 @@ test('corrupt config without force points to --force and force recovers', async 
 });
 
 test('bool interval in config is rejected loudly', async (t) => {
+  // 配置字段类型错统一走 loadConfig 的 ExitError(2)，install 会附上
+  // --force 出口。（setupInstall 默认 force，这里显式走非 force 路径。）
   const s = await setupInstall(t);
   writeJson(s.deps.paths.configPath, {
     roots: [s.tmp], maxDepth: 2, intervalSeconds: true, leadSeconds: 600,
   });
-  await assert.rejects(s.install(), (e) => e instanceof ExitError && e.code === 1);
+  await assert.rejects(s.install({ force: false }), (e) => e instanceof ExitError
+    && e.code === 2 && /--force/.test(e.message));
 });
 
 test('explicitly empty roots is rejected loudly', async (t) => {
@@ -317,6 +362,22 @@ test('omitted flags preserve existing values', async (t) => {
   await s.install({ interval: 120 });
   assert.equal(s.cfg().leadSeconds, 45);
   assert.equal(s.cfg().intervalSeconds, 120);
+});
+
+test('force drops only the mistyped legacy fields', async (t) => {
+  const s = await setupInstall(t);
+  await s.install({ roots: `${s.tmp}/ws` });
+  // 手改坏两个字段，force 重装：坏字段回默认并当面提示，好字段照旧继承
+  // （roots 不给命令行值，验证它来自继承而非 helper 默认）。
+  writeJson(s.deps.paths.configPath, {
+    ...s.cfg(), autoRenew: 'false', maxDepth: true,
+  });
+  await s.install({ roots: undefined });
+  assert.equal(s.cfg().autoRenew, true); // DEFAULT_CONFIG
+  assert.equal(s.cfg().maxDepth, 2);
+  assert.deepEqual(s.cfg().roots, [`${s.tmp}/ws`]);
+  assert.ok(s.lines.some((l) => l.includes('autoRenew') && l.includes('未继承')));
+  assert.ok(s.lines.some((l) => l.includes('maxDepth') && l.includes('未继承')));
 });
 
 test('auto-renew flags set the value; omitted preserves', async (t) => {

@@ -1,7 +1,7 @@
 // 分钟级 cron 解析与下一次触发计算。字段全是别的程序写的，畸形表达式在
 // 边界处返回 null/不可满足，绝不抛进巡检循环。
 
-import { SEARCH_DAYS, MISSED_LOOKBACK_DAYS } from './constants.mjs';
+import { SEARCH_DAYS } from './constants.mjs';
 
 const MS_DAY = 86400_000;
 const MS_MINUTE = 60_000;
@@ -159,13 +159,10 @@ function wanted(cron, task, now, leadMs) {
   if (taskIsOneshot(task)) {
     const created = createdAtDate(task);
     if (!created) return false;
-    // 从创建时间向前搜，而不是从现在。跨度要封顶：表达式永不匹配的陈旧
-    // 条目否则会逐分钟扫到创建之初。一次性任务都在触发前不久创建，封顶
-    // 不会漏掉真实条目，超过上界的早就死透了。
-    const span = Math.min(
-      Math.floor((now.getTime() - created.getTime()) / MS_DAY) + 1,
-      MISSED_LOOKBACK_DAYS,
-    );
+    // 从创建时间向前搜到当前：要找的就是 created..now 之间的第一个触发
+    // 点，不封顶——「下个月某天」这类远跨度一次性任务错过时同样该补执行。
+    // 陈年条目也不贵：nextAfter 的日历快进按月跳，十年也只有百余次迭代。
+    const span = Math.floor((now.getTime() - created.getTime()) / MS_DAY) + 1;
     const first = cron.nextAfter(
       new Date(created.getTime() - MS_MINUTE),
       span,

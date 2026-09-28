@@ -7,7 +7,6 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const LABEL = 'local.cron-up';
-export const OLD_LABEL = 'local.doorman';
 
 const HOME = os.homedir();
 // 被预热的 agent 工作区里，定时任务文件的相对路径。

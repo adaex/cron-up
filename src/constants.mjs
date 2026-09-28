@@ -1,7 +1,6 @@
 // 全部调参常量集中一处，改动时便于通盘核对。
 
 export const DEFAULT_CONFIG = {
-  version: 1,
   // 默认扫家目录（两层深覆盖 ~/<root>/<workspace>）；安装时可用 roots 收窄。
   roots: ['~'],
   maxDepth: 2,
@@ -51,7 +50,5 @@ export const SEARCH_DAYS = 7;
 // list/总览回答「下次何时触发」，要看到一年后：年度任务必须显示真实日期，
 // 不能误报成「无安排」。nextAfter 的日历快进让长窗口依然便宜。
 export const DISPLAY_SEARCH_DAYS = 366;
-// 补执行检测从任务创建时间向前搜，需要独立的上界。
-export const MISSED_LOOKBACK_DAYS = 30;
 // list 问「一次性任务是否被错过」，与巡检同一个补执行判定，只是不带前瞻。
 export const ZERO_LEAD_MS = 0;

@@ -119,7 +119,7 @@ test('corrupt config renders the whole page', async (t) => {
   const s = await setup(t);
   fs.writeFileSync(s.cfgPath, '{ not valid json');
   const out = await s.render();
-  assert.ok(out.includes('文件损坏'));
+  assert.ok(out.includes('配置：无法生效'));
   assert.ok(out.includes('会话：无保活会话'));
   assert.ok(out.includes('常用命令'));
 });
@@ -140,8 +140,9 @@ test('non-int numeric fields alert instead of crashing', async (t) => {
     roots: [s.tmp], maxDepth: 3, intervalSeconds: 300, leadSeconds: '600',
   });
   const out = await s.render();
+  assert.ok(out.includes('配置：无法生效'));
   assert.ok(out.includes('leadSeconds'));
-  assert.ok(out.includes('应为整数秒'));
+  assert.ok(out.includes('非负整数'));
   assert.ok(out.includes('需要留意'));
   assert.ok(out.includes('会话：'));
 });
@@ -149,10 +150,11 @@ test('non-int numeric fields alert instead of crashing', async (t) => {
 test('bool numeric fields alert like other bad types', async (t) => {
   const s = await setup(t);
   writeJson(s.cfgPath, {
-    roots: [s.tmp], maxDepth: 3, intervalSeconds: true, leadSeconds: false,
+    roots: [s.tmp], maxDepth: 3, intervalSeconds: true, leadSeconds: 600,
   });
   const out = await s.render();
-  assert.ok(out.includes('应为整数秒'));
+  assert.ok(out.includes('intervalSeconds'));
+  assert.ok(out.includes('正整数'));
   assert.ok(out.includes('需要留意'));
 });
 

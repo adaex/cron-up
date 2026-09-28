@@ -11,7 +11,6 @@ import {
 } from '../src/config.mjs';
 import { discover, onDiskCase } from '../src/tasks.mjs';
 import { ExitError } from '../src/internals.mjs';
-import { DEFAULT_CONFIG } from '../src/constants.mjs';
 import { mkTmp, mockDeps, tmpPaths, writeJson } from '../test-support/helpers.mjs';
 
 test('roots normalised despite shell tilde quirks', (t) => {
@@ -108,23 +107,55 @@ test('overview sees a missing config as absent', () => {
     (e) => e.code === 'ENOENT');
 });
 
-test('string roots falls back to default', (t) => {
+test('string roots is rejected loudly', (t) => {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp, { home: tmp });
   const file = path.join(tmp, 'cfg.json');
   writeJson(file, { roots: '~/single-string' });
-  const cfg = loadConfig(file);
-  assert.ok(Array.isArray(cfg.roots));
-  assert.ok(!cfg.roots.join('').includes('~'));
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('roots'));
+    return true;
+  });
 });
 
-test('bool maxdepth is coerced to default', (t) => {
+test('string autoRenew is rejected loudly', (t) => {
+  // 危险方向的回归：写成 "false" 绝不能静默回退成 true 继续改任务文件。
+  const tmp = mkTmp(t);
+  mockDeps(t);
+  const file = path.join(tmp, 'cfg.json');
+  writeJson(file, { autoRenew: 'false' });
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('autoRenew'));
+    return true;
+  });
+});
+
+test('bool maxdepth is rejected loudly', (t) => {
   const tmp = mkTmp(t);
   mockDeps(t);
   const file = path.join(tmp, 'cfg.json');
   writeJson(file, { maxDepth: true });
-  assert.equal(loadConfig(file).maxDepth, DEFAULT_CONFIG.maxDepth);
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('maxDepth'));
+    return true;
+  });
+});
+
+test('field errors can be raised for human pages', (t) => {
+  const tmp = mkTmp(t);
+  mockDeps(t);
+  const file = path.join(tmp, 'cfg.json');
+  writeJson(file, { leadSeconds: '600' });
+  assert.throws(() => loadConfig(file, { corruptOk: true }),
+    (e) => e instanceof Error && !(e instanceof ExitError)
+      && e.message.includes('leadSeconds'));
 });
 
 // ---- state ----
