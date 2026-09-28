@@ -88,6 +88,13 @@ export function taskView(task, now, leadMs = undefined) {
   };
 }
 
+// MM-DD HH:MM（任务触发点的统一展示格式，等价 Python strftime）。
+export function fmtMDHM(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:`
+    + `${p(d.getMinutes())}`;
+}
+
 // 会话年龄的粗粒度中文：长驻按天计，否则按分钟。
 export function sessionAgeZh(startedAt, cur) {
   const secs = Math.max(0, cur - startedAt);

@@ -4,6 +4,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
+// 引全量入口：保证所有业务模块都已向 deps 自注册。
+import '../src/index.mjs';
 import { deps } from '../src/internals.mjs';
 import { paths } from '../src/paths.mjs';
 
