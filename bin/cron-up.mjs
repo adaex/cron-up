@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// cron-up 入口。launchd 以「node 绝对路径 + 本文件绝对路径 + run」直接
-// 启动本文件（npm shim 的 /usr/bin/env node 在 launchd 最小 PATH 下找不
-// 到 node）。
+// cron-up 入口（npm bin 的 shim 目标）。launchd 经自有的 cron-up-service
+// 启动脚本拉起：脚本把 node 与本包所在的 bin 目录放进 PATH 后执行
+// `cron-up run`，命令与本文件都从 PATH 解析，npm 升级自动跟随。
 
 import { main } from '../src/cli.mjs';
 import { ExitError } from '../src/internals.mjs';
