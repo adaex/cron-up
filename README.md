@@ -46,7 +46,7 @@ cron-up install --roots ~/code,~/work --interval 300 --lead 600
 
 第二步会写入配置与 LaunchAgent 并立即跑首轮巡检；参数都可省略，不带参数则用默认扫描范围与间隔。安装不需要 sudo（前提是你的 npm 全局目录在用户家目录下，fnm/volta/nvm/Homebrew 默认都满足）。
 
-`--roots` 填写存放 agent 工作目录的父目录（逗号分隔）。不填时默认扫描家目录下两层以内（`~/` 自身、`~/*` 与 `~/*/*`），并自动跳过 `Library`、`Documents` 等系统目录和 `.git`、`node_modules`、`.cache` 等目录；建议显式指定，范围越小越安全、越快。使用默认范围安装时 install 会再打印一次安全提示：今后 clone 进家目录的任何仓库都会进入巡检，其中的周期任务会被自动续期永久化（原理见「安全说明」）。
+`--roots` 填写存放 agent 工作目录的父目录（逗号分隔）。不填时默认扫描 `~/space`、`~/workspace`、`~/tasks` 三个容器（不存在的目录跳过），深度两层以内，并自动跳过 `Library`、`Documents` 等系统目录和 `.git`、`node_modules`、`.cache` 等目录；目录布局不同或需要收窄时建议显式指定，范围越小越安全、越快。使用默认范围安装时 install 会再打印一次安全提示：今后 clone 进这三个容器的仓库也会进入巡检，其中的周期任务会被自动续期永久化（原理见「安全说明」）。
 
 launchd 的环境变量极少（PATH 只有 `/usr/bin:/bin:/usr/sbin:/sbin`），npm 全局命令那个 `#!/usr/bin/env node` 壳在它下面找不到 node。因此安装时把**node 与 cron-up 所在的 bin 目录**（fnm 是 `~/.local/share/fnm/aliases/default/bin`——`fnm default` 切换时这个 symlink 自己跟着切；volta 是 `~/.volta/bin`；Homebrew/官网是系统 bin 目录；其余安装方式取当前 node 的 bin 目录）写进一个自有的启动脚本（`cron-up-service`）的 PATH，脚本直接 `exec cron-up run`——cron-up 与 node 每轮从 PATH 解析，**npm 升级自动跟随，无需重跑 install**，且 node 与包永远同版本。fnm/volta 切换默认版本后只需在新版本里装过一次 `npm i -g cron-up`，忘了装的话总览页会提示；nvm 等按版本目录安装的形态则绑定装包时的目录，切换默认版本后重跑一次 `cron-up install` 才切过去。自建启动脚本的另一个原因是显示名：macOS 系统设置「允许在后台」按 launchd 拉起的第一个可执行文件给条目归组，直连 node 会显示在「Node.js Foundation」（node 的签名者）名下，指向自有脚本则显示 **cron-up-service**。
 

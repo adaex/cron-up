@@ -328,9 +328,10 @@ export async function cmdInstall(args) {
   if (JSON.stringify(cfg.roots)
       === JSON.stringify(normalizeRoots(DEFAULT_CONFIG.roots))) {
     // 与 README 安全说明同一句话，在配置落定的这一刻当面再说一遍。
-    deps.print('提示：未指定 --roots，扫描范围是整个用户目录，今后 clone 的'
-      + '仓库也会进入巡检；自动续期会把其中的周期任务永久化。建议用 '
-      + '--roots 显式限定范围（见 README 安全说明）');
+    deps.print('提示：未指定 --roots，默认扫描 ~/space、~/workspace、~/tasks'
+      + '（不存在的目录跳过）；今后 clone 进这些容器的仓库也会进入巡检，'
+      + '自动续期会把其中的周期任务永久化。目录布局不同或需收窄时用 '
+      + '--roots 指定（见 README 安全说明）');
   }
 
   // npm 包没有「安装二进制」这一步：node 与入口文件已由 npm 就位，这里只

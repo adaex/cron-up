@@ -1,8 +1,11 @@
 // 全部调参常量集中一处，改动时便于通盘核对。
 
 export const DEFAULT_CONFIG = {
-  // 默认扫家目录（两层深覆盖 ~/<root>/<workspace>）；安装时可用 roots 收窄。
-  roots: ['~'],
+  // 默认只扫本人的三个任务制容器（两层深覆盖 <容器>/<仓>及其一级子目录），
+  // 不扫整个家目录——他人可写仓库里的周期任务会被自动续期永久化，默认范围
+  // 必须是用户完全掌控的领地（见 README 安全说明）。其他布局用 --roots 覆
+  // 盖；目录不存在则跳过。
+  roots: ['~/space', '~/workspace', '~/tasks'],
   maxDepth: 2,
   intervalSeconds: 300,
   leadSeconds: 600,
