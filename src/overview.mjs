@@ -7,6 +7,7 @@ import path from 'node:path';
 
 import { deps } from './internals.mjs';
 import { loadConfig, loadState, validateConfig } from './config.mjs';
+import { FAIL_LIMIT } from './constants.mjs';
 import { packageVersion, TASK_REL } from './paths.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
 import {
@@ -81,8 +82,10 @@ function overviewTasks(cfg, cols, consumers, state) {
           + `请运行 cron-up logs ${path.basename(ws)} 排查`);
         coolingWarned.add(ws);
       } else {
+        const fails = (state[ws] ?? {}).fails ?? 0;
         alerts.push(`${ws} 有任务即将执行（或错过待补执行），但当前没有交互`
-          + '会话，下轮巡检会自动启动');
+          + `会话，下轮巡检会自动启动${fails > 0 ? `（近期已失败 ${fails} 次，`
+            + `${FAIL_LIMIT} 次后进入冷却）` : ''}`);
       }
     }
   }
@@ -115,7 +118,7 @@ function overviewSessions(cols, state, suppressCooling = new Set(),
   for (const [ws, ent] of Object.entries(state)) {
     if ((ent.cooldownUntil ?? 0) > cur) cooling.push([ws, ent]);
     else if (deps.trackedAlive(ent)) live.push([ws, ent]);
-    else dead.push(ws); // 记录还在、进程已没：下轮巡检即清理
+    else dead.push(ws); // 记录还在、进程已没：带失败计数的保留至老化，其余下轮清理
   }
   let tail = '';
   if (cooling.length) tail += `，冷却 ${cooling.length} 个`;

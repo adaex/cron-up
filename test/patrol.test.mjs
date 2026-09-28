@@ -9,6 +9,7 @@ import {
   WARMUP_GRACE_SECONDS,
   SESSION_MAX_AGE_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
+  FAIL_TTL_SECONDS,
 } from '../src/constants.mjs';
 import { ExitError } from '../src/internals.mjs';
 import {
@@ -121,6 +122,72 @@ test('lifecycle: spawn, healthy, die, cooldown, probation, user session', async 
   m.holder.consumer = false;
   await m.patrol();
   assert.equal(m.state()[WS].fails, 0);
+});
+
+test('fails counter survives sparse task windows and reaches cooldown', async (t) => {
+  const m = await setupMachine(t);
+  // 每小时任务的节奏：提前窗口只覆盖约 2 轮巡检，窗口外的轮次不得清掉计
+  // 数，否则 FAIL_LIMIT 永远数不满、冷却形同虚设。
+  const WANTED = () => [{ cron: '*/5 * * * *', createdAt: 0 }];
+  const QUIET = () => [{ cron: '0 9 1 1 *', recurring: true }];
+  m.deps.readTasks = WANTED;
+
+  // 窗口轮 1：首次拉起；会话随即「启动后立即退出」。
+  await m.patrol();
+  m.alivePids.delete(m.state()[WS].pid);
+  // 窗口轮 2：发现死亡 → fails=1，重拉；又死。
+  await m.patrol();
+  assert.equal(m.state()[WS].fails, 1);
+  m.alivePids.delete(m.state()[WS].pid);
+  // 窗口外的几轮：任务不在提前窗口，条目带着计数保留。
+  m.deps.readTasks = QUIET;
+  await m.patrol();
+  await m.patrol();
+  let ent = m.state()[WS];
+  assert.equal(ent.fails, 1, '窗口外不得清掉失败计数');
+  assert.ok(ent.deadSince > 0, '死条目首次被发现时打老化时间戳');
+
+  // 下一个窗口：计数接着数，第二个窗口内进入冷却。
+  m.deps.readTasks = WANTED;
+  await m.patrol();
+  assert.equal(m.state()[WS].fails, 2);
+  m.alivePids.delete(m.state()[WS].pid);
+  await m.patrol();
+  ent = m.state()[WS];
+  assert.equal(ent.fails, 3);
+  assert.ok((ent.cooldownUntil ?? 0) > Math.floor(Date.now() / 1000));
+});
+
+test('dead entry with fails is dropped after TTL', async (t) => {
+  const m = await setupMachine(t);
+  m.deps.readTasks = () => [{ cron: '0 9 1 1 *', recurring: true }];
+  const cur = Math.floor(Date.now() / 1000);
+  m.writeState({
+    [WS]: { pid: 424242, procStart: 'x', fails: 2, deadSince: cur - FAIL_TTL_SECONDS - 1 },
+  });
+  await m.patrol();
+  assert.ok(!(WS in m.state()), '超过 TTL 的陈年计数连同条目一起老化');
+  // TTL 之内仍保留。
+  m.writeState({
+    [WS]: { pid: 424243, procStart: 'x', fails: 2, deadSince: cur - 100 },
+  });
+  await m.patrol();
+  assert.equal(m.state()[WS].fails, 2);
+});
+
+test('user session in place keeps our dead entry and its fails', async (t) => {
+  const m = await setupMachine(t);
+  // 用户自己的会话在场 ≠ launchd 拉起的环境健康：死条目与计数不因消费者
+  // 出现而丢，留给后续窗口继续累积或老化。
+  const cur = Math.floor(Date.now() / 1000);
+  m.writeState({
+    [WS]: { pid: 424244, procStart: 'x', fails: 2, deadSince: cur - 10 },
+  });
+  m.holder.consumer = true;
+  await m.patrol();
+  const ent = m.state()[WS];
+  assert.ok(ent, '消费者在场不删死条目');
+  assert.equal(ent.fails, 2, '消费者在场不清失败计数');
 });
 
 test('observed registration resets streak even when nothing wanted', async (t) => {

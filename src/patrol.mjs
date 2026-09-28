@@ -9,6 +9,7 @@ import { deps } from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
+  FAIL_TTL_SECONDS,
   WARMUP_GRACE_SECONDS,
   SESSION_MAX_AGE_SECONDS,
   SESSION_IDLE_SECONDS,
@@ -184,13 +185,11 @@ export async function patrolWorkspace(
 
   if (consumers.has(ws)) {
     // 任务正在被消费。区分我们的预热会话与用户的交互会话：前者继续跟踪
-    // （活消费者证明健康 → 计数清零），后者彻底放手。
-    if (ent !== null) {
-      if (mineAlive) {
-        ent.fails = 0;
-      } else if (!cooling) {
-        delete state[ws];
-      }
+    // （活消费者证明健康 → 计数清零），后者放手——但不在这里删死条目，失败
+    // 计数要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），
+    // 由轮末 kept 过滤统一处理。
+    if (ent !== null && mineAlive) {
+      ent.fails = 0;
     }
     return;
   }
@@ -316,10 +315,20 @@ export async function cmdRun(args) {
       }
     }
 
-    // 丢掉已死且不处冷却的条目；保留冷却与活会话。
+    // 丢掉已死且不处冷却的条目；保留冷却、活会话，以及带失败计数的死条
+    // 目——计数跨任务窗口累积才能数满 FAIL_LIMIT（提前窗口常常只覆盖一两
+    // 轮巡检），首次发现死亡时打 deadSince，超过 FAIL_TTL 后连同计数一起
+    // 老化丢弃。
     const kept = Object.fromEntries(
-      Object.entries(state).filter(([, ent]) =>
-        deps.trackedAlive(ent) || (ent.cooldownUntil ?? 0) > cur),
+      Object.entries(state).filter(([, ent]) => {
+        if (deps.trackedAlive(ent)) return true;
+        if ((ent.cooldownUntil ?? 0) > cur) return true;
+        if ((ent.fails ?? 0) > 0) {
+          ent.deadSince ??= cur;
+          return cur - ent.deadSince < FAIL_TTL_SECONDS;
+        }
+        return false;
+      }),
     );
     saveState(kept);
     return true;

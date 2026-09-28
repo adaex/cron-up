@@ -17,6 +17,11 @@ export const DEFAULT_CONFIG = {
 // 而不是每 5 分钟无限重拉。
 export const FAIL_LIMIT = 3;
 export const COOLDOWN_SECONDS = 1800;
+// 失败计数随死条目保留的时长。提前窗口通常只覆盖一两轮巡检（每小时任务
+// 约 2 轮），计数若在窗口外的轮次被清理就永远数不满 FAIL_LIMIT——冷却只对
+// 稠密任务生效。保留 48 小时让稀疏任务跨窗口累积；老化防止陈年计数误伤
+// 已修好的环境。
+export const FAIL_TTL_SECONDS = 48 * 3600;
 // pid 合法值域。state.json 与会话登记两个外部来源都在入口处按它校验：
 // 超大整数能穿过类型转换，直到 process.kill 才抛，所以必须入口卡范围。
 export const PID_T_MAX = 2 ** 31 - 1;

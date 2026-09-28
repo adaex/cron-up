@@ -135,7 +135,7 @@ export function loadState() {
       pid = null;
     }
     ent.pid = pid && pid > 0 && pid <= PID_T_MAX ? pid : null;
-    for (const k of ['startedAt', 'cooldownUntil', 'fails']) {
+    for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince']) {
       if (ent[k] !== null && ent[k] !== undefined) {
         try {
           ent[k] = lenientInt(ent[k]);
