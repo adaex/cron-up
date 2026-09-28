@@ -30,6 +30,12 @@ export const paths = {
   get statePath() {
     return path.join(this.appSupport, 'state.json');
   },
+  // launchd 拉起的启动脚本。ProgramArguments[0] 直接指向它而非 node：
+  // macOS 后台项目列表按可执行文件名显示条目，直连 node 会归到「Node.js
+  // Foundation」名下（node 的签名者），自有脚本则显示脚本自己的名字。
+  get serviceScriptPath() {
+    return path.join(this.appSupport, 'cron-up-service');
+  },
 };
 
 // 版本号读 package.json（用 fs 读而非 JSON import attribute，避免对 Node

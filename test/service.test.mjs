@@ -10,6 +10,7 @@ import {
   renderPlist,
   readPlistProgramArgs,
   launcherHealth,
+  writeServiceScript,
   cmdInstall,
   cmdUninstall,
 } from '../src/service.mjs';
@@ -133,65 +134,75 @@ test('launcher priority: fnm beats volta', (t) => {
   assert.equal(resolveLauncher({ home }).manager, 'fnm');
 });
 
-// ---- plist ----
+// ---- 启动脚本与 plist ----
 
-test('renderPlist contains absolute node, entry, run and interval', (t) => {
-  mockDeps(t).paths = tmpPaths(mkTmp(t));
-  const xml = renderPlist(600, {
-    nodePath: '/usr/local/bin/node', entryPath: '/opt/pkg/cron-up.mjs' });
-  assert.ok(xml.includes('<string>local.cron-up</string>'));
-  assert.ok(xml.includes('<string>/usr/local/bin/node</string>'));
-  assert.ok(xml.includes('<string>/opt/pkg/cron-up.mjs</string>'));
-  assert.ok(xml.includes('<string>run</string>'));
-  assert.ok(xml.includes('<integer>600</integer>'));
-  const args = readPlistProgramArgsFrom(xml);
-  assert.deepEqual(args, ['/usr/local/bin/node', '/opt/pkg/cron-up.mjs', 'run']);
-});
-
-test('renderPlist XML-escapes ampersands in paths', (t) => {
-  mockDeps(t).paths = tmpPaths(mkTmp(t));
-  const xml = renderPlist(300, {
-    nodePath: '/x/a&b/node', entryPath: '/x/e<m>.mjs' });
-  assert.ok(xml.includes('/x/a&amp;b/node'));
-  assert.ok(xml.includes('/x/e&lt;m&gt;.mjs'));
-  assert.ok(readPlistProgramArgsFrom(xml)[0] === '/x/a&b/node');
-});
-
-function readPlistProgramArgsFrom(xml) {
-  const block = xml.match(
-    /<key>ProgramArguments<\/key>\s*<array>([\s\S]*?)<\/array>/);
-  return [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)]
-    .map((m) => m[1]
-      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&'));
+// 装好一条完整的启动链（脚本 + plist），node/entry 路径由用例给定。
+function installLaunchChain(t, nodePath, entryPath) {
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(mkTmp(t));
+  const script = writeServiceScript({ nodePath, entryPath });
+  fs.writeFileSync(deps.paths.plistPath, renderPlist(300, script));
+  return deps;
 }
+
+test('service script execs node with entry and run, mode 755', (t) => {
+  const deps = installLaunchChain(t, '/x/node', '/x/cron-up.mjs');
+  const script = deps.paths.serviceScriptPath;
+  assert.equal(fs.readFileSync(script, 'utf-8'),
+    '#!/bin/bash\n'
+    + '# 由 cron-up install 生成；重跑 cron-up install --force 覆盖重生成\n'
+    + 'exec "/x/node" "/x/cron-up.mjs" run\n');
+  assert.equal(fs.statSync(script).mode & 0o777, 0o755);
+});
+
+test('renderPlist points ProgramArguments at the service script only', (t) => {
+  const deps = installLaunchChain(t, '/x/node', '/x/cron-up.mjs');
+  const xml = fs.readFileSync(deps.paths.plistPath, 'utf-8');
+  assert.ok(xml.includes('<string>local.cron-up</string>'));
+  assert.ok(xml.includes(`<string>${deps.paths.serviceScriptPath}</string>`));
+  assert.ok(!xml.includes('/x/node')); // node 路径只在脚本里
+  assert.ok(xml.includes('<integer>300</integer>'));
+});
+
+test('renderPlist XML-escapes ampersands in the script path', (t) => {
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(mkTmp(t));
+  const xml = renderPlist(300, '/x/a&b/cron-up-service');
+  assert.ok(xml.includes('/x/a&amp;b/cron-up-service'));
+});
 
 test('launcherHealth flags a missing node path', (t) => {
   const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
-  const goodEntry = path.join(tmp, 'entry.mjs');
-  fs.writeFileSync(goodEntry, '');
-  fs.writeFileSync(deps.paths.plistPath, renderPlist(300, {
-    nodePath: path.join(tmp, 'gone/node'),
-    entryPath: goodEntry,
-  }));
-  assert.deepEqual(readPlistProgramArgs(),
-    [path.join(tmp, 'gone/node'), goodEntry, 'run']);
+  const deps = installLaunchChain(t, path.join(tmp, 'gone/node'),
+    path.join(tmp, 'entry.mjs'));
+  fs.writeFileSync(path.join(tmp, 'entry.mjs'), '');
   const alert = launcherHealth();
   assert.ok(alert && alert.includes('失效'));
+  assert.ok(alert.includes('node'));
 });
 
 test('launcherHealth is null when both paths exist', (t) => {
   const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
-  const node = path.join(tmp, 'node');
-  const entry = path.join(tmp, 'entry.mjs');
-  fs.writeFileSync(node, '');
-  fs.writeFileSync(entry, '');
-  fs.writeFileSync(deps.paths.plistPath,
-    renderPlist(300, { nodePath: node, entryPath: entry }));
+  fs.writeFileSync(path.join(tmp, 'node'), '');
+  installLaunchChain(t, path.join(tmp, 'node'), path.join(tmp, 'entry.mjs'));
+  fs.writeFileSync(path.join(tmp, 'entry.mjs'), '');
   assert.equal(launcherHealth(), null);
+});
+
+test('launcherHealth flags a missing service script', (t) => {
+  const tmp = mkTmp(t);
+  const deps = installLaunchChain(t, path.join(tmp, 'node'),
+    path.join(tmp, 'entry.mjs'));
+  fs.rmSync(deps.paths.serviceScriptPath);
+  const alert = launcherHealth();
+  assert.ok(alert && alert.includes('启动脚本已失效'));
+});
+
+test('launcherHealth flags a hand-edited service script', (t) => {
+  const deps = installLaunchChain(t, '/x/node', '/x/entry.mjs');
+  fs.writeFileSync(deps.paths.serviceScriptPath, '#!/bin/bash\necho hi\n');
+  const alert = launcherHealth();
+  assert.ok(alert && alert.includes('无法解读'));
 });
 
 // 在 tmp 里伪造 fnm/nvm 的版本化目录布局（路径中出现 node-versions/<v> 段
@@ -206,13 +217,10 @@ function writeVersioned(tmp, version, file) {
 
 test('launcherHealth flags entry path in another node version dir', (t) => {
   const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
   const node = writeVersioned(tmp, 'v26.0.0', 'bin/node');
   const entry = writeVersioned(tmp, 'v24.20.0',
     path.join('lib', 'node_modules', 'cron-up', 'bin', 'cron-up.mjs'));
-  fs.writeFileSync(deps.paths.plistPath,
-    renderPlist(300, { nodePath: node, entryPath: entry }));
+  installLaunchChain(t, node, entry);
   const alert = launcherHealth();
   assert.ok(alert && alert.includes('另一个 node 版本'));
   assert.ok(alert.includes('cron-up install'));
@@ -220,8 +228,6 @@ test('launcherHealth flags entry path in another node version dir', (t) => {
 
 test('launcherHealth is quiet when versions agree or path is unversioned', (t) => {
   const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
   // 同一版本目录下的 node 与入口：正常。
   const node = writeVersioned(tmp, 'v26.0.0', 'bin/node');
   const entry = writeVersioned(tmp, 'v26.0.0',
@@ -230,12 +236,32 @@ test('launcherHealth is quiet when versions agree or path is unversioned', (t) =
   const linked = path.join(tmp, 'worktree', 'bin', 'cron-up.mjs');
   fs.mkdirSync(path.dirname(linked), { recursive: true });
   fs.writeFileSync(linked, '');
-  fs.writeFileSync(deps.paths.plistPath,
-    renderPlist(300, { nodePath: node, entryPath: entry }));
+  const deps = installLaunchChain(t, node, entry);
   assert.equal(launcherHealth(), null);
-  fs.writeFileSync(deps.paths.plistPath,
-    renderPlist(300, { nodePath: node, entryPath: linked }));
+  fs.writeFileSync(deps.paths.serviceScriptPath,
+    `#!/bin/bash\nexec "${node}" "${linked}" run\n`);
   assert.equal(launcherHealth(), null);
+});
+
+test('launcherHealth still checks legacy three-argument plists', (t) => {
+  // 旧版 plist（ProgramArguments 直写 node/entry/run）：升级后重跑 install
+  // 前的过渡形态。
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  const node = path.join(tmp, 'node');
+  const entry = path.join(tmp, 'entry.mjs');
+  fs.writeFileSync(node, '');
+  fs.writeFileSync(entry, '');
+  const esc = (s) => s.replace(/&/g, '&amp;');
+  fs.writeFileSync(deps.paths.plistPath,
+    `<key>ProgramArguments</key>\n<array>\n`
+    + `\t<string>${esc(node)}</string>\n\t<string>${esc(entry)}</string>\n`
+    + `\t<string>run</string>\n</array>\n`);
+  assert.deepEqual(readPlistProgramArgs(), [node, entry, 'run']);
+  assert.equal(launcherHealth(), null);
+  fs.rmSync(node);
+  assert.ok(launcherHealth()?.includes('失效'));
 });
 
 // ---- install ----
@@ -273,6 +299,10 @@ test('install writes config, plist, bootstraps and runs first patrol', async (t)
   await s.install();
   assert.equal(s.cfg().intervalSeconds, 300);
   assert.ok(fs.existsSync(s.deps.paths.plistPath));
+  // 启动脚本随 install 生成，plist 的 ProgramArguments 只指向它。
+  assert.ok(fs.existsSync(s.deps.paths.serviceScriptPath));
+  assert.equal(fs.statSync(s.deps.paths.serviceScriptPath).mode & 0o777, 0o755);
+  assert.deepEqual(readPlistProgramArgs(), [s.deps.paths.serviceScriptPath]);
   assert.ok(s.launchCalls.some((c) => c[0] === 'bootstrap'));
   assert.ok(s.lines.some((l) => l.includes('已加载到 launchd')));
   assert.ok(s.lines.some((l) => l.includes('首轮巡检完成')));

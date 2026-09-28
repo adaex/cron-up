@@ -47,6 +47,9 @@ export function tmpPaths(tmp, overrides = {}) {
     get statePath() {
       return path.join(this.appSupport, 'state.json');
     },
+    get serviceScriptPath() {
+      return path.join(this.appSupport, 'cron-up-service');
+    },
     ...overrides,
   };
   // 派生目录建出来，测试直接写 statePath/configPath 不会 ENOENT。

@@ -215,12 +215,25 @@ function xmlUnescape(s) {
 }
 
 // key 按字母序排列。ProgramArguments 是
-// [node 绝对路径, 入口脚本绝对路径, 'run']——launchd 的最小 PATH 里没有
-// node，不能写 npm shim。
-export function renderPlist(intervalSeconds, launcher) {
-  const args = [launcher.nodePath, launcher.entryPath, 'run']
-    .map((a) => `\t\t<string>${xmlEscape(a)}</string>`)
-    .join('\n');
+// 生成 launchd 拉起的启动脚本：ProgramArguments[0] 指向它而非 node。
+// macOS 的后台项目列表（系统设置 → 登录项与扩展 → 允许在后台）按
+// ProgramArguments[0] 的文件名归组条目：直连 node 会与所有 node 系后台服务
+// 合并显示在「Node.js Foundation」（node 的签名者）名下；指向自有脚本则
+// 显示 cron-up-service。路径变化（换 Node 安装方式、升级）后重跑
+// cron-up install 覆盖重生成。
+export function writeServiceScript(launcher) {
+  const script = deps.paths.serviceScriptPath;
+  fs.mkdirSync(path.dirname(script), { recursive: true });
+  fs.writeFileSync(script,
+    '#!/bin/bash\n'
+    + '# 由 cron-up install 生成；重跑 cron-up install --force 覆盖重生成\n'
+    + `exec "${launcher.nodePath}" "${launcher.entryPath}" run\n`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+
+// ProgramArguments 单参数（启动脚本路径）——node 与入口路径在脚本里。
+export function renderPlist(intervalSeconds, scriptPath) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -229,7 +242,7 @@ export function renderPlist(intervalSeconds, launcher) {
 \t<string>${LABEL}</string>
 \t<key>ProgramArguments</key>
 \t<array>
-${args}
+\t\t<string>${xmlEscape(scriptPath)}</string>
 \t</array>
 \t<key>RunAtLoad</key>
 \t<true/>
@@ -244,8 +257,10 @@ ${args}
 `;
 }
 
-// 从已安装 plist 的 ProgramArguments 里抠出三个参数（plist 是我们自己写
-// 的，正则足够，不引 plist 解析器）。
+// 从已安装 plist 的 ProgramArguments 里抠出参数（plist 是我们自己写的，
+// 正则足够，不引 plist 解析器）。两种形态：单参数（当前，启动脚本路径）
+// 与三参数 [node, 入口, 'run']（旧版 plist，升级后重跑 install 前的过渡
+// 形态）。
 export function readPlistProgramArgs() {
   let text;
   try {
@@ -258,7 +273,20 @@ export function readPlistProgramArgs() {
   if (!block) return null;
   const parts = [...block[1].matchAll(/<string>([\s\S]*?)<\/string>/g)]
     .map((m) => xmlUnescape(m[1]));
-  return parts.length === 3 ? parts : null;
+  return parts.length > 0 ? parts : null;
+}
+
+// 从启动脚本内容里解出 [node 路径, 入口路径]；脚本是我们生成的固定格
+// 式，解不出（手改坏）返回 null。
+function readServiceScriptPaths(scriptPath) {
+  let text;
+  try {
+    text = fs.readFileSync(scriptPath, 'utf-8');
+  } catch {
+    return null;
+  }
+  const m = text.match(/^exec "(.+)" "(.+)" run$/m);
+  return m ? [m[1], m[2]] : null;
 }
 
 // fnm 与 nvm 的全局包装在版本化目录里（…/node-versions/v<X>/… 与
@@ -273,14 +301,9 @@ function nodeVersionRoot(p) {
   return m ? m[0] : null;
 }
 
-// 总览页健康检查：plist 里写死的 node/入口路径若已不存在（fnm default 被
-// 删、nvm 版本目录被清），launchd 每轮都会静默拉不起来；路径都在但分属不
-// 同 node 版本目录时，巡检跑的多半是旧版包。
-export function launcherHealth() {
-  if (!fs.existsSync(deps.paths.plistPath)) return null;
-  const args = readPlistProgramArgs();
-  if (!args) return null;
-  const [nodePath, entryPath] = args;
+// node/入口路径的存在性与版本分叉检查，新（启动脚本内）旧（plist 三参
+// 数）两种形态共用。
+function pathHealthAlert(nodePath, entryPath) {
   const missing = [nodePath, entryPath].filter((p) => !fs.existsSync(p));
   if (missing.length > 0) {
     return 'launchd 配置中的 Node 或入口路径已失效（'
@@ -299,6 +322,34 @@ export function launcherHealth() {
     return 'launchd 配置里的入口路径属于另一个 node 版本目录'
       + `（${entryRoot}），而当前 node 是 ${nodeReal}；巡检可能在运行旧版`
       + ' cron-up，重跑 cron-up install 更新路径';
+  }
+  return null;
+}
+
+// 总览页健康检查：plist 指定的启动链若已断（脚本或其中的 node/入口路径
+// 不存在，如 fnm default 被删、nvm 版本目录被清），launchd 每轮都会静默
+// 拉不起来；路径都在但分属不同 node 版本目录时，巡检跑的多半是旧版包。
+export function launcherHealth() {
+  if (!fs.existsSync(deps.paths.plistPath)) return null;
+  const args = readPlistProgramArgs();
+  if (!args) return null;
+  if (args.length === 1) {
+    const [scriptPath] = args;
+    if (!fs.existsSync(scriptPath)) {
+      return `launchd 配置中的启动脚本已失效（${path.basename(scriptPath)} `
+        + '不存在），巡检当前拉不起来；请重新运行 cron-up install';
+    }
+    const paths = readServiceScriptPaths(scriptPath);
+    if (paths === null) {
+      return `启动脚本 ${scriptPath} 内容无法解读（可能被手改），`
+        + '重跑 cron-up install 覆盖重生成';
+    }
+    return pathHealthAlert(...paths);
+  }
+  if (args.length === 3) {
+    // 旧版 plist（ProgramArguments 直写 node 与入口）：升级后重跑
+    // install 前的过渡形态，照常检查。
+    return pathHealthAlert(args[0], args[1]);
   }
   return null;
 }
@@ -397,13 +448,15 @@ export async function cmdInstall(args) {
   }
 
   // npm 包没有「安装二进制」这一步：node 与入口文件已由 npm 就位，这里只
-  // 解析它们的稳定绝对路径写给 launchd。
+  // 解析它们的稳定绝对路径，写进启动脚本（plist 只指向脚本，让后台项目
+  // 列表显示 cron-up-service 而非 node 的签名者）。
   const launcher = resolveLauncher();
   if (launcher.note) deps.print(`提示：${launcher.note}`);
 
+  const script = writeServiceScript(launcher);
   fs.writeFileSync(deps.paths.plistPath,
-    renderPlist(cfg.intervalSeconds, launcher));
-  deps.print(`已写入 LaunchAgent：${deps.paths.plistPath}`);
+    renderPlist(cfg.intervalSeconds, script));
+  deps.print(`已写入启动脚本与 LaunchAgent：${script}、${deps.paths.plistPath}`);
 
   deps.launchctl('bootout', `${guiTarget()}/${LABEL}`);
   const r = deps.launchctl('bootstrap', guiTarget(), deps.paths.plistPath);
