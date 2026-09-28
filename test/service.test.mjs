@@ -145,7 +145,7 @@ function installLaunchChain(t, nodePath, entryPath) {
   return deps;
 }
 
-test('service script execs node with entry and run, mode 755', (t) => {
+test('service script pins absolute paths when no stable dir (nvm)', (t) => {
   const deps = installLaunchChain(t, '/x/node', '/x/cron-up.mjs');
   const script = deps.paths.serviceScriptPath;
   assert.equal(fs.readFileSync(script, 'utf-8'),
@@ -153,6 +153,48 @@ test('service script execs node with entry and run, mode 755', (t) => {
     + '# 由 cron-up install 生成；重跑 cron-up install --force 覆盖重生成\n'
     + 'exec "/x/node" "/x/cron-up.mjs" run\n');
   assert.equal(fs.statSync(script).mode & 0o777, 0o755);
+});
+
+test('service script with stable dirs execs cron-up via PATH', (t) => {
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(mkTmp(t));
+  writeServiceScript({ nodePath: '/x/node', entryPath: '/x/e.mjs',
+    pathDirs: ['/Users/u/.local/share/fnm/aliases/default/bin'] });
+  const script = deps.paths.serviceScriptPath;
+  assert.equal(fs.readFileSync(script, 'utf-8'),
+    '#!/bin/bash\n'
+    + '# 由 cron-up install 生成；重跑 cron-up install --force 覆盖重生成\n'
+    + 'export PATH="/Users/u/.local/share/fnm/aliases/default/bin":"$PATH"\n'
+    + 'exec cron-up run\n');
+  assert.equal(fs.statSync(script).mode & 0o777, 0o755);
+});
+
+test('launcherHealth resolves PATH-form script against stable bins', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  const bin = path.join(tmp, 'stable-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  const writeScript = () => {
+    const script = deps.paths.serviceScriptPath;
+    fs.writeFileSync(script,
+      `#!/bin/bash\nexport PATH="${bin}":"$PATH"\nexec cron-up run\n`);
+    fs.writeFileSync(deps.paths.plistPath, renderPlist(300, script));
+  };
+  // bin 里 cron-up 与 node 都在：健康。
+  for (const name of ['cron-up', 'node']) {
+    fs.writeFileSync(path.join(bin, name), '');
+    fs.chmodSync(path.join(bin, name), 0o755);
+  }
+  writeScript();
+  assert.equal(launcherHealth(), null);
+  // 切换默认版本后忘了在新版本里装包：cron-up 解析不到。
+  fs.rmSync(path.join(bin, 'cron-up'));
+  assert.ok(launcherHealth()?.includes('找不到 cron-up'));
+  fs.writeFileSync(path.join(bin, 'cron-up'), '');
+  fs.chmodSync(path.join(bin, 'cron-up'), 0o755);
+  fs.rmSync(path.join(bin, 'node'));
+  assert.ok(launcherHealth()?.includes('找不到 node'));
 });
 
 test('renderPlist points ProgramArguments at the service script only', (t) => {
