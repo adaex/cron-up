@@ -49,6 +49,7 @@ export function tmpPaths(tmp, overrides = {}) {
   // 派生目录建出来，测试直接写 statePath/configPath 不会 ENOENT。
   fs.mkdirSync(p.appSupport, { recursive: true });
   fs.mkdirSync(p.logDir, { recursive: true });
+  fs.mkdirSync(p.sessionDir, { recursive: true });
   return p;
 }
 
