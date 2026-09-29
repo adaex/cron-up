@@ -253,20 +253,29 @@ export async function patrolWorkspace(
     }
   }
 
+  // 成败只认一个事实——有没有拿到 pid：null、undefined、无 pid 的对象都算
+  // 没拉起，计数与日志同源，不会各说各话。
   const spawned = deps.spawnSession(ws);
+  if (spawned?.pid == null) {
+    // 本次尝试已当场失败，立即计入（成功拉起则本次尚待观察，沿用 fails）。
+    const newFails = fails + 1;
+    state[ws] = {
+      pid: null,
+      startedAt: cur,
+      fails: newFails,
+      log: sessionLogPath(ws),
+    };
+    deps.log(`启动失败 ${ws}：会话进程没有拉起（连续失败计数 ${newFails}）`);
+    return;
+  }
   state[ws] = {
-    pid: spawned?.pid ?? null,
+    pid: spawned.pid,
     startedAt: cur,
-    procStart: spawned?.procStart,
-    // 拉不起来时本次尝试已当场失败，立即计入；成功拉起则本次尚待观察。
-    fails: spawned === null ? fails + 1 : fails,
+    procStart: spawned.procStart,
+    fails,
     log: sessionLogPath(ws),
   };
-  if (spawned === null) {
-    deps.log(`启动失败 ${ws}：会话进程没有拉起（连续失败计数 ${fails + 1}）`);
-  } else {
-    deps.log(`已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
-  }
+  deps.log(`已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
 }
 
 // 跑一轮巡检；抢不到锁返回 false。
