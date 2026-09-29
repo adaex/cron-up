@@ -128,6 +128,9 @@ export function spawnSession(ws) {
   // unref 后即使异步启动失败也不要变成 uncaught（监听器不影响 loop 退出）。
   child.on('error', () => {});
   child.unref();
+  // 拉不起来（spawn 当场失败，pid 是 undefined）时返回 null：没有进程可跟
+  // 踪，调用方按启动失败计数，不把 pid=undefined 写进 state。
+  if (child.pid === undefined) return null;
   return { pid: child.pid, procStart: deps.procStartedAt(child.pid) };
 }
 

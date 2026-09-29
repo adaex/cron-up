@@ -213,7 +213,9 @@ export async function patrolWorkspace(
     // 冷却刚结束：给一次干净的缓刑拉起，而不是立刻再次顶满限制。
     fails = 0;
   } else {
-    fails = (ent?.fails ?? 0) + (ent ? 1 : 0);
+    // 只有真的拉起过（pid 非空）的条目死亡才算一次新失败；pid 为空的条目
+    // 是当场就没拉起的尝试，那次失败已在写入时计过，不再重复累计。
+    fails = (ent?.fails ?? 0) + (ent?.pid ? 1 : 0);
   }
 
   if (fails >= FAIL_LIMIT) {
@@ -251,15 +253,20 @@ export async function patrolWorkspace(
     }
   }
 
-  const { pid, procStart } = deps.spawnSession(ws);
+  const spawned = deps.spawnSession(ws);
   state[ws] = {
-    pid,
+    pid: spawned?.pid ?? null,
     startedAt: cur,
-    procStart,
-    fails,
+    procStart: spawned?.procStart,
+    // 拉不起来时本次尝试已当场失败，立即计入；成功拉起则本次尚待观察。
+    fails: spawned === null ? fails + 1 : fails,
     log: sessionLogPath(ws),
   };
-  deps.log(`已启动 ${ws} pid=${pid}（连续失败计数 ${fails}）`);
+  if (spawned === null) {
+    deps.log(`启动失败 ${ws}：会话进程没有拉起（连续失败计数 ${fails + 1}）`);
+  } else {
+    deps.log(`已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
+  }
 }
 
 // 跑一轮巡检；抢不到锁返回 false。

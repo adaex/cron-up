@@ -60,6 +60,18 @@ test('spawn: child env marked and claude markers stripped', (t) => {
   assert.ok('CLAUDE_CODE_CHILD_SESSION' in process.env);
 });
 
+test('spawn that never started returns null, not a pid-less record', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  // 拉不起来（如解释器缺失）时 child.pid 是 undefined：调用方拿到的应是
+  // null，好按启动失败计数，而不是把 pid=undefined 写进 state。
+  deps.spawn = () => ({ pid: undefined, on() {}, unref() {} });
+  const ws = path.join(tmp, 'proj');
+  fs.mkdirSync(ws);
+  assert.equal(spawnSession(ws), null);
+});
+
 test('buildChildEnv is a pure function', () => {
   const env = { CLAUDE_CODE_X: '1', KEEP: '2' };
   const out = buildChildEnv(env);

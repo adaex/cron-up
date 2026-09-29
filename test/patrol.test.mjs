@@ -231,6 +231,29 @@ test('stuck session is retired and counted', async (t) => {
   assert.ok((m.state()[WS].cooldownUntil ?? 0) > Math.floor(Date.now() / 1000));
 });
 
+test('spawn that never starts is counted and reaches cooldown', async (t) => {
+  const m = await setupMachine(t);
+  const logs = [];
+  m.deps.log = (msg) => logs.push(msg);
+  m.deps.spawnSession = () => null;
+
+  await m.patrol();
+  assert.equal(m.state()[WS].pid, null, '没有伪 pid 进 state');
+  assert.equal(m.state()[WS].fails, 1, '当场失败的尝试立即计数');
+  assert.ok(logs.some((l) => l.includes('启动失败')));
+
+  await m.patrol();
+  assert.equal(m.state()[WS].fails, 2, '无 pid 条目不再重复累计上次失败');
+
+  await m.patrol();
+  assert.equal(m.state()[WS].fails, 3);
+
+  await m.patrol();
+  const ent = m.state()[WS];
+  assert.ok((ent.cooldownUntil ?? 0) > Math.floor(Date.now() / 1000),
+    '连续三次拉不起后进入冷却');
+});
+
 test('recycled pid is not mistaken for our session', async (t) => {
   const m = await setupMachine(t);
   await m.patrol();
