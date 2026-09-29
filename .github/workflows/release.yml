@@ -33,7 +33,10 @@ jobs:
       contents: read
       id-token: write
     steps:
+      # 序号校验要数全部历史 tag：默认浅克隆只带本次触发 tag，不够。
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v5
         with:
           node-version: 24
@@ -45,6 +48,18 @@ jobs:
           if [ "$version" != "$GITHUB_REF_NAME" ]; then
             echo "package.json 的版本（$version）与 tag（$GITHUB_REF_NAME）" \
               "不一致：先改版本号再发版" >&2
+            exit 1
+          fi
+      # 版本序号规则：序号 = 含本次在内的历史发布总次数（v* tag 计数）。
+      # 数错（该发 21 发成 22）在这里当场拦下，不等到 npm 上出现断号。
+      - name: Verify tag serial equals total release count
+        run: |
+          total=$(git tag -l 'v*' | wc -l | tr -d '[:space:]')
+          serial=${GITHUB_REF_NAME#v}
+          serial=${serial##*.}
+          if [ "$serial" != "$total" ]; then
+            echo "tag 序号（$serial）与 v* tag 总数（$total，含本 tag）不一致：" \
+              "序号应为发布前 git tag -l 'v*' | wc -l 的结果加一" >&2
             exit 1
           fi
       - name: npm pack dry run (sanity check)
