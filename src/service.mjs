@@ -272,7 +272,7 @@ export async function cmdInstall(args) {
     if (args.roots !== undefined) ignored.push('--roots');
     if (args.interval !== undefined) ignored.push('--interval');
     if (args.lead !== undefined) ignored.push('--lead');
-    if (args.autoRenew !== undefined) ignored.push('--auto-renew / --no-auto-renew');
+    if (args.autoRenew !== undefined) ignored.push('--auto-renew');
     if (ignored.length > 0) {
       deps.print(`警告：参数 ${ignored.join('、')} 未生效（现有配置保留）；`
         + '要更新这些字段请带 --force 重跑，--force 只覆盖显式给出的字段');

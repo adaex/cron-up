@@ -354,6 +354,12 @@ test('without --force existing config is kept', async (t) => {
   await cmdInstall({ roots: '/other', force: false });
   assert.ok(lines2.some((l) => l.includes('保留现有配置')));
   assert.deepEqual(s.cfg().roots, [s.tmp]); // 没被 /other 覆盖
+  // 没给显式参数就不得冒「未生效」的警告（roots 在这个用例里给了，这里
+  // 换成不带的形态单独验证）。
+  const lines3 = [];
+  s.deps.print = (m) => lines3.push(m);
+  await cmdInstall({ force: false });
+  assert.ok(!lines3.some((l) => l.includes('未生效')));
 });
 
 test('without --force, ignored flags are named in output', async (t) => {
