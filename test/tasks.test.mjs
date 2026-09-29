@@ -75,13 +75,15 @@ test('tags recurring and preserves everything else', (t) => {
 
 test('stale tmp from a killed write is swept even when nothing to tag', (t) => {
   const { file } = taskDir(t);
-  // 全部已标好 → renew 提前返回不写入；上轮被杀残留的 .tmp 仍要被清走，
-  // 否则它会永远躺在用户的仓库里。
+  // 全部已标好 → renew 提前返回不写入；上轮被杀残留的专属临时文件仍要被
+  // 清走，否则它会永远躺在用户的仓库里。泛用 .tmp 不是我们的东西，不碰。
   fs.writeFileSync(file,
     JSON.stringify({ tasks: [{ ...RECURRING, permanent: true }] }));
-  fs.writeFileSync(`${file}.tmp`, 'half-written');
+  fs.writeFileSync(`${file}.cron-up-tmp`, 'half-written');
+  fs.writeFileSync(`${file}.tmp`, 'foreign writer in flight');
   assert.equal(renewWorkspace(file), 0);
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.equal(fs.existsSync(`${file}.cron-up-tmp`), false);
+  assert.equal(fs.existsSync(`${file}.tmp`), true);
 });
 
 test('chinese prompt is written literally', (t) => {
@@ -175,7 +177,7 @@ test('atomic write refuses a stale mtime', (t) => {
     () => atomicWriteJson(file, { tasks: [{ x: 1 }] }, staleMtime),
     TaskFileChanged);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf-8')).tasks, []);
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.equal(fs.existsSync(`${file}.cron-up-tmp`), false);
 });
 
 test('concurrent change mid-update is not clobbered', (t) => {
@@ -191,7 +193,7 @@ test('concurrent change mid-update is not clobbered', (t) => {
   assert.throws(() => renewWorkspace(file), TaskFileChanged);
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf-8')),
     { tasks: [{ id: 'cc-wins' }] });
-  assert.equal(fs.existsSync(`${file}.tmp`), false);
+  assert.equal(fs.existsSync(`${file}.cron-up-tmp`), false);
 });
 
 test('task view exposes the permanent flag', () => {

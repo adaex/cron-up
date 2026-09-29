@@ -146,6 +146,13 @@ export function loadTaskDoc(file) {
   return doc;
 }
 
+// 临时文件用专属后缀而非泛用的 .tmp：清扫时只认自己的名字，不会误删恰好
+// 用同一约定的其他写者（巡检锁只隔离 cron-up 自己，管不到 Claude Code）
+// 刚建好的临时文件。
+function tmpSibling(file) {
+  return `${file}.cron-up-tmp`;
+}
+
 // 旁边写再 rename 的原子替换，保留原文件权限位与中文字面量。
 // tmp 以 0600 创建（绝不更宽），写完再放宽到原 mode。expectedMtimeNs 是
 // 乐观锁：路径 mtime 自调用方读后变了说明别的写者抢先，抛
@@ -157,7 +164,7 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
   } catch {
     // 新文件用 0600。
   }
-  const tmp = `${file}.tmp`;
+  const tmp = tmpSibling(file);
   // JSON.stringify 两空格缩进：中文按字面写出（不转 \u），无尾换行。
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), {
     flag: 'w',
@@ -197,11 +204,11 @@ export function renewWorkspace(taskfile) {
   } catch {
     return null;
   }
-  // 上次写一半被杀（SIGKILL/断电）留下的 .tmp 会永远躺在用户的仓库里——
-  // 已全部标好的文件不再触发写入，没人替它收尾。巡检互斥保证此刻没有另
-  // 一轮 cron-up 在写，顺手清掉。
+  // 上次写一半被杀（SIGKILL/断电）留下的临时文件会永远躺在用户的仓库里
+  // ——已全部标好的文件不再触发写入，没人替它收尾。只清专属后缀的，顺手
+  // 且不碰别人。
   try {
-    fs.unlinkSync(`${taskfile}.tmp`);
+    fs.unlinkSync(tmpSibling(taskfile));
   } catch {
     // 不存在即无事。
   }
