@@ -265,6 +265,17 @@ export async function cmdInstall(args) {
       throw e;
     }
     deps.print(`保留现有配置：${deps.paths.configPath}（需要更新时加 --force）`);
+    // 不带 --force 时配置原样保留，命令行显式给的参数一律不生效：点名说清
+    // 被忽略的是哪些，而不是让用户以为已经改了。
+    const ignored = [];
+    if (args.roots !== undefined) ignored.push('--roots');
+    if (args.interval !== undefined) ignored.push('--interval');
+    if (args.lead !== undefined) ignored.push('--lead');
+    if (args.autoRenew !== undefined) ignored.push('--auto-renew / --no-auto-renew');
+    if (ignored.length > 0) {
+      deps.print(`警告：参数 ${ignored.join('、')} 未生效（现有配置保留）；`
+        + '要更新这些字段请带 --force 重跑，--force 只覆盖显式给出的字段');
+    }
   } else {
     // 即使 --force 也从现有配置（全新安装则默认值）起步，只覆盖命令行给
     // 的字段——否则 --force --interval 600 会悄悄把 roots 重置成默认。

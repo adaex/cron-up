@@ -356,6 +356,22 @@ test('without --force existing config is kept', async (t) => {
   assert.deepEqual(s.cfg().roots, [s.tmp]); // 没被 /other 覆盖
 });
 
+test('without --force, ignored flags are named in output', async (t) => {
+  const s = await setupInstall(t);
+  await s.install();
+  const lines2 = [];
+  s.deps.print = (m) => lines2.push(m);
+  await cmdInstall({
+    roots: '/other', interval: 120, lead: 30, autoRenew: false, force: false,
+  });
+  assert.ok(lines2.some((l) => l.includes('未生效')
+    && l.includes('--roots') && l.includes('--interval')
+    && l.includes('--lead') && l.includes('--auto-renew')));
+  // 参数全部忽略，配置原样。
+  assert.deepEqual(s.cfg().roots, [s.tmp]);
+  assert.equal(s.cfg().intervalSeconds, 300);
+});
+
 // ---- uninstall ----
 
 async function setupUninstall(t) {
