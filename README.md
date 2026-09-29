@@ -187,7 +187,7 @@ npm link                    # 本机把开发版链接成全局 cron-up，迭代
 
 ## 发布
 
-- **版本号**：按「年.月.序号」——两位年份、月份、累计发布序号。序号永不重置、不随月份归零，每次发布加一，始终等于含本次在内的历史发布总次数（0.x 时代的发布同样计入）。序号在 26.9.7 之后由月内计数改为累计计数，切换时历史共 20 次发布，故下一次是第 21 次：9 月内再发是 `26.9.21`，到 10 月发是 `26.10.21`，月份照常反映发布时间、序号只增不减。下一序号不用手数：发布前 `git fetch --tags` 后 `git tag -l 'v*' | wc -l` 数出已有发布次数，加一即得。
+- **版本号**：按「年.月.序号」——两位年份、月份、累计发布序号。序号永不重置、不随月份归零，每次发布加一，始终等于含本次在内的历史发布总次数（0.x 时代的发布同样计入）。序号在 26.9.7 之后由月内计数改为累计计数，切换时历史共 20 次发布，故下一次是第 21 次：9 月内再发是 `26.9.21`，到 10 月发是 `26.10.21`，月份照常反映发布时间、序号只增不减。下一序号不用手数：发布前 `git fetch --prune --prune-tags --tags` 后 `git tag -l 'v*' | wc -l` 数出已有发布次数，加一即得（prune-tags 让删错的远端 tag 不至于把本地计数顶歪）。发布失败的 tag 重跑 release 工作流即可，序号不消耗。
 - **发布方式**：先把 package.json 的 version 改成新版本并合入 main，再打同名 `v<version>` tag（如 `v26.9.21`）；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致（版本不符直接失败，杜绝「代码是 26.9.2、tag 叫 26.9.3」这类漂移），并复核 tag 序号等于含它在内的 `v*` tag 总数（序号数错当场失败），然后 publish。push 到 main 的每次提交也会先跑一遍测试（ci workflow）。
 - **trusted publishing**：npm 经 GitHub OIDC 验证「确为 `adaex/cron-up` 仓库 `release.yml` 由该 tag 触发的运行」后放行，不使用任何长期凭证（仓库里没有 NPM_TOKEN，token 泄漏冒发这条路不存在），且每个版本自动附带 provenance 出处证明（npm 包页可见构建来源与 commit）；前提是 npmjs.com 包设置里已登记 Trusted Publisher（repository `adaex/cron-up`、workflow `.github/workflows/release.yml`，一次性配置），没登记的话 publish 会被拒绝。
 - **npm 传播延迟**：publish 成功后 npm 服务端约两分钟才完成处理，`latest` 标签与本机 npm 缓存各自再滞后一层——发布后立即 `npm i -g cron-up@latest` 可能装到旧版且毫无提示（`changed 1 package` 不含版本号）；等 `npm view cron-up version` 刷新后用显式版本号安装，装完以总览首行版本号为准。
