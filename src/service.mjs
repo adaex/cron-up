@@ -26,9 +26,10 @@ export function guiTarget() {
   return `gui/${process.getuid()}`;
 }
 
-// launchctl 调用统一走不抛的 execFile，判成败看 status。
+// launchctl 调用统一走不抛的 execFile，判成败看 status。与 ps 同款防御：
+// launchctl 卡住时命令挂死不如超时报「未加载」——总览页至少还能出来。
 export function launchctl(...args) {
-  return deps.execFile('/bin/launchctl', args);
+  return deps.execFile('/bin/launchctl', args, { timeout: 10000 });
 }
 
 export function launchctlInfo() {

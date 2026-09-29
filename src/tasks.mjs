@@ -197,6 +197,14 @@ export function renewWorkspace(taskfile) {
   } catch {
     return null;
   }
+  // 上次写一半被杀（SIGKILL/断电）留下的 .tmp 会永远躺在用户的仓库里——
+  // 已全部标好的文件不再触发写入，没人替它收尾。巡检互斥保证此刻没有另
+  // 一轮 cron-up 在写，顺手清掉。
+  try {
+    fs.unlinkSync(`${taskfile}.tmp`);
+  } catch {
+    // 不存在即无事。
+  }
   const doc = deps.loadTaskDoc(taskfile);
   if (doc === null) return null;
   let tagged = 0;

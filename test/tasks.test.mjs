@@ -73,6 +73,17 @@ test('tags recurring and preserves everything else', (t) => {
   assert.equal(doc.version, 7);
 });
 
+test('stale tmp from a killed write is swept even when nothing to tag', (t) => {
+  const { file } = taskDir(t);
+  // 全部已标好 → renew 提前返回不写入；上轮被杀残留的 .tmp 仍要被清走，
+  // 否则它会永远躺在用户的仓库里。
+  fs.writeFileSync(file,
+    JSON.stringify({ tasks: [{ ...RECURRING, permanent: true }] }));
+  fs.writeFileSync(`${file}.tmp`, 'half-written');
+  assert.equal(renewWorkspace(file), 0);
+  assert.equal(fs.existsSync(`${file}.tmp`), false);
+});
+
 test('chinese prompt is written literally', (t) => {
   const { file } = taskDir(t);
   fs.writeFileSync(file, JSON.stringify({ tasks: [{ ...RECURRING }] }));
