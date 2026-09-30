@@ -244,13 +244,27 @@ test('zero lead is an explicit choice', async (t) => {
   assert.equal(s.cfg().leadSeconds, 0);
 });
 
-test('zero interval is rejected loudly', async (t) => {
+test('zero interval is rejected loudly and leaves config untouched', async (t) => {
   const s = await setupInstall(t);
+  await s.install();
   await assert.rejects(s.install({ interval: 0 }), (e) => {
     assert.ok(e instanceof ExitError);
     assert.equal(e.code, 1);
     return true;
   });
+  // 被拒的安装不能把非法值留在盘上：否则此后每轮巡检都会以退出码 2 失败。
+  assert.equal(s.cfg().intervalSeconds, 300);
+});
+
+test('negative lead is rejected loudly and leaves config untouched', async (t) => {
+  const s = await setupInstall(t);
+  await s.install();
+  await assert.rejects(s.install({ lead: -5 }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 1);
+    return true;
+  });
+  assert.equal(s.cfg().leadSeconds, 600);
 });
 
 test('non-object legacy config is ignored on force', async (t) => {

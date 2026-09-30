@@ -312,9 +312,23 @@ export async function cmdInstall(args) {
       overrides.roots = roots;
     }
     // is not undefined，而非 truthiness：--lead 0（「不要提前量」）是合法
-    // 选择，不能被悄悄丢掉；--interval 0 也要留到下面的校验被响亮拒绝。
-    if (args.interval !== undefined) overrides.intervalSeconds = args.interval;
-    if (args.lead !== undefined) overrides.leadSeconds = args.lead;
+    // 选择，不能被悄悄丢掉。值域就地拦且必须在 saveConfig 之前：文件继承
+    // 的值已由 loadConfig / configFieldErrors 把关，命令行值只经过整数解
+    // 析——被拒的安装若把非法值写进配置，此后每轮巡检都会以退出码 2 死掉。
+    if (args.interval !== undefined) {
+      if (!isInt(args.interval) || args.interval <= 0) {
+        deps.printErr(`--interval 必须是正整数秒，当前为 ${JSON.stringify(args.interval)}`);
+        throw new ExitError(1);
+      }
+      overrides.intervalSeconds = args.interval;
+    }
+    if (args.lead !== undefined) {
+      if (!isInt(args.lead) || args.lead < 0) {
+        deps.printErr(`--lead 必须是非负整数秒，当前为 ${JSON.stringify(args.lead)}`);
+        throw new ExitError(1);
+      }
+      overrides.leadSeconds = args.lead;
+    }
     if (args.autoRenew !== undefined) overrides.autoRenew = args.autoRenew;
     cfg = { ...cfg, ...overrides };
     cfg.roots = normalizeRoots(cfg.roots ?? []);
@@ -324,18 +338,7 @@ export async function cmdInstall(args) {
     deps.print(`已写入配置：${deps.paths.configPath}（更新字段：${updated}，${rest}）`);
   }
 
-  // 动系统前先校验生效配置：文件继承的值由 loadConfig / configFieldErrors
-  // 保证类型，但命令行给的 --interval/--lead 只经过整数解析，取值范围要在
-  // 这里拦（--interval 0 非法、--lead 0 是合法选择）；软问题（提前量过
-  // 小、目录缺失）只警告。
-  if (!isInt(cfg.intervalSeconds) || cfg.intervalSeconds <= 0) {
-    deps.printErr(`intervalSeconds 必须是正整数秒，当前为 ${JSON.stringify(cfg.intervalSeconds)}`);
-    throw new ExitError(1);
-  }
-  if (!isInt(cfg.leadSeconds) || cfg.leadSeconds < 0) {
-    deps.printErr(`leadSeconds 必须是非负整数秒，当前为 ${JSON.stringify(cfg.leadSeconds)}`);
-    throw new ExitError(1);
-  }
+  // 命令行值的硬校验已在落盘前完成；软问题（提前量过小、目录缺失）只警告。
   validateConfig(cfg, (m) => deps.print(m));
   if (JSON.stringify(cfg.roots)
       === JSON.stringify(normalizeRoots(DEFAULT_CONFIG.roots))) {
