@@ -6,9 +6,15 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { deps } from './internals.mjs';
-import { loadConfig, loadState, validateConfig } from './config.mjs';
+import {
+  loadConfig,
+  loadState,
+  validateConfig,
+  loadHeartbeat,
+} from './config.mjs';
 import { packageVersion, TASK_REL } from './paths.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
+import { HEARTBEAT_STALE_FACTOR } from './constants.mjs';
 import {
   humanDelta,
   clip,
@@ -16,6 +22,7 @@ import {
   dispWidth,
   taskView,
   sessionAgeZh,
+  elapsedZh,
   fmtMDHM,
   fmtHM,
 } from './display.mjs';
@@ -196,6 +203,8 @@ export async function cmdOverview(args) {
   const [consumers, registryAlert] = await deps.scanSessions();
   if (registryAlert) alerts.push(registryAlert);
   const state = loadState();
+  const curOv = Math.floor(Date.now() / 1000);
+  const heartbeat = loadHeartbeat();
   const coolingWarned = new Set();
   let discovered = null;
 
@@ -229,6 +238,20 @@ export async function cmdOverview(args) {
     deps.print(prefix
       + clip(rootsText, cols - dispWidth(prefix) - dispWidth(suffix))
       + suffix);
+    // 心跳回答「巡检最近真的在跑吗」：launchd 已加载但启动脚本运行期失
+    // 效时，静态健康检查（launcherHealth）全绿而轮次早已停摆，只有沉默的
+    // 心跳能戳穿。服务未加载（info 为 null）时不告警，服务行已说明未安装。
+    if (heartbeat) {
+      deps.print(`上次巡检：${elapsedZh(curOv - heartbeat.ranAt)}前`);
+      if (info
+          && curOv - heartbeat.ranAt
+            > cfg.intervalSeconds * HEARTBEAT_STALE_FACTOR) {
+        alerts.push(`巡检已沉默 ${elapsedZh(curOv - heartbeat.ranAt)}：launchd `
+          + `显示服务已加载（配置每 ${cfg.intervalSeconds} 秒一轮），但最近没有`
+          + '成功跑完的轮次，启动链可能已失效；请运行 cron-up logs 查看巡检'
+          + '日志，必要时重跑 cron-up install');
+      }
+    }
     alerts.push(...validateConfig(cfg, () => {}));
     deps.print('');
     const [taskAlerts, cooled, found] = overviewTasks(cfg, cols, consumers, state);

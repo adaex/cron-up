@@ -72,6 +72,28 @@ test('spawn that never started returns null, not a pid-less record', (t) => {
   assert.equal(spawnSession(ws), null);
 });
 
+test('async spawn error is recorded in the patrol log with its reason', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  let onError;
+  deps.spawn = () => ({
+    pid: 4242,
+    on(event, fn) { if (event === 'error') onError = fn; },
+    unref() {},
+  });
+  const logged = [];
+  deps.log = (msg) => logged.push(msg);
+  const ws = path.join(tmp, 'proj');
+  fs.mkdirSync(ws);
+  spawnSession(ws);
+  assert.equal(typeof onError, 'function');
+  onError(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+  assert.equal(logged.length, 1);
+  assert.ok(logged[0].includes('ENOENT'));
+  assert.ok(logged[0].includes(ws));
+});
+
 test('spawn rotates the previous generation log to .1', (t) => {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);

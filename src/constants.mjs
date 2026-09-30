@@ -55,9 +55,12 @@ export const SESSION_RECYCLE_IDLE_SECONDS = 180;
 // 回收后同轮重拉的新会话约 10 秒完成登记，余量保的是登记抖动；更近的触
 // 发直接复用现有会话（时间紧邻的任务共享）。
 export const SESSION_FIRE_MARGIN_SECONDS = 120;
-// 巡检日志每轮几行，但跑几年的机器也该有上限。launchd 每次按路径重开，
-// 轮初改名是安全的：本轮 fd 继续写改名后的 inode，下轮开新文件。
+// 巡检日志每轮两行心跳加零星事件，跑几年的机器也该有上限。launchd 每次按
+// 路径重开，轮初改名是安全的：本轮 fd 继续写改名后的 inode，下轮开新文件。
 export const PATROL_LOG_ROTATE_BYTES = 1024 * 1024;
+// 心跳沉默多少倍轮次间隔算异常：轮首据此提示漏轮（电脑休眠时 launchd 会
+// 合并错过的间隔，醒来只补一轮），总览页据此报「服务在但巡检没在跑」。
+export const HEARTBEAT_STALE_FACTOR = 2;
 
 // 不进入这些目录：VCS/依赖内部与 macOS 家目录系统文件夹——agent 工作区不
 // 会在里面，光一个 ~/Library 就足以让家目录扫描爆炸。

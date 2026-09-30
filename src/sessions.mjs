@@ -126,8 +126,13 @@ export function spawnSession(ws) {
     cwd: ws,
     env: buildChildEnv(process.env),
   });
-  // unref 后即使异步启动失败也不要变成 uncaught（监听器不影响 loop 退出）。
-  child.on('error', () => {});
+  // unref 后即使异步启动失败也不要变成 uncaught（监听器不影响 loop 退出）；
+  // 但错误原因要留进巡检日志——spawn 同步返回成功、子进程 exec 阶段才失败
+  // （ENOENT/EAGAIN 等）时，上层只能看到会话随后死亡，没有任何原因可查。
+  child.on('error', (e) => {
+    deps.log(`会话进程拉起异常 ${ws}：${e?.code ? `${e.code}：` : ''}`
+      + `${e?.message ?? e}`);
+  });
   child.unref();
   // 拉不起来（spawn 当场失败，pid 是 undefined）时返回 null：没有进程可跟
   // 踪，调用方按启动失败计数，不把 pid=undefined 写进 state。

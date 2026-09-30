@@ -227,3 +227,30 @@ test('hand-edited state types render without crashing', async (t) => {
   });
   assert.ok(out.includes('会话：'));
 });
+
+test('fresh heartbeat shows last-run time without stale alert', async (t) => {
+  const s = await setup(t);
+  writeJson(s.deps.paths.heartbeatPath, {
+    ranAt: Math.floor(Date.now() / 1000) - 30,
+  });
+  const out = await s.render();
+  assert.ok(out.includes('上次巡检：'));
+  assert.ok(!out.includes('巡检已沉默'));
+});
+
+test('stale heartbeat with service loaded raises a silence alert', async (t) => {
+  const s = await setup(t); // launchctlInfo 默认已加载、间隔 300
+  writeJson(s.deps.paths.heartbeatPath, {
+    ranAt: Math.floor(Date.now() / 1000) - 900,
+  });
+  const out = await s.render();
+  assert.ok(out.includes('巡检已沉默 15 分钟'));
+  assert.ok(out.includes('cron-up logs'));
+});
+
+test('missing heartbeat renders without silence claim', async (t) => {
+  const s = await setup(t);
+  const out = await s.render();
+  assert.ok(!out.includes('上次巡检：'));
+  assert.ok(!out.includes('巡检已沉默'));
+});

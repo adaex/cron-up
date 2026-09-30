@@ -32,6 +32,10 @@ export const paths = {
   get statePath() {
     return path.join(this.dataDir, 'state.json');
   },
+  // 巡检心跳：每轮成功跑完写一次，总览页据此判断上次巡检多久前。
+  get heartbeatPath() {
+    return path.join(this.dataDir, 'heartbeat');
+  },
   // launchd 拉起的启动脚本。ProgramArguments[0] 直接指向它而非 node：
   // macOS 后台项目列表按可执行文件名显示条目，直连 node 会归到「Node.js
   // Foundation」名下（node 的签名者），自有脚本则显示脚本自己的名字。

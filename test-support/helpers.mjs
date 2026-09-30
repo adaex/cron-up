@@ -47,6 +47,9 @@ export function tmpPaths(tmp, overrides = {}) {
     get statePath() {
       return path.join(this.dataDir, 'state.json');
     },
+    get heartbeatPath() {
+      return path.join(this.dataDir, 'heartbeat');
+    },
     get serviceScriptPath() {
       return path.join(this.dataDir, 'cron-up-service');
     },

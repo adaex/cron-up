@@ -187,6 +187,24 @@ export function saveState(state) {
   atomicSave(deps.paths.statePath, state);
 }
 
+// 巡检心跳：每轮成功跑完覆盖写一次。轮首读它发现漏轮（距上次超过两个间
+// 隔），总览页读它报「服务在但巡检没在跑」。缺失/损坏/形状不对一律读作
+// 没有心跳——旧版本升级后的首轮、与总览读到半截文件都按此降级。
+export function loadHeartbeat() {
+  let doc;
+  try {
+    doc = JSON.parse(fs.readFileSync(deps.paths.heartbeatPath, 'utf-8'));
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(doc) || !Number.isFinite(doc.ranAt)) return null;
+  return doc;
+}
+
+export function saveHeartbeat(doc) {
+  atomicSave(deps.paths.heartbeatPath, doc);
+}
+
 export function saveConfig(cfg) {
   atomicSave(deps.paths.configPath, cfg);
 }

@@ -157,3 +157,13 @@ export function sessionAgeZh(startedAt, cur) {
   if (secs >= 86400) return `${Math.floor(secs / 86400)} 天`;
   return `${Math.floor(secs / 60)} 分钟`;
 }
+
+// 已过去时长的粗略中文说法，秒级分辨率：巡检漏轮间隔、被动退出会话的存
+// 活时长、总览页的「上次巡检」用它。
+export function elapsedZh(secs) {
+  secs = Math.max(0, Math.floor(secs));
+  if (secs < 60) return `${secs} 秒`;
+  if (secs < 3600) return `${Math.floor(secs / 60)} 分钟`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)} 小时`;
+  return `${Math.floor(secs / 86400)} 天`;
+}

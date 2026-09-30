@@ -9,6 +9,8 @@ import {
   loadState,
   saveState,
   validateConfig,
+  loadHeartbeat,
+  saveHeartbeat,
 } from '../src/config.mjs';
 import { discover, onDiskCase } from '../src/tasks.mjs';
 import { ExitError } from '../src/internals.mjs';
@@ -266,4 +268,25 @@ test('state saves as 0600 inside a 0700 data dir', (t) => {
   saveState({ '/a': { pid: 1, fails: 0 } });
   assert.equal(fs.statSync(deps.paths.statePath).mode & 0o777, 0o600);
   assert.equal(fs.statSync(deps.paths.dataDir).mode & 0o777, 0o700);
+});
+
+test('heartbeat round-trips, and missing or broken files read as null', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  assert.equal(loadHeartbeat(), null, '尚无心跳文件');
+  saveHeartbeat({ ranAt: 123, sessionRetain: 'window' });
+  assert.equal(loadHeartbeat().ranAt, 123);
+  writeJson(deps.paths.heartbeatPath, { noRanAt: true });
+  assert.equal(loadHeartbeat(), null, '形状不对按没有心跳处理');
+  fs.writeFileSync(deps.paths.heartbeatPath, '{ half');
+  assert.equal(loadHeartbeat(), null, '半截 JSON 按没有心跳处理');
+});
+
+test('heartbeat saves as 0600', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  saveHeartbeat({ ranAt: 1 });
+  assert.equal(fs.statSync(deps.paths.heartbeatPath).mode & 0o777, 0o600);
 });

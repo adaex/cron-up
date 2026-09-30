@@ -684,3 +684,79 @@ test('tail window: a dead session during the tail is respawned', async (t) => {
   await m.run(at1335, neighborTasks(), new Set());
   assert.ok(m.alivePids.has(999), '尾窗内缺会话必须同轮重拉，不能漏跑');
 });
+
+// ---- 轮次心跳、汇总与被动退出 ----
+
+test('each round writes a heartbeat and logs start/end summary', async (t) => {
+  // 关掉 autoRenew/autoMinId：假任务文件路径会让维护步骤报「维护错误」，
+  // 干扰「本轮无动作」的断言。
+  const m = await setupMachine(t, { autoRenew: false, autoMinId: false });
+  const logs = [];
+  m.deps.log = (msg) => logs.push(msg);
+
+  await m.patrol(); // 首轮：拉起会话
+  assert.ok(logs.some((x) => x.startsWith('巡检开始')));
+  const end1 = logs.find((x) => x.startsWith('巡检结束'));
+  assert.match(end1, /发现 1 个工作区/);
+  assert.match(end1, /启动 1/);
+  assert.match(end1, /耗时/);
+  const hb1 = readJson(m.deps.paths.heartbeatPath);
+  assert.equal(hb1.sessionRetain, 'window');
+  assert.equal(hb1.events.spawn, 1);
+  assert.equal(typeof hb1.ranAt, 'number');
+
+  // 次轮：会话健康且已登记，平静无动作；心跳刚写过，不应有漏轮告警。
+  logs.length = 0;
+  m.holder.consumer = true;
+  await m.patrol();
+  const end2 = logs.find((x) => x.startsWith('巡检结束'));
+  assert.match(end2, /活动交互会话 1 个；本轮无动作/);
+  assert.ok(!logs.some((x) => x.includes('漏轮')));
+  assert.ok(!logs.some((x) => x.includes('会话退出')));
+});
+
+test('heartbeat older than two intervals warns about missed rounds', async (t) => {
+  const m = await setupMachine(t, { autoRenew: false, autoMinId: false });
+  writeJson(m.deps.paths.heartbeatPath, {
+    ranAt: Math.floor(Date.now() / 1000) - 900, // 间隔 300 秒 × 2 = 600
+  });
+  const logs = [];
+  m.deps.log = (msg) => logs.push(msg);
+  await m.patrol();
+  assert.ok(logs.some((x) => x.includes('超过 2 个轮次间隔') && x.includes('漏轮')));
+});
+
+test('session dying on its own is reported with lifetime and respawned', async (t) => {
+  const m = await setupMachine(t, { autoRenew: false, autoMinId: false });
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  // 拨回 startedAt：验证被动退出日志带上存活时长。
+  m.writeState({
+    ...m.state(),
+    [WS]: { ...m.state()[WS], startedAt: Math.floor(Date.now() / 1000) - 90 },
+  });
+  m.alivePids.delete(pid); // 非巡检结束：自行崩溃/被杀
+  const logs = [];
+  m.deps.log = (msg) => logs.push(msg);
+  await m.patrol();
+  const line = logs.find((x) => x.includes('会话退出') && x.includes(`pid=${pid}`));
+  assert.ok(line, '被动退出要有独立日志');
+  assert.match(line, /非巡检主动结束/);
+  assert.match(line, /已存活 1 分钟/);
+  assert.notEqual(m.state()[WS].pid, pid, '任务仍在窗口内：同轮重拉');
+  assert.equal(readJson(m.deps.paths.heartbeatPath).events.exit, 1);
+});
+
+test('actively recycled session is not also reported as passive exit', async (t) => {
+  const m = await setupMachine(t, { autoRenew: false, autoMinId: false });
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  staleLog();
+  m.deps.readTasks = recycleTasks();
+  const logs = [];
+  m.deps.log = (msg) => logs.push(msg);
+  await m.patrol();
+  assert.ok(logs.some((x) => x.startsWith(`回收 ${WS} pid=${pid}`)));
+  assert.ok(!logs.some((x) => x.includes('会话退出') && x.includes(`pid=${pid}`)),
+    '主动回收不能再被记一次被动退出');
+});

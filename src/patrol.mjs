@@ -16,8 +16,15 @@ import {
   SESSION_RECYCLE_IDLE_SECONDS,
   SESSION_FIRE_MARGIN_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
+  HEARTBEAT_STALE_FACTOR,
 } from './constants.mjs';
-import { loadConfig, loadState, saveState } from './config.mjs';
+import {
+  loadConfig,
+  loadState,
+  saveState,
+  loadHeartbeat,
+  saveHeartbeat,
+} from './config.mjs';
 import { maintainWorkspace, TaskFileChanged } from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wanted } from './cron.mjs';
 import {
@@ -25,7 +32,27 @@ import {
   sessionLogIdleSeconds,
   scriptProcLogPath,
 } from './sessions.mjs';
-import { TASK_REL } from './paths.mjs';
+import { TASK_REL, packageVersion } from './paths.mjs';
+import { elapsedZh } from './display.mjs';
+
+// 事件类型 → 轮末汇总里的中文标签。patrolWorkspace 与 cmdRun 往同一个
+// stats 计数器里记账，平静轮也会打出「本轮无动作」。
+const EVENT_LABELS = [
+  ['spawn', '启动'],
+  ['recycle', '回收'],
+  ['ageout', '换代'],
+  ['exit', '自行退出'],
+  ['stuck', '卡死退休'],
+  ['adopt', '接管'],
+  ['fail', '启动失败'],
+  ['cool', '进入冷却'],
+  ['warn', '告警'],
+  ['error', '错误'],
+];
+
+function bump(stats, kind) {
+  if (stats) stats[kind] = (stats[kind] ?? 0) + 1;
+}
 
 export function log(msg) {
   const d = new Date();
@@ -144,17 +171,23 @@ function needHorizonMs(tasks, now) {
 // cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。
 export async function patrolWorkspace(
   ws, state, now, leadMs, cur, consumers, scriptProcs = [],
-  retain = 'always',
+  retain = 'always', stats = null,
 ) {
   const tasks = deps.readTasks(ws);
   let ent = state[ws] ?? null;
+  // 边记日志边给轮末汇总记账：日志给人翻，stats 给轮首/轮末心跳行一个
+  // 紧凑全貌。stats 为 null（直接单测）时退化为纯日志。
+  const note = (kind, msg) => {
+    bump(stats, kind);
+    deps.log(msg);
+  };
 
   if (tasks === null) {
     // 任务文件读不出：证据太弱，绝不动会话；但不能不吭声——文件还在却读
     // 不出意味着这个目录的定时任务一个都不会执行。文件已消失则是正常竞
     // 态（一次性任务执行完被删），不报。
     if (fs.existsSync(path.join(ws, TASK_REL))) {
-      deps.log(`任务文件读不出 ${ws}：格式损坏或不可读，本轮跳过该目录，`
+      note('warn', `任务文件读不出 ${ws}：格式损坏或不可读，本轮跳过该目录，`
         + `其中 ${TASK_REL} 里的定时任务都不会执行`);
     }
     return;
@@ -166,7 +199,7 @@ export async function patrolWorkspace(
     if (ent !== null) {
       if (deps.trackedAlive(ent)) {
         await deps.stopSession(ent);
-        deps.log(`回收 ${ws} pid=${ent.pid}：任务已全部清空，结束保活会话`);
+        note('recycle', `回收 ${ws} pid=${ent.pid}：任务已全部清空，结束保活会话`);
       }
       delete state[ws];
     }
@@ -182,7 +215,7 @@ export async function patrolWorkspace(
         && sessionLogIdleSeconds(
           ent.log || sessionLogPath(ws), cur) > SESSION_IDLE_SECONDS) {
       await deps.stopSession(ent);
-      deps.log(`换代 ${ws} pid=${ent.pid}：会话已连续运行 `
+      note('ageout', `换代 ${ws} pid=${ent.pid}：会话已连续运行 `
         + `${Math.floor(age / 86400)} 天且近期无输出，结束后按需重拉`);
       delete state[ws];
       ent = null;
@@ -212,7 +245,7 @@ export async function patrolWorkspace(
         > SESSION_FIRE_MARGIN_SECONDS * 1000) {
     const pid = ent.pid;
     await deps.stopSession(ent);
-    deps.log(`回收 ${ws} pid=${pid}：本代任务已执行完毕且界面静默，`
+    note('recycle', `回收 ${ws} pid=${pid}：本代任务已执行完毕且界面静默，`
       + '结束会话，下次需要时重拉');
     delete state[ws];
     ent = null;
@@ -248,7 +281,7 @@ export async function patrolWorkspace(
     const age = cur - (ent.startedAt ?? cur);
     if (age <= WARMUP_GRACE_SECONDS) return;
     await deps.stopSession(ent);
-    deps.log(`卡死 ${ws} pid=${ent.pid}：进程已存活 ${age} 秒仍未登记会话，`
+    note('stuck', `卡死 ${ws} pid=${ent.pid}：进程已存活 ${age} 秒仍未登记会话，`
       + '已终止（排查：cron-up logs '
       + `${path.basename(ws)}）`);
   }
@@ -272,7 +305,7 @@ export async function patrolWorkspace(
       fails,
       cooldownUntil: cur + COOLDOWN_SECONDS,
     };
-    deps.log(`冷却 ${ws}：仍有任务需要会话，但保活会话连续失败 ${fails} 次，`
+    note('cool', `冷却 ${ws}：仍有任务需要会话，但保活会话连续失败 ${fails} 次，`
       + `暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
     return;
   }
@@ -294,7 +327,7 @@ export async function patrolWorkspace(
           fails: 0,
           log: logPath,
         };
-        deps.log(`接管 ${ws} pid=${procPid}：state 记录缺失，但进程表里仍有`
+        note('adopt', `接管 ${ws} pid=${procPid}：state 记录缺失，但进程表里仍有`
           + '本工作区的保活会话，重新纳入跟踪');
         return;
       }
@@ -313,7 +346,7 @@ export async function patrolWorkspace(
       fails: newFails,
       log: sessionLogPath(ws),
     };
-    deps.log(`启动失败 ${ws}：会话进程没有拉起（连续失败计数 ${newFails}）`);
+    note('fail', `启动失败 ${ws}：会话进程没有拉起（连续失败计数 ${newFails}）`);
     return;
   }
   state[ws] = {
@@ -323,7 +356,7 @@ export async function patrolWorkspace(
     fails,
     log: sessionLogPath(ws),
   };
-  deps.log(`已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
+  note('spawn', `已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
 }
 
 // 跑一轮巡检；抢不到锁返回 false。
@@ -333,25 +366,76 @@ export async function cmdRun(args) {
     deps.log('已有一轮巡检在进行，本轮跳过');
     return false;
   }
+  // 包一层 stopSession 记下本轮主动结束的 pid：轮末凭它区分「我们回收的」
+  // 与「会话自行退出/被外部杀掉的」，后者以前是无声丢失。finally 还原。
+  const prevStopSession = deps.stopSession;
+  const stoppedPids = new Set();
+  deps.stopSession = async (ent) => {
+    if (ent?.pid) stoppedPids.add(ent.pid);
+    return prevStopSession(ent);
+  };
   try {
+    const startedAtMs = Date.now();
+    const stats = {};
     deps.rotatePatrolLogs();
     const cfg = loadConfig(args?.config ?? deps.paths.configPath);
     const now = new Date();
     const leadMs = cfg.leadSeconds * 1000;
     const state = loadState();
+    const cur = Math.floor(Date.now() / 1000);
+
+    // 轮首心跳：没有这两行，launchd 拉不起巡检（启动脚本失效、node 缺失）
+    // 时日志会一片寂静，无法和「平安无事」区分。上轮心跳过老说明中间漏
+    // 轮——休眠期间错过的 StartInterval，launchd 醒来只补跑一轮。
+    const hb = loadHeartbeat();
+    if (hb !== null
+        && cur - hb.ranAt > cfg.intervalSeconds * HEARTBEAT_STALE_FACTOR) {
+      bump(stats, 'warn');
+      deps.log(`距上次巡检已 ${elapsedZh(cur - hb.ranAt)}，超过 `
+        + `${HEARTBEAT_STALE_FACTOR} 个轮次间隔（${cfg.intervalSeconds} 秒），`
+        + '期间 launchd 可能漏轮（常见于电脑休眠）');
+    }
+    deps.log(`巡检开始：${cfg.sessionRetain} 模式，扫描根目录 `
+      + `${cfg.roots.length} 个`);
     if (cfg.roots.length === 0) {
+      bump(stats, 'warn');
       deps.log('警告：扫描目录 roots 为空，巡检不会发现任何工作区；'
         + '请检查配置文件或用 install --roots 指定');
     }
 
-    const cur = Math.floor(Date.now() / 1000);
+    // 轮初拍一份「上轮末仍相信活着」的会话快照（entry 复制，本轮原地改写
+    // 不影响），分成「轮初已没气」与「轮初还活着」两组。不能只收此刻
+    // kill -0 成功的——两轮之间崩溃正是最典型的被动死亡，本轮开始时它早
+    // 已没气；带 deadSince 的是上轮已报过死亡的旧条目，跳过以免每轮重复报。
+    const prevTracked = Object.entries(state)
+      .filter(([, ent]) => ent.pid && !ent.deadSince)
+      .map(([ws, ent]) => [ws, { ...ent }]);
+    const prevDead = prevTracked.filter(([, ent]) => !deps.trackedAlive(ent));
+    const prevAlive = prevTracked.filter(([, ent]) => deps.trackedAlive(ent));
+    const exitLine = (ws, old) => `会话退出 ${ws} pid=${old.pid}：非巡检主动结束`
+      + `（已存活 ${elapsedZh(cur - (old.startedAt ?? cur))}），可能自行退出或`
+      + '被外部终止；若反复出现请用 cron-up logs '
+      + `${path.basename(ws)} 排查启动过程`;
+
     // 登记每轮只读一次：否则每个工作区都要 readdir + ps 一遍，自检也归
     // 属这里。
     const [consumers, registryAlert] = await deps.scanSessions();
-    if (registryAlert) deps.log(`告警：${registryAlert}`);
+    if (registryAlert) {
+      bump(stats, 'warn');
+      deps.log(`告警：${registryAlert}`);
+    }
     const scriptProcs = deps.listScriptProcesses();
 
+    // 轮间死亡在进入工作区循环前先报：随后该工作区若需要会话会打印重拉，
+    // 日志时间线就是「退出 → 重拉」，而不是反过来。
+    for (const [ws, old] of prevDead) {
+      bump(stats, 'exit');
+      deps.log(exitLine(ws, old));
+    }
+
+    let found = 0;
     for (const [ws, taskfile] of deps.discover(cfg.roots, cfg.maxDepth)) {
+      found += 1;
       // 一个工作区读不动不能中断整轮：discover 是生成器，这里抛了会跳过
       // 后面所有工作区。续期/改 id 与保活各自独立守卫——维护失败绝不压制
       // 该工作区的会话保活。两者合并为同一次原子写（见 maintainWorkspace）。
@@ -372,6 +456,7 @@ export async function cmdRun(args) {
               + 'always 模式换代）后才读到新 id');
           }
         } catch (e) {
+          bump(stats, e instanceof TaskFileChanged ? 'warn' : 'error');
           if (e instanceof TaskFileChanged) {
             deps.log(`维护暂缓 ${ws}：任务文件刚被 Claude Code 改动，`
               + '本轮不覆盖，下轮再来');
@@ -383,10 +468,23 @@ export async function cmdRun(args) {
       try {
         await patrolWorkspace(
           ws, state, now, leadMs, cur, consumers, scriptProcs,
-          cfg.sessionRetain);
+          cfg.sessionRetain, stats);
       } catch (e) {
+        bump(stats, 'error');
         deps.log(`错误 ${ws}：${e.constructor.name}：${e.message}`);
       }
+    }
+
+    // 轮中死亡：轮初还活着、轮末复核没气、又不是本轮主动 stop 的。指纹复
+    // 核由 trackedAlive 完成（带 procStart 指纹，pid 回收不会误报）。主动
+    // 回收/换代/卡死有各自的日志，这里只补轮中自行消亡那一类；轮间死亡刚
+    // 才已在循环前报过。报过的死条目随后由 kept 过滤打上 deadSince，后续
+    // 轮次不会重复报。
+    for (const [ws, old] of prevAlive) {
+      if (stoppedPids.has(old.pid)) continue;
+      if (deps.trackedAlive(old)) continue;
+      bump(stats, 'exit');
+      deps.log(exitLine(ws, old));
     }
 
     // 丢掉已死且不处冷却的条目；保留冷却、活会话，以及带失败计数的死条
@@ -405,8 +503,28 @@ export async function cmdRun(args) {
       }),
     );
     saveState(kept);
+
+    // 轮末汇总：一行交代这轮看见了什么、动了什么、花了多久，随后更新心跳。
+    const actions = EVENT_LABELS
+      .filter(([kind]) => stats[kind])
+      .map(([kind, label]) => `${label} ${stats[kind]}`)
+      .join('、');
+    const durationMs = Date.now() - startedAtMs;
+    const durationZh = durationMs < 1000
+      ? `${durationMs} 毫秒` : `${(durationMs / 1000).toFixed(1)} 秒`;
+    deps.log(`巡检结束：发现 ${found} 个工作区，活动交互会话 ${consumers.size} `
+      + `个；本轮${actions || '无动作'}，耗时 ${durationZh}`);
+    saveHeartbeat({
+      ranAt: cur,
+      version: packageVersion(),
+      intervalSeconds: cfg.intervalSeconds,
+      sessionRetain: cfg.sessionRetain,
+      durationMs,
+      events: stats,
+    });
     return true;
   } finally {
+    deps.stopSession = prevStopSession;
     releaseLock(lock);
   }
 }
