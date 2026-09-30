@@ -7,7 +7,6 @@ import path from 'node:path';
 
 import { deps } from './internals.mjs';
 import {
-  LOG_ROTATE_BYTES,
   SESSION_IDLE_SECONDS,
 } from './constants.mjs';
 
@@ -98,10 +97,12 @@ export function spawnSession(ws) {
   } catch {
     // 目录权限维持现状。
   }
-  // script(1) 不带 O_APPEND 打开 typescript，下次 spawn 会截断，所以只轮
-  // 转仍在增长的会话留下的超大日志。
+  // window 模式下「一代会话 = 一次执行」：script(1) 打开即截断，不轮转的
+  // 话上一代（上一次任务执行）的界面记录会随本次拉起被抹掉。无条件保留
+  // 一代（.1）——总量上界两代，活着的一代增长再快也只影响自身，不会经
+  // 轮转放大。
   try {
-    if (fs.existsSync(logPath) && fs.statSync(logPath).size > LOG_ROTATE_BYTES) {
+    if (fs.existsSync(logPath)) {
       const old = `${logPath}.1`;
       fs.rmSync(old, { force: true });
       fs.renameSync(logPath, old);

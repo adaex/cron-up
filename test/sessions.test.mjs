@@ -72,6 +72,23 @@ test('spawn that never started returns null, not a pid-less record', (t) => {
   assert.equal(spawnSession(ws), null);
 });
 
+test('spawn rotates the previous generation log to .1', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  deps.procStartedAt = () => 'start';
+  deps.spawn = () => ({ pid: 4242, on() {}, unref() {} });
+  const ws = path.join(tmp, 'proj');
+  fs.mkdirSync(ws);
+  const log = sessionLogPath(ws);
+  spawnSession(ws);
+  // script(1) 打开即截断：不轮转的话，window 模式下上一次执行的界面记录
+  // 会随下一代拉起被抹掉。
+  fs.writeFileSync(log, '上一代的界面记录\n');
+  spawnSession(ws);
+  assert.equal(fs.readFileSync(`${log}.1`, 'utf-8'), '上一代的界面记录\n');
+});
+
 test('buildChildEnv is a pure function', () => {
   const env = { CLAUDE_CODE_X: '1', KEEP: '2' };
   const out = buildChildEnv(env);
