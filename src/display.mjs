@@ -5,6 +5,7 @@ import {
   taskIsOneshot,
   wanted,
   predictedFire,
+  recurringTailWindow,
 } from './cron.mjs';
 import { DISPLAY_SEARCH_DAYS, ZERO_LEAD_MS } from './constants.mjs';
 
@@ -89,13 +90,21 @@ export function taskView(task, now, leadMs = undefined) {
       fire: null,
     };
   }
-  const nxt = cron.nextAfter(now, DISPLAY_SEARCH_DAYS);
   const oneshot = taskIsOneshot(task);
-  // nxt 按定义严格晚于 now，「已错过」完全由补执行判定回答。
+  // nxt 按定义不晚于展示语境里的下一次投递，「已错过」完全由补执行判定
+  // 回答。
   const missed = oneshot && wanted(cron, task, now, ZERO_LEAD_MS);
+  // 周期任务的投递尾窗内，即将到来的投递属于上一落点：展示落点对齐到
+  // 那个已过的 slot，箭头才画得出「09:00 → 09:30」，而不是从明天的落点
+  // 拐回来（2 月 29 日任务尾窗内 nextAfter 甚至找不到下一落点）。fire 与
+  // 落点同源，两边不会各说各话。
+  const tail = oneshot ? null : recurringTailWindow(cron, task?.id, now);
+  const nxt = tail ? tail[0] : cron.nextAfter(now, DISPLAY_SEARCH_DAYS);
   return {
     valid: true,
-    nxt,
+    // 已错过的一次性任务没有未来触发：nxt 置 null，否则「一年内无」的判
+    // 断和总览「最近」（fire ?? nxt）会把它当成明年同刻的安排。
+    nxt: missed ? null : nxt,
     missed,
     kind: oneshot ? '一次性' : '周期',
     permanent: Boolean(task.permanent) && !oneshot,
@@ -105,8 +114,9 @@ export function taskView(task, now, leadMs = undefined) {
     // 都是 null，键的形状不随参数变化。
     wanted: leadMs !== undefined ? wanted(cron, task, now, leadMs) : null,
     // 计入 Claude Code 投递抖动后的预计实际触发时刻；已错过的一次性任务
-    // 没有未来触发，为 null。与 nxt 同为 Date 或 null。
-    fire: missed ? null : predictedFire(task, now),
+    // 没有未来触发，为 null；尾窗内的周期任务是即将到来的这次延迟投递。
+    // 与 nxt 同为 Date 或 null。
+    fire: missed ? null : (tail ? new Date(tail[1]) : predictedFire(task, now)),
   };
 }
 

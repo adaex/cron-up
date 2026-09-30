@@ -1,7 +1,12 @@
 // 分钟级 cron 解析与下一次触发计算。字段全是别的程序写的，畸形表达式在
 // 边界处返回 null/不可满足，绝不抛进巡检循环。
 
-import { SEARCH_DAYS, DISPLAY_SEARCH_DAYS, CC_JITTER } from './constants.mjs';
+import {
+  SEARCH_DAYS,
+  DISPLAY_SEARCH_DAYS,
+  CC_JITTER,
+  TAIL_WINDOW_DAYS,
+} from './constants.mjs';
 
 const MS_DAY = 86400_000;
 const MS_MINUTE = 60_000;
@@ -24,8 +29,12 @@ export function parseCronField(expr, lo, hi) {
     const slash = token.indexOf('/');
     if (slash >= 0) {
       rng = token.slice(0, slash);
-      step = strictInt(token.slice(slash + 1)); // "/0" 必须抛：步进 0 会死循环
-      if (step === 0) throw new Error('cron 步进不能为 0');
+      step = strictInt(token.slice(slash + 1));
+      // 步进必须显式卡正数：strictInt 接受负号，0 让步进循环原地打转、
+      // 负数让 v+=step 递减、v<=end 恒真——两者都是永不退出的死循环，
+      // 而一个含 "/-5" 的任务文件就能挂死整轮巡检。拒绝后由
+      // parseCronOrNone 读作「cron 无效」。
+      if (!(step > 0)) throw new Error('cron 步进必须是正整数');
     } else {
       rng = token;
       step = 1;
@@ -209,15 +218,9 @@ function wanted(cron, task, now, leadMs) {
   // 周期任务：投递不是在落点，而是落点 + 按 id 确定的抖动（每日任务通常
   // 30 分）。落点已过、抖动投递时刻未到的这段「投递尾窗」里会话仍必须在
   // 场——否则 window 模式会把执行完近邻任务后空闲下来的会话回收且不重
-  // 拉，让本次触发漏跑（周期任务没有补执行）。找上一落点用 366 天窗口，
-  // 覆盖月/年任务；prevAtOrBefore 有日历快进，不贵。
-  const prev = cron.prevAtOrBefore(now, DISPLAY_SEARCH_DAYS);
-  if (prev !== null) {
-    const fireAt = prev.getTime()
-      + recurringDelayMs(cron, prev, task.id, DISPLAY_SEARCH_DAYS + 1);
-    if (now.getTime() < fireAt) return true;
-  }
-  return false;
+  // 拉，让本次触发漏跑（周期任务没有补执行）。机制与窗口口径见
+  // recurringTailWindow。
+  return recurringTailWindow(cron, task.id, now) !== null;
 }
 
 // 任务是否需要已预热的会话。任务字段全是别的程序写的，畸形条目读作「不
@@ -241,17 +244,19 @@ export function taskIdHash(taskId) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// 任务按 Claude Code 的抖动规则预计的实际触发时刻；cron 无效、不可满足或
-// 窗口内没有落点时返回 null。基准为 now（上游调度器以上次触发时刻为基
-// 准，展示只关心从现在起的下一次，两者算出的落点一致）。
+// 任务按 Claude Code 的抖动规则预计的实际触发时刻；cron 无效、不可满足且
+// 不在尾窗内、窗口内没有落点时返回 null。落点已过、投递未到的尾窗里答
+// 「正在等待的这次投递」（上一落点 + 抖动），而不是下个落点。基准为 now
+// （上游调度器以上次触发时刻为基准，展示只关心从现在起的下一次，两者算
+// 出的落点一致）。
 export function predictedFire(task, now, withinDays = DISPLAY_SEARCH_DAYS) {
   const cron = parseCronOrNone(task?.cron);
   if (cron === null || !cron.satisfiable) return null;
-  const i = cron.nextAfter(now, withinDays);
-  if (i === null) return null;
   const h = taskIdHash(task?.id);
 
   if (taskIsOneshot(task)) {
+    const i = cron.nextAfter(now, withinDays);
+    if (i === null) return null;
     // 复刻 Wsn()：只有落点分钟落在 :00/:30 网格上才提前一个按哈希缩放的
     // 小量（0~90 秒），其余分钟整点不抖；提前量不越过 now。
     if (i.getMinutes() % CC_JITTER.oneShotMinuteMod !== 0) return i;
@@ -260,6 +265,16 @@ export function predictedFire(task, now, withinDays = DISPLAY_SEARCH_DAYS) {
     return new Date(Math.max(i.getTime() - ahead, now.getTime()));
   }
 
+  // 尾窗内的周期任务：下一次真实投递是「上一落点 + 抖动」，数分钟内就
+  // 到，不是 nextAfter 给出的下个落点——后者严格在未来，会把展示拐到明
+  // 天（list 的落点列由 taskView 用 recurringTailWindow 对齐同一落点）。
+  // 先于窗口检查：2 月 29 日这类长周期任务的下一落点可能在展示窗口之
+  // 外，正在等待的投递却依然成立。
+  const tail = recurringTailWindow(cron, task?.id, now);
+  if (tail !== null) return new Date(tail[1]);
+
+  const i = cron.nextAfter(now, withinDays);
+  if (i === null) return null;
   // 复刻 bOt()：抖动按「本落点到下一落点」的周期比例缩放并封顶。nextAfter
   // 语义是严格晚于入参（内部进位一分钟），传 slot 本身即取下一落点；窗口
   // 边缘取不到时与上游一致：视为无后续，不抖动。
@@ -280,4 +295,17 @@ export function recurringDelayMs(cron, slot, taskId, withinDays = SEARCH_DAYS) {
     taskIdHash(taskId) * CC_JITTER.recurringFrac * period,
     CC_JITTER.recurringCapMs,
   );
+}
+
+// 周期任务的「投递尾窗」判定：上一落点已过、按 id 算的延迟投递时刻未
+// 到。返回 [落点, 投递时刻 ms]；不在尾窗、找不到上一或下一落点返回
+// null。wanted（保活判定）与 predictedFire/taskView（展示）共用这一口径，
+// 两边不会各说各话；窗口取 TAIL_WINDOW_DAYS，理由见 constants。
+export function recurringTailWindow(cron, taskId, now) {
+  const prev = cron.prevAtOrBefore(now, TAIL_WINDOW_DAYS);
+  if (prev === null) return null;
+  const fireMs = prev.getTime()
+    + recurringDelayMs(cron, prev, taskId, TAIL_WINDOW_DAYS);
+  if (now.getTime() >= fireMs) return null;
+  return [prev, fireMs];
 }

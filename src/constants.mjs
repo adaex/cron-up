@@ -98,6 +98,13 @@ export const CC_JITTER = {
 // maxN，常量只保留「目标延迟」这一个可调项。
 export const AUTO_MIN_ID_TARGET_DELAY_MS = 60 * 1000;
 
+// 投递尾窗判定的回看/前探窗口（wanted 与 predictedFire 共用，见
+// src/cron.mjs 的 recurringTailWindow）：找上一落点用 prevAtOrBefore、算
+// 周期用 nextAfter，两个方向都要罩住月/年任务之外的 2 月 29 日——相邻落
+// 点隔 4 年，世纪非闰年（2100）隔 8 年；窗口小了尾窗会塌缩成零：落点已
+// 过、投递未到，死亡却不重拉。日历快进按月跳，十年窗口也只有百余次迭代。
+export const TAIL_WINDOW_DAYS = 366 * 10 + 1;
+
 // 定时任务 7 天过期（周期任务被调度器删除，一次性任务早就触发过），巡检
 // 不需要看得更远。展示页另算。
 export const SEARCH_DAYS = 7;

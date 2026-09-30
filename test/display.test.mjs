@@ -39,3 +39,27 @@ test('taskView carries a predicted fire time', () => {
   // 下一落点 09-21 13:00，顶格 30 分钟 → 09-21 13:30。
   assert.equal(v.fire.getTime(), new Date(2026, 8, 21, 13, 30, 0).getTime());
 });
+
+test('taskView aligns the slot to the pending tail delivery', () => {
+  // 落点 15:30 已过、顶格 id 投递 16:00 未到：nxt 对齐今天 15:30（而非
+  // 明天的落点），fire 是今天 16:00——「15:30 → 16:00」箭头画得出，排序
+  // 也把它当最临近的事。
+  const now = new Date(2026, 8, 20, 15, 47);
+  const v = taskView(
+    { id: 'c1363d8b', cron: '30 15 * * *', recurring: true }, now);
+  assert.equal(v.nxt.getTime(), new Date(2026, 8, 20, 15, 30, 0).getTime());
+  assert.equal(v.fire.getTime(), new Date(2026, 8, 20, 16, 0, 0).getTime());
+});
+
+test('missed one-shot has no next slot', () => {
+  // 已错过的一次性任务：nxt 必须为 null，否则「一年内无」的判断和总览
+  // 「最近」（fire ?? nxt）会把它当成明年同刻的安排。
+  const now = new Date(2026, 8, 20, 15, 47);
+  const v = taskView({
+    id: 'c1363d8b', cron: '30 8 20 9 *', recurring: false,
+    createdAt: now.getTime() - 86400_000,
+  }, now);
+  assert.equal(v.missed, true);
+  assert.equal(v.nxt, null);
+  assert.equal(v.fire, null);
+});

@@ -6,6 +6,7 @@ import { performance } from 'node:perf_hooks';
 import {
   Cron,
   parseCronField,
+  parseCronOrNone,
   taskIsOneshot,
   taskWanted,
   wanted,
@@ -27,6 +28,16 @@ test('step ranges', () => {
     dt(2026, 9, 20, 15, 50));
   assert.equal(new Cron('3,33 * * * *').nextAfter(NOW)?.getTime(),
     dt(2026, 9, 20, 16, 3));
+});
+
+test('non-positive step is rejected, not hung on', () => {
+  // strictInt 接受负号，而负步进让步进循环里 v+=step 递减、v<=end 恒真
+  // ——永不退出的死循环，一个含 "/-5" 的任务文件就能挂死整轮巡检。全部
+  // 读作「cron 无效」；这个测试能跑完本身即证明没有被挂住。
+  for (const expr of ['*/0 * * * *', '*/-5 * * * *', '0-30/-2 * * * *',
+    '5/-2 * * * *']) {
+    assert.equal(parseCronOrNone(expr), null, expr);
+  }
 });
 
 test('rolls to next day', () => {
@@ -404,4 +415,36 @@ test('wanted tail window is bounded by the actual delay, not the 30m cap', () =>
     { id: '058e0149', recurring: true }, at(15, 44), 0), true);
   assert.equal(wanted(new Cron(cron),
     { id: '058e0149', recurring: true }, at(15, 46), 0), false);
+});
+
+test('predictedFire answers the pending tail delivery, not the next slot', () => {
+  // NOW 15:47：落点 15:30 已过、顶格 id 的投递点 16:00 未到——预计触发是
+  // 今天 16:00，而不是明天的落点 + 抖动。落点与预计同刻的任务文件里
+  // list 会画出「15:30 → 16:00」（见 display 测试的落点对齐）。
+  const task = { id: 'c1363d8b', cron: '30 15 * * *', recurring: true };
+  assert.equal(predictedFire(task, NOW).getTime(),
+    new Date(2026, 8, 20, 16, 0, 0).getTime());
+  // 尾窗一过（16:30），回到下一落点 + 抖动：明天 15:30 → 16:00。
+  const after = new Date(2026, 8, 20, 16, 30, 0);
+  assert.equal(predictedFire(task, after).getTime(),
+    new Date(2026, 8, 21, 16, 0, 0).getTime());
+});
+
+test('tail window survives multi-year slot gaps (Feb 29)', () => {
+  // 2028-02-29 09:15：上一落点在 1461 天前（2024-02-29），任何 366 天窗口
+  // 都找不到它，尾窗会塌缩成零——wanted 仍须答 true、predictedFire 仍须
+  // 答今天 09:30（顶格 30 分钟）；且下一落点（2032 年）在展示窗口之外，
+  // predictedFire 不能先死在窗口检查上。
+  const now = new Date(2028, 1, 29, 9, 15, 0);
+  const task = { id: 'c1363d8b', cron: '0 9 29 2 *', recurring: true };
+  assert.equal(taskWanted(task, now, 0), true);
+  assert.equal(predictedFire(task, now).getTime(),
+    new Date(2028, 1, 29, 9, 30, 0).getTime());
+  // 投递一过，回正常的「下一落点」口径：2032-02-29 超出 366 天展示窗
+  // 口，predictedFire 如实答 null（「一年内无」）——但尾窗判定不受影响，
+  // 明年同日再次进入尾窗时仍能保住会话。
+  const after = new Date(2028, 1, 29, 10, 0, 0);
+  assert.equal(predictedFire(task, after), null);
+  const nextYear = new Date(2029, 1, 28, 9, 15, 0);
+  assert.equal(taskWanted(task, nextYear, 0), false);
 });
