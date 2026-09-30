@@ -184,13 +184,10 @@ export async function patrolWorkspace(
   const cooling = Boolean(ent && (ent.cooldownUntil ?? 0) > cur);
 
   if (consumers.has(ws)) {
-    // 任务正在被消费。区分我们的预热会话与用户的交互会话：前者继续跟踪
-    // （活消费者证明健康 → 计数清零），后者放手——但不在这里删死条目，失败
-    // 计数要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），
-    // 由轮末 kept 过滤统一处理。
-    if (ent !== null && mineAlive) {
-      ent.fails = 0;
-    }
+    // 任务正在被消费。可能是我们的预热会话（已登记——上面的健康清零已覆
+    // 盖），也可能是用户的交互会话——后者放手：不在这里删死条目，失败计数
+    // 要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），由轮
+    // 末 kept 过滤统一处理。
     return;
   }
 

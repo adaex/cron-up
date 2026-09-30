@@ -165,7 +165,9 @@ const COMMANDS = [
 export async function cmdOverview(args) {
   const cols = deps.terminalWidth();
   const v = packageVersion();
-  deps.print(`cron-up ${v ?? ''} —— 为定时任务提前备好交互会话`);
+  deps.print(v === null
+    ? 'cron-up —— 为定时任务提前备好交互会话'
+    : `cron-up ${v} —— 为定时任务提前备好交互会话`);
 
   const cfgPath = args?.config ?? deps.paths.configPath;
   let cfg = null;
