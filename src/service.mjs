@@ -244,6 +244,13 @@ export function launcherHealth() {
 // ---- install / uninstall ----
 
 export async function cmdInstall(args) {
+  // --config 在这里只会造成误解：install 写盘、launchd 每轮读取的都是固定
+  // 路径的配置，指定别的路径不改变任何行为——静默忽略等于让人以为装到了
+  // 别处。查询与巡检命令（run/renew/list/总览）才真正支持 --config。
+  if (args.config !== undefined) {
+    throw new ExitError(2, 'install 不支持 --config：配置与 LaunchAgent 固定'
+      + `使用 ${deps.paths.configPath}，如需临时改配置请直接编辑该文件`);
+  }
   fs.mkdirSync(deps.paths.dataDir, { recursive: true });
   fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
   try {
@@ -379,6 +386,12 @@ export async function cmdInstall(args) {
 }
 
 export async function cmdUninstall(args) {
+  // 同 install：uninstall 动的是本机固定的安装产物，--config 只会让人以为
+  // 卸载的是另一套安装（--purge 删的也是真实目录）。
+  if (args.config !== undefined) {
+    throw new ExitError(2, 'uninstall 不支持 --config：卸载操作的是本机固定'
+      + `的安装产物（${deps.paths.plistPath} 等）`);
+  }
   const r = deps.launchctl('bootout', `${guiTarget()}/${LABEL}`);
   if (r.status === 0) deps.print('已从 launchd 卸载');
 

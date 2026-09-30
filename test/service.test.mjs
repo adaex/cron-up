@@ -244,6 +244,18 @@ test('zero lead is an explicit choice', async (t) => {
   assert.equal(s.cfg().leadSeconds, 0);
 });
 
+test('install rejects --config instead of silently ignoring it', async (t) => {
+  const s = await setupInstall(t);
+  await assert.rejects(s.install({ config: '/tmp/elsewhere.json' }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('--config'));
+    return true;
+  });
+  // 一行报错走人，不能留下半个安装。
+  assert.equal(fs.existsSync(s.deps.paths.configPath), false);
+});
+
 test('zero interval is rejected loudly and leaves config untouched', async (t) => {
   const s = await setupInstall(t);
   await s.install();
@@ -409,6 +421,17 @@ async function setupUninstall(t) {
     purge: false, keepSessions: false, ...kw });
   return { tmp, deps, stopped, lines, uninstall };
 }
+
+test('uninstall rejects --config instead of silently ignoring it', async (t) => {
+  const s = await setupUninstall(t);
+  await assert.rejects(s.uninstall({ config: '/tmp/elsewhere.json' }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('--config'));
+    return true;
+  });
+  assert.deepEqual(s.stopped, []);
+});
 
 test('sessions are stopped by default', async (t) => {
   const s = await setupUninstall(t);
