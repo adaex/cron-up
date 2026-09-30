@@ -13,11 +13,13 @@ import {
   WARMUP_GRACE_SECONDS,
   SESSION_MAX_AGE_SECONDS,
   SESSION_IDLE_SECONDS,
+  SESSION_RECYCLE_IDLE_SECONDS,
+  SESSION_FIRE_MARGIN_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
 } from './constants.mjs';
 import { loadConfig, loadState, saveState } from './config.mjs';
 import { renewWorkspace, TaskFileChanged } from './tasks.mjs';
-import { taskWanted } from './cron.mjs';
+import { taskWanted, parseCronOrNone, wanted } from './cron.mjs';
 import {
   sessionLogPath,
   sessionLogIdleSeconds,
@@ -124,9 +126,25 @@ export function rotatePatrolLogs() {
   }
 }
 
-// 保证一个工作区里有一个健康的消费者会话。原地修改 state。
+// 下次「需要会话在场」的时刻（ms）：各任务下次触发的最小值；有错过待补
+// 执行的一次性任务时视为立刻需要。窗口内无安排返回 Infinity。
+function needHorizonMs(tasks, now) {
+  let horizon = Infinity;
+  for (const t of tasks) {
+    const cron = parseCronOrNone(t?.cron);
+    if (cron === null) continue;
+    if (wanted(cron, t, now, 0)) return now.getTime();
+    const nxt = cron.nextAfter(now)?.getTime();
+    if (nxt !== undefined && nxt < horizon) horizon = nxt;
+  }
+  return horizon;
+}
+
+// 保证一个工作区里有一个健康的消费者会话。原地修改 state。retain 来自
+// cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。
 export async function patrolWorkspace(
   ws, state, now, leadMs, cur, consumers, scriptProcs = [],
+  retain = 'always',
 ) {
   const tasks = deps.readTasks(ws);
   let ent = state[ws] ?? null;
@@ -169,7 +187,40 @@ export async function patrolWorkspace(
       delete state[ws];
       ent = null;
       mineAlive = false;
+      // 消费者快照拍于轮初，被换代的这代可能正是快照里的消费者：重扫一
+      // 次，别让陈旧登记挡住下面的重拉。
+      const [fresh] = await deps.scanSessions();
+      consumers = fresh;
     }
+  }
+
+  // window 模式回收：会话生命周期对齐「一次执行」而非「常驻」。三个条件
+  // 缺一不可：本代会话期间真的有任务触发过（lastFiredAt 晚于 startedAt
+  // ——区分「执行完的空闲」与「等待触发的空闲」，后者是预热缓存在干活，
+  // 回收它只会每轮空转重拉）；界面静默超时（TUI 执行期间持续渲染，静默
+  // 即不在干活）；距下次需要会话还有余量（回收后同轮重拉，新会话来得及
+  // 登记，不会漏掉到点任务）。时间上重叠或紧邻的任务仍共享会话：任务路
+  // 由在 Claude Code 手里，同目录并发多会话无法指定归属，还有重复执行的
+  // 风险。回收不计失败——任务成功执行过是最强的健康证据，陈年计数一并
+  // 清零。
+  if (ent !== null && mineAlive && retain === 'window'
+      && tasks.some((t) => typeof t?.lastFiredAt === 'number'
+        && t.lastFiredAt > (ent.startedAt ?? 0) * 1000)
+      && sessionLogIdleSeconds(ent.log || sessionLogPath(ws), cur)
+        > SESSION_RECYCLE_IDLE_SECONDS
+      && needHorizonMs(tasks, now) - now.getTime()
+        > SESSION_FIRE_MARGIN_SECONDS * 1000) {
+    const pid = ent.pid;
+    await deps.stopSession(ent);
+    deps.log(`回收 ${ws} pid=${pid}：本代任务已执行完毕且界面静默，`
+      + '结束会话，下次需要时重拉');
+    delete state[ws];
+    ent = null;
+    mineAlive = false;
+    // 同上：快照里的消费者可能正是刚结束的这代。用户自己的会话若在场，
+    // 重扫依旧看见，不会在同目录双开。
+    const [fresh] = await deps.scanSessions();
+    consumers = fresh;
   }
 
   // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
@@ -322,7 +373,8 @@ export async function cmdRun(args) {
       }
       try {
         await patrolWorkspace(
-          ws, state, now, leadMs, cur, consumers, scriptProcs);
+          ws, state, now, leadMs, cur, consumers, scriptProcs,
+          cfg.sessionRetain);
       } catch (e) {
         deps.log(`错误 ${ws}：${e.constructor.name}：${e.message}`);
       }

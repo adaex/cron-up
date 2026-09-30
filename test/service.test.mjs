@@ -244,6 +244,19 @@ test('zero lead is an explicit choice', async (t) => {
   assert.equal(s.cfg().leadSeconds, 0);
 });
 
+test('session-retain flag validates and persists', async (t) => {
+  const s = await setupInstall(t);
+  await s.install({ sessionRetain: 'always' });
+  assert.equal(s.cfg().sessionRetain, 'always');
+  await assert.rejects(s.install({ sessionRetain: 'sometimes' }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 1);
+    return true;
+  });
+  // 与其他值域校验同一条纪律：被拒的安装不落盘。
+  assert.equal(s.cfg().sessionRetain, 'always');
+});
+
 test('install rejects --config instead of silently ignoring it', async (t) => {
   const s = await setupInstall(t);
   await assert.rejects(s.install({ config: '/tmp/elsewhere.json' }), (e) => {

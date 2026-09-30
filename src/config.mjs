@@ -70,6 +70,10 @@ export function configFieldErrors(cfg) {
     errs.push(['autoRenew',
       `autoRenew 应是布尔值（true/false），当前为 ${JSON.stringify(cfg.autoRenew)}`]);
   }
+  if (cfg.sessionRetain !== 'window' && cfg.sessionRetain !== 'always') {
+    errs.push(['sessionRetain',
+      `sessionRetain 应是 "window" 或 "always"，当前为 ${JSON.stringify(cfg.sessionRetain)}`]);
+  }
   return errs;
 }
 

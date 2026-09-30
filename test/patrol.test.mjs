@@ -22,7 +22,7 @@ import {
 
 const WS = '/x';
 
-async function setupMachine(t) {
+async function setupMachine(t, cfgExtra = {}) {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp, {
@@ -33,6 +33,7 @@ async function setupMachine(t) {
   const cfgPath = path.join(tmp, 'config.json');
   writeJson(cfgPath, {
     roots: [WS], maxDepth: 3, intervalSeconds: 300, leadSeconds: 600,
+    ...cfgExtra,
   });
   const alivePids = new Set();
   let nextPid = 100;
@@ -445,6 +446,139 @@ test('file vanished after discovery is not reported', async (t) => {
   await patrolWorkspace(ws, {}, new Date(), 0, Math.floor(Date.now() / 1000),
     new Set(), []);
   assert.deepEqual(logs, []);
+});
+
+// ---- window 模式回收 ----
+
+// 已触发过的远方任务 + 静默的界面记录：回收的标准背景。
+function recycleTasks(soonCron = null) {
+  const tasks = [{
+    cron: '0 9 1 1 *', recurring: true, createdAt: 0,
+    lastFiredAt: Date.now(),
+  }];
+  if (soonCron) {
+    tasks.push({ cron: soonCron, createdAt: Date.now(), recurring: false });
+  }
+  return () => tasks;
+}
+
+function staleLog() {
+  // spawnSession 是假的、不落日志文件：没有就先造一个（空文件 + 旧
+  // mtime），有则只把 mtime 拨回去。
+  const file = sessionLogPath(WS);
+  if (!fs.existsSync(file)) fs.writeFileSync(file, '');
+  const old = new Date(Date.now() - 3600_000);
+  fs.utimesSync(file, old, old);
+}
+
+test('window mode recycles an idle session after its task fired', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  staleLog();
+  m.deps.readTasks = recycleTasks();
+  await m.patrol();
+  assert.ok(!m.alivePids.has(pid), '执行完毕的会话被回收');
+  assert.ok(!(WS in m.state()), '无近窗口安排则不重拉');
+});
+
+test('recycle respawns in the same round when a window is still open', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid1 = m.state()[WS].pid;
+  staleLog();
+  // 4 分钟后要触发的任务：在 lead 窗口内、且超出回收余量——回收旧会话后
+  // 同一轮就要拉新会话，等下一轮可能就错过触发点了。
+  const soon = new Date(Date.now() + 4 * 60_000);
+  const soonCron = `${soon.getMinutes()} ${soon.getHours()} ${soon.getDate()} `
+    + `${soon.getMonth() + 1} *`;
+  m.deps.readTasks = recycleTasks(soonCron);
+  await m.patrol();
+  const ent = m.state()[WS];
+  assert.ok(!m.alivePids.has(pid1), '旧会话被回收');
+  assert.ok(ent && ent.pid !== pid1, '同轮重拉了新会话');
+  assert.equal(ent.fails, 0, '回收不计失败');
+});
+
+test('busy session is never recycled', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  fs.writeFileSync(sessionLogPath(WS), 'still rendering\n'); // mtime 即现在
+  m.deps.readTasks = recycleTasks();
+  await m.patrol();
+  assert.ok(m.alivePids.has(pid), '日志新鲜 = 可能在执行，不动');
+});
+
+test('waiting warm session is not recycled before anything fires', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  staleLog();
+  m.deps.readTasks = () => [
+    { cron: '0 9 1 1 *', recurring: true, createdAt: 0 }, // 无 lastFiredAt
+  ];
+  await m.patrol();
+  assert.ok(m.alivePids.has(pid), '等待触发的空闲是预热缓存在干活，保留');
+});
+
+test('session nearing its next fire is kept for reuse', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  staleLog();
+  // 下次触发 60 秒后，小于回收余量：宁可直接复用现有会话。
+  const soon = new Date(Date.now() + 60_000);
+  const soonCron = `${soon.getMinutes()} ${soon.getHours()} ${soon.getDate()} `
+    + `${soon.getMonth() + 1} *`;
+  m.deps.readTasks = recycleTasks(soonCron);
+  await m.patrol();
+  assert.equal(m.state()[WS].pid, pid, '距下次触发太近，不回收');
+});
+
+test('pending missed one-shot blocks recycle', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  staleLog();
+  const past = new Date(Date.now() - 86400_000);
+  const pastCron = `${past.getMinutes()} ${past.getHours()} ${past.getDate()} `
+    + `${past.getMonth() + 1} *`;
+  m.deps.readTasks = () => [
+    { cron: '0 9 1 1 *', recurring: true, createdAt: 0,
+      lastFiredAt: Date.now() },
+    { cron: pastCron, createdAt: Date.now() - 2 * 86400_000, recurring: false },
+  ];
+  await m.patrol();
+  assert.ok(m.alivePids.has(pid), '错过待补执行的任务需要会话，不能回收');
+});
+
+test('always mode keeps the session resident', async (t) => {
+  const m = await setupMachine(t, { sessionRetain: 'always' });
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  staleLog();
+  m.deps.readTasks = recycleTasks();
+  await m.patrol();
+  assert.ok(m.alivePids.has(pid));
+  assert.equal(m.state()[WS].pid, pid);
+});
+
+test('our session recycles beside a user session without respawning', async (t) => {
+  const m = await setupMachine(t);
+  await m.patrol();
+  const pid = m.state()[WS].pid;
+  m.holder.consumer = true; // 用户会话在场：快照与重扫都看见
+  staleLog();
+  const soon = new Date(Date.now() + 4 * 60_000);
+  const soonCron = `${soon.getMinutes()} ${soon.getHours()} ${soon.getDate()} `
+    + `${soon.getMonth() + 1} *`;
+  m.deps.readTasks = recycleTasks(soonCron);
+  const spawnedBefore = m.nextPid;
+  await m.patrol();
+  assert.ok(!m.alivePids.has(pid), '我们的一代会被回收');
+  assert.equal(m.nextPid, spawnedBefore, '用户会话在场时不重拉，避免同目录双开');
+  assert.ok(!(WS in m.state()));
 });
 
 // ---- 日志轮转 ----

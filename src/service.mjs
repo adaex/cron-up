@@ -280,6 +280,7 @@ export async function cmdInstall(args) {
     if (args.interval !== undefined) ignored.push('--interval');
     if (args.lead !== undefined) ignored.push('--lead');
     if (args.autoRenew !== undefined) ignored.push('--auto-renew');
+    if (args.sessionRetain !== undefined) ignored.push('--session-retain');
     if (ignored.length > 0) {
       deps.print(`警告：参数 ${ignored.join('、')} 未生效（现有配置保留）；`
         + '要更新这些字段请带 --force 重跑，--force 只覆盖显式给出的字段');
@@ -337,6 +338,13 @@ export async function cmdInstall(args) {
       overrides.leadSeconds = args.lead;
     }
     if (args.autoRenew !== undefined) overrides.autoRenew = args.autoRenew;
+    if (args.sessionRetain !== undefined) {
+      if (args.sessionRetain !== 'window' && args.sessionRetain !== 'always') {
+        deps.printErr(`--session-retain 只接受 window 或 always，当前为 ${JSON.stringify(args.sessionRetain)}`);
+        throw new ExitError(1);
+      }
+      overrides.sessionRetain = args.sessionRetain;
+    }
     cfg = { ...cfg, ...overrides };
     cfg.roots = normalizeRoots(cfg.roots ?? []);
     saveConfig(cfg);

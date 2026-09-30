@@ -14,6 +14,11 @@ export const DEFAULT_CONFIG = {
   // 全部补标。配置里 autoRenew:false 可关（下轮生效），或安装时
   // --no-auto-renew。
   autoRenew: true,
+  // 会话保留策略：'window'（默认）——会话生命周期对齐「一次执行」：任务
+  // 触发过、执行完毕且距下次需要还有余量即回收，下次窗口重拉，任务之间
+  // 上下文不互相累积；'always'——旧常驻行为，执行间隔里也保留会话，仅受
+  // 7 天超龄换代约束。
+  sessionRetain: 'window',
 };
 
 // 预热会话连续三次启动后死亡，大概率是环境坏了（缺信任、env 不对），退避
@@ -36,6 +41,14 @@ export const WARMUP_GRACE_SECONDS = 180;
 // 才退役——日志安静是没有任务在执行的证据，运行中的任务绝不会被切掉。
 export const SESSION_MAX_AGE_SECONDS = 7 * 86400;
 export const SESSION_IDLE_SECONDS = 3600;
+// window 模式回收判据一：界面静默超过此时长视为「本次执行已结束」。TUI
+// 工作时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；与
+// WARMUP_GRACE 同值，对齐「3 分钟定生死」的既有心智。
+export const SESSION_RECYCLE_IDLE_SECONDS = 180;
+// window 模式回收判据二：距下次「需要会话在场」的时刻至少还有这么多秒。
+// 回收后同轮重拉的新会话约 10 秒完成登记，余量保的是登记抖动；更近的触
+// 发直接复用现有会话（时间紧邻的任务共享）。
+export const SESSION_FIRE_MARGIN_SECONDS = 120;
 // TUI typescript 是全屏渲染流，长驻时无限增长，拉起时轮转（script(1) 打开
 // 即截断，所以轮转粒度是一个预热会话的生命周期）。
 export const LOG_ROTATE_BYTES = 10 * 1024 * 1024;

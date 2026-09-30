@@ -202,12 +202,14 @@ export async function cmdOverview(args) {
   } else {
     const actualIv = info ? info.interval : null;
     const renewTag = cfg.autoRenew ? '，自动续期开' : '，自动续期关';
+    const retainTag = cfg.sessionRetain === 'always'
+      ? '，会话常驻' : '，会话按执行回收';
     if (actualIv === null || actualIv === undefined) {
       deps.print(`巡检：配置为每 ${cfg.intervalSeconds} 秒一轮（服务未加载），`
-        + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}`);
+        + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}${retainTag}`);
     } else {
       deps.print(`巡检：每 ${actualIv} 秒一轮，提前 ${cfg.leadSeconds} 秒启动`
-        + `会话${renewTag}`);
+        + `会话${renewTag}${retainTag}`);
       if (actualIv !== cfg.intervalSeconds) {
         alerts.push(`launchd 实际间隔 ${actualIv} 秒与配置 ${cfg.intervalSeconds} `
           + '秒不一致，重新运行 cron-up install 后生效');

@@ -149,6 +149,19 @@ test('bool maxdepth is rejected loudly', (t) => {
   });
 });
 
+test('bad sessionRetain is rejected loudly', (t) => {
+  const tmp = mkTmp(t);
+  mockDeps(t);
+  const file = path.join(tmp, 'cfg.json');
+  writeJson(file, { sessionRetain: 'sometimes' });
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('sessionRetain'));
+    return true;
+  });
+});
+
 test('field errors can be raised for human pages', (t) => {
   const tmp = mkTmp(t);
   mockDeps(t);
