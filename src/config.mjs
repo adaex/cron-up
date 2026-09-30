@@ -149,10 +149,29 @@ export function loadState() {
   return out;
 }
 
+// 自产物按私密收紧（与会话日志、任务文件写入同一纪律）：state 含工作区路
+// 径与 pid，多用户机器上不给其他账号读面。chmod 顺带收回老版本留下的宽松
+// 权限——state 每轮都写、config 每次 install 都写，存量会自动跟进；失败维
+// 持现状。
 function atomicSave(file, doc) {
-  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const dir = path.dirname(file);
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // 维持现状。
+  }
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`);
+  // 以 0600 创建；残留的旧 tmp 更宽时也收回来，rename 保持该模式位。
+  fs.writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`, {
+    flag: 'w',
+    mode: 0o600,
+  });
+  try {
+    fs.chmodSync(tmp, 0o600);
+  } catch {
+    // 维持 0600。
+  }
   fs.renameSync(tmp, file);
 }
 

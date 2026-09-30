@@ -7,6 +7,7 @@ import {
   normalizeRoots,
   loadConfig,
   loadState,
+  saveState,
   validateConfig,
 } from '../src/config.mjs';
 import { discover, onDiskCase } from '../src/tasks.mjs';
@@ -220,4 +221,14 @@ test('missing state file reads as empty', (t) => {
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp);
   assert.deepEqual(loadState(), {});
+});
+
+test('state saves as 0600 inside a 0700 data dir', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  // tmpPaths 建出的 dataDir 是默认 0755，正好代表老版本留下的宽松目录。
+  deps.paths = tmpPaths(tmp);
+  saveState({ '/a': { pid: 1, fails: 0 } });
+  assert.equal(fs.statSync(deps.paths.statePath).mode & 0o777, 0o600);
+  assert.equal(fs.statSync(deps.paths.dataDir).mode & 0o777, 0o700);
 });
