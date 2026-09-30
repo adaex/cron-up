@@ -5,6 +5,12 @@ on:
     branches: [main]
   pull_request:
 
+# 同一分支快速连推时取消尚未跑完的旧轮：macOS runner 计费是 Linux 的十
+# 倍，测试又只需 2 秒，没有让旧提交排队跑完的道理。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: macos-latest
