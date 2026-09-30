@@ -7,7 +7,11 @@ import path from 'node:path';
 
 import { deps } from './internals.mjs';
 import { TASK_REL } from './paths.mjs';
-import { PRUNE_DIRS } from './constants.mjs';
+import {
+  PRUNE_DIRS,
+  CC_JITTER,
+  AUTO_MIN_ID_TARGET_DELAY_MS,
+} from './constants.mjs';
 
 export function expandHome(p) {
   const home = deps.paths.home;
@@ -192,12 +196,60 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
   fs.renameSync(tmp, file);
 }
 
-// 给所有缺 truthy permanent 标记的周期任务打上标记。
-// 返回：打标的数量（文件只重写一次）；0 表示文件已全部标好（字节级不
-// 动，这是 5 分钟巡检不会永远重写别人文件的幂等性）；null 表示文件缺失/
-// 损坏；读到的与写间被改抛 TaskFileChanged。一次性任务与无标志的手写文
-// 件永不修改。
-export function renewWorkspace(taskfile) {
+// 严格 8 位十六进制的任务 id（Claude Code 自己生成的形状）转数值；其他
+// 形状（短串、UUID、缺失、非字符串）返回 null——它们算「未达标」，由
+// minifyIds 改写成合规小号。
+export function parseTaskIdN(id) {
+  if (typeof id !== 'string' || !/^[0-9a-fA-F]{8}$/.test(id)) return null;
+  return parseInt(id, 16);
+}
+
+// autoMinId 的 id 数值上界：每日任务延迟 ≤ AUTO_MIN_ID_TARGET_DELAY_MS。
+export function minTaskIdMaxN() {
+  return Math.floor(
+    AUTO_MIN_ID_TARGET_DELAY_MS
+      / (CC_JITTER.recurringFrac * 86400_000) * 2 ** 32);
+}
+
+// 把显式周期任务里 id 数值超过上界（或形状不合法）的，改写成文件内未占用
+// 的小号（00000001 起的 8 位十六进制），使其投递抖动降到目标延迟内。原地
+// 修改 tasks 元素，返回改写条数。关键纪律：
+//   - 只碰 t.recurring truthy 的显式周期任务，一次性与无标志手写条目不碰；
+//   - 已达标的小号（含 00000000）原样保留，永不重排——多次巡检结果稳定，
+//     第二轮起 0 改动、文件字节不动；
+//   - 空号在「文件内全部任务」（含一次性）已占用的 id 之外分配，保证同文
+//     件唯一；跨文件重复无妨（各工作区独立加载）。
+export function minifyIds(tasks) {
+  const maxN = minTaskIdMaxN();
+  const used = new Set();
+  for (const t of tasks) {
+    if (!isPlainObject(t)) continue;
+    const n = parseTaskIdN(t.id);
+    if (n !== null) used.add(n);
+  }
+  let next = 1;
+  const takeFree = () => {
+    while (used.has(next)) next += 1;
+    used.add(next);
+    return next;
+  };
+  let changed = 0;
+  for (const t of tasks) {
+    if (!isPlainObject(t) || !t.recurring) continue;
+    const n = parseTaskIdN(t.id);
+    if (n !== null && n <= maxN) continue;
+    t.id = takeFree().toString(16).padStart(8, '0');
+    changed += 1;
+  }
+  return changed;
+}
+
+// 一轮巡检对一个任务文件做的维护：renew（补 permanent）与 minify（id 改
+// 小）合并为同一次受 mtime 乐观锁保护的原子写。外壳与旧 renewWorkspace
+// 完全一致：先取 mtimeNs、清残留 .cron-up-tmp、loadTaskDoc round-trip 整
+// 文档；两项计数都为 0 时字节级不动。返回 {renewed,minified}；null 表示
+// 文件缺失/损坏；读到写间被改抛 TaskFileChanged。
+export function maintainWorkspace(taskfile, { renew = false, minify = false } = {}) {
   let mtimeNs;
   try {
     mtimeNs = fs.statSync(taskfile, { bigint: true }).mtimeNs;
@@ -205,7 +257,7 @@ export function renewWorkspace(taskfile) {
     return null;
   }
   // 上次写一半被杀（SIGKILL/断电）留下的临时文件会永远躺在用户的仓库里
-  // ——已全部标好的文件不再触发写入，没人替它收尾。只清专属后缀的，顺手
+  // ——已无需改动的文件不再触发写入，没人替它收尾。只清专属后缀的，顺手
   // 且不碰别人。
   try {
     fs.unlinkSync(tmpSibling(taskfile));
@@ -214,20 +266,29 @@ export function renewWorkspace(taskfile) {
   }
   const doc = deps.loadTaskDoc(taskfile);
   if (doc === null) return null;
-  let tagged = 0;
-  for (const t of doc.tasks) {
-    // truthy 而非 === true：与 Claude Code 自己的加载器一致
-    // （...o.permanent && {permanent:true}），它已认作永久的任何值都算，
-    // 不再重写。只有显式周期任务有资格——绝不从 cron 形状推断周期性，
-    // 一次性任务不碰。
-    if (isPlainObject(t) && t.recurring && !t.permanent) {
-      t.permanent = true;
-      tagged += 1;
+  let renewed = 0;
+  if (renew) {
+    for (const t of doc.tasks) {
+      // truthy 而非 === true：与 Claude Code 自己的加载器一致
+      // （...o.permanent && {permanent:true}），它已认作永久的任何值都算，
+      // 不再重写。只有显式周期任务有资格——绝不从 cron 形状推断周期性，
+      // 一次性任务不碰。
+      if (isPlainObject(t) && t.recurring && !t.permanent) {
+        t.permanent = true;
+        renewed += 1;
+      }
     }
   }
-  if (tagged === 0) return 0;
+  const minified = minify ? minifyIds(doc.tasks) : 0;
+  if (renewed === 0 && minified === 0) return { renewed: 0, minified: 0 };
   atomicWriteJson(taskfile, doc, mtimeNs);
-  return tagged;
+  return { renewed, minified };
+}
+
+// 手动 renew 的薄封装：只补 permanent（不改 id），保持 null/0/N 三态契约。
+export function renewWorkspace(taskfile) {
+  const r = maintainWorkspace(taskfile, { renew: true });
+  return r === null ? null : r.renewed;
 }
 
 Object.assign(deps, { discover, readTasks, loadTaskDoc });

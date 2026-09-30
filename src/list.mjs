@@ -8,13 +8,21 @@ import {
   pad,
   dispWidth,
   taskView,
-  fmtMDHM,
+  fmtFireRange,
 } from './display.mjs';
 
 function rank(v) {
   if (!v.valid) return 3;
   if (v.missed) return 0;
   return v.nxt ? 1 : 2;
+}
+
+// 状态列文案：有效任务是「设定落点 → 预计实际触发」（无抖动时只有落点）。
+function statusText(v) {
+  if (!v.valid) return 'cron 无效';
+  if (v.missed) return '已错过';
+  if (!v.nxt) return '一年内无';
+  return fmtFireRange(v.nxt, v.fire);
 }
 
 export async function cmdList(args) {
@@ -60,41 +68,41 @@ export async function cmdList(args) {
   blocks.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   deps.print(`共 ${blocks.length} 个工作区、${total} 个定时任务`);
 
-  // 列宽从全部候选文案动态算（时间戳 "09-25 08:30" 恒为 11 列），改文案
-  // 不会静默错位；cadence 是截断列，取固定上限。
+  // 列宽从全部实际文案动态算（跨天箭头最长 "09-25 08:30 → 09-26 09:00"），
+  // 改文案不会静默错位；cadence 是截断列，取固定上限。
   const statusW = Math.max(11,
-    ...['cron 无效', '已错过', '一年内无'].map(dispWidth));
+    ...blocks.flatMap(([, , views]) => views.map((v) => dispWidth(statusText(v)))));
   const kindW = Math.max(...['一次性', '周期', '周期·永久'].map(dispWidth)) + 1;
   const cadW = 16;
-  // "  " + status + "  " + kind + "  " + cadence + "  " + summary
-  const summaryW = Math.max(12,
-    cols - (2 + statusW + 2 + kindW + 2 + cadW + 2));
+  // 固定列（不含摘要段）："  " status "  " kind "  " cadence。摘要段再占
+  // "  " + summaryW。空间紧张时摘要先让位；为 0 则整段省略——状态箭头在
+  // 60 列下限下本身就可能占 25 列（跨天），不能再用 12 列摘要下限把行撑爆。
+  const fixedW = 2 + statusW + 2 + kindW + 2 + cadW;
+  const summaryW = Math.max(0, cols - fixedW - 2);
   for (const [ws, consumer, views] of blocks) {
     deps.print('');
     const label = consumer ? '交互会话：有' : '交互会话：无';
     const pathW = cols - dispWidth(label) - 1;
     deps.print(`${pad(clip(ws, pathW), pathW)} ${label}`);
     for (const v of views) {
-      let status;
       let kind;
       let cadence;
       let summary;
       if (!v.valid) {
-        status = 'cron 无效';
         kind = '—';
         cadence = '—';
         summary = `原字段值：${JSON.stringify(v.expr)}；${v.summary}`;
       } else {
-        // 已错过：一次性任务触发点已过，下次会话启动时补执行。missed 时
-        // permanent 恒为 false（taskView 对一次性任务剔除了该标记）。
-        status = v.missed ? '已错过'
-          : (v.nxt ? fmtMDHM(v.nxt) : '一年内无');
         kind = v.permanent ? '周期·永久' : v.kind;
         cadence = v.cadence;
         summary = v.summary;
       }
-      deps.print('  ' + pad(status, statusW) + '  ' + pad(kind, kindW) + '  '
-        + pad(clip(cadence, cadW), cadW) + '  ' + clip(summary, summaryW));
+      let line = '  ' + pad(statusText(v), statusW) + '  '
+        + pad(kind, kindW) + '  '
+        + pad(clip(cadence, cadW), cadW);
+      // 极窄屏摘要列算到 0：整段省略（含前导间隔），保证行宽不超终端。
+      if (summaryW > 0) line += '  ' + clip(summary, summaryW);
+      deps.print(line);
     }
   }
 }

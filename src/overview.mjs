@@ -17,6 +17,7 @@ import {
   taskView,
   sessionAgeZh,
   fmtMDHM,
+  fmtHM,
 } from './display.mjs';
 
 // 总览页任务盘点。返回 [告警, 已在告警里说明冷却的工作区集合, 本轮发现
@@ -59,8 +60,10 @@ function overviewTasks(cfg, cols, consumers, state) {
         bad += 1;
         continue;
       }
-      if (v.nxt && (!soonest || v.nxt.getTime() < soonest[0].getTime())) {
-        soonest = [v.nxt, ws, v.summary];
+      // 「最近」按计入抖动后的预计实际触发排，而非 cron 落点。
+      const fire = v.fire ?? v.nxt;
+      if (fire && (!soonest || fire.getTime() < soonest[0].getTime())) {
+        soonest = [fire, ws, v.summary, v.nxt];
       }
       if (v.wanted) wanted = true;
     }
@@ -96,9 +99,13 @@ function overviewTasks(cfg, cols, consumers, state) {
     ? `任务：${nTasks} 个，分布在 ${nWs} 个工作区`
     : '任务：暂无');
   if (soonest) {
-    const [nxt, ws, summary] = soonest;
-    const line = `最近：${fmtMDHM(nxt)}（${humanDelta(nxt.getTime() - now.getTime())}） `
-      + `${path.basename(ws)} · ${summary}`;
+    const [fire, ws, summary, nxt] = soonest;
+    // 预计与设定不在同一分钟时，附注 cron 落点，解释两个时间的差。
+    const setTag = (nxt && (fmtHM(fire) !== fmtHM(nxt)
+      || fire.getDate() !== nxt.getDate()))
+      ? `，设定 ${fmtHM(nxt)}` : '';
+    const line = `最近：${fmtMDHM(fire)}（${humanDelta(fire.getTime() - now.getTime())}`
+      + `${setTag}） ${path.basename(ws)} · ${summary}`;
     deps.print(clip(line, cols));
   }
   if (!cfg.autoRenew && unrenewed > 0) {
@@ -155,10 +162,10 @@ function overviewSessions(cols, state, suppressCooling = new Set(),
 }
 
 const COMMANDS = [
-  ['list', '逐个列出任务的内容摘要、执行时间与会话状态'],
+  ['list', '逐个列出任务的内容摘要、设定/预计触发时间与会话状态'],
   ['logs [目录片段] [-f]', '查看巡检日志或后台会话记录'],
   ['run', '立即手动巡检一轮'],
-  ['renew', '立即给所有周期任务补 permanent（跳过 7 天过期）'],
+  ['renew', '立即给所有周期任务补 permanent 并改小 id'],
   ['install --force', '更新配置并重新安装（全部参数见 --help）'],
 ];
 
@@ -202,14 +209,15 @@ export async function cmdOverview(args) {
   } else {
     const actualIv = info ? info.interval : null;
     const renewTag = cfg.autoRenew ? '，自动续期开' : '，自动续期关';
+    const minIdTag = cfg.autoMinId ? '，id 自动改小' : '，id 保持原样';
     const retainTag = cfg.sessionRetain === 'always'
       ? '，会话常驻' : '，会话按执行回收';
     if (actualIv === null || actualIv === undefined) {
       deps.print(`巡检：配置为每 ${cfg.intervalSeconds} 秒一轮（服务未加载），`
-        + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}${retainTag}`);
+        + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}${minIdTag}${retainTag}`);
     } else {
       deps.print(`巡检：每 ${actualIv} 秒一轮，提前 ${cfg.leadSeconds} 秒启动`
-        + `会话${renewTag}${retainTag}`);
+        + `会话${renewTag}${minIdTag}${retainTag}`);
       if (actualIv !== cfg.intervalSeconds) {
         alerts.push(`launchd 实际间隔 ${actualIv} 秒与配置 ${cfg.intervalSeconds} `
           + '秒不一致，重新运行 cron-up install 后生效');

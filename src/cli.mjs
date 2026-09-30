@@ -12,7 +12,7 @@ import { cmdOverview } from './overview.mjs';
 import { cmdLogs } from './logs.mjs';
 
 // 选项类型：string 吃一个值；int 吃一个值且必须是严格十进制；bool 是无值
-// 开关；tri 支持 --name / --no-name（install 的 auto-renew）。
+// 开关；tri 支持 --name / --no-name（install 的 auto-renew、auto-min-id）。
 const SPECS = {
   install: {
     options: {
@@ -21,6 +21,7 @@ const SPECS = {
       lead: 'int',
       force: 'bool',
       'auto-renew': 'tri',
+      'auto-min-id': 'tri',
       'session-retain': 'string',
     },
   },
@@ -160,11 +161,11 @@ export const USAGE = `cron-up —— 为定时任务提前备好交互会话
 
 用法：
   cron-up                    查看总览（服务、配置、任务、会话）
-  cron-up install            安装配置与 LaunchAgent（--roots --interval --lead --session-retain --force --no-auto-renew）
+  cron-up install            安装配置与 LaunchAgent（--roots --interval --lead --session-retain --force --no-auto-renew --no-auto-min-id）
   cron-up uninstall          卸载（--purge 连配置日志一起删，--keep-sessions 保留后台会话）
-  cron-up list               逐个列出定时任务及下次执行时间
+  cron-up list               逐个列出定时任务的设定/预计实际触发时间
   cron-up run                执行一轮巡检（launchd 入口）
-  cron-up renew              立即给所有周期任务补 permanent
+  cron-up renew              立即给所有周期任务补 permanent 并改小 id
   cron-up logs [目录片段]    查看巡检日志或后台会话记录（-f 跟踪）
 
 升级：npm i -g cron-up@latest`;

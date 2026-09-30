@@ -608,3 +608,79 @@ test('patrol log rotation', (t) => {
   rotatePatrolLogs();
   assert.equal(fs.statSync(`${out2}.1`).size, PATROL_LOG_ROTATE_BYTES + 1);
 });
+
+// ---- 投递抖动尾窗：落点已过、实际投递未到，会话不能被回收 ----
+// 两个每日任务：X 落点 13:00（13:30 顶格延迟投递，已跑完），Y 落点 13:30
+// （同样顶格，要到 14:00 才投递）。13:35 时 Y 落点已过却还没投递，旧逻辑
+// 误把「下一落点在明天」当作今天跑完，回收会话导致 Y 漏跑。
+const BUG_DAY = new Date(2026, 8, 21); // 2026-09-21 周一
+function neighborTasks(yFiredAt) {
+  const tasks = [
+    { id: 'c1363d8b', cron: '0 13 * * *', recurring: true,
+      lastFiredAt: new Date(2026, 8, 21, 13, 30, 0).getTime() },
+    { id: '6b6c321b', cron: '30 13 * * *', recurring: true },
+  ];
+  if (yFiredAt) tasks[1].lastFiredAt = yFiredAt;
+  return tasks;
+}
+
+async function setupTailWindow(t) {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp, { sessionLogDir: path.join(tmp, 'sessions') });
+  fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
+  deps.listScriptProcesses = () => [];
+  deps.procStartedAt = (p) => (p === 100 ? 'start-100' : null);
+  const alivePids = new Set([100]);
+  let spawns = 0;
+  deps.alive = (p) => alivePids.has(p);
+  deps.spawnSession = () => { spawns += 1; alivePids.add(999); return { pid: 999 }; };
+  deps.stopSession = async (ent) => { alivePids.delete(ent.pid); };
+  deps.log = () => {};
+  const file = sessionLogPath(WS);
+  fs.writeFileSync(file, '');
+  const quiet = (at) => {
+    const old = new Date(at.getTime() - 3600_000);
+    fs.utimesSync(file, old, old);
+  };
+  return {
+    deps, alivePids, file, quiet, spawnCount: () => spawns,
+    run(now, tasks, consumers) {
+      const cur = Math.floor(now.getTime() / 1000);
+      deps.scanSessions = () => [consumers, null];
+      deps.readTasks = () => tasks;
+      const state = { [WS]: { pid: 100, startedAt: cur - 2700, fails: 0, log: file } };
+      return patrolWorkspace(WS, state, now, 600_000, cur,
+        consumers, [], 'window').then(() => state);
+    },
+  };
+}
+
+test('tail window: session kept while neighbor task awaits its delayed fire', async (t) => {
+  const m = await setupTailWindow(t);
+  const at1335 = new Date(BUG_DAY.getFullYear(), 8, 21, 13, 35, 0);
+  m.quiet(at1335);
+  const state = await m.run(at1335, neighborTasks(), new Set([WS]));
+  assert.ok(m.alivePids.has(100), 'Y 14:00 才投递，13:35 不能回收会话');
+  assert.ok(WS in state, 'state 条目保留');
+  assert.equal(m.spawnCount(), 0, '会话还活着，无需重拉');
+});
+
+test('tail window passed: session is recycled normally', async (t) => {
+  const m = await setupTailWindow(t);
+  const at1405 = new Date(BUG_DAY.getFullYear(), 8, 21, 14, 5, 0);
+  m.quiet(at1405);
+  const yFired = new Date(BUG_DAY.getFullYear(), 8, 21, 14, 0, 0).getTime();
+  const state = await m.run(at1405, neighborTasks(yFired), new Set([WS]));
+  assert.ok(!m.alivePids.has(100), '两个任务都投递完且静默，正常回收');
+  assert.ok(!(WS in state), '下一落点在明天，不重拉');
+});
+
+test('tail window: a dead session during the tail is respawned', async (t) => {
+  const m = await setupTailWindow(t);
+  m.alivePids.delete(100); // 会话恰在尾窗内死了
+  const at1335 = new Date(BUG_DAY.getFullYear(), 8, 21, 13, 35, 0);
+  m.quiet(at1335);
+  await m.run(at1335, neighborTasks(), new Set());
+  assert.ok(m.alivePids.has(999), '尾窗内缺会话必须同轮重拉，不能漏跑');
+});

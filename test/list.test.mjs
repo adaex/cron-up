@@ -143,3 +143,31 @@ test('permanent recurring is labeled', async (t) => {
     assert.ok(dispWidth(line) <= 100);
   }
 });
+
+test('status shows slot to predicted-fire range for jittered tasks', async (t) => {
+  const s = await setup(t);
+  s.deps.terminalWidth = () => 120;
+  // id 哈希顶格：每日 13:00 的任务预计 13:30 才投递。
+  const out = await s.render([{
+    id: 'c1363d8b', cron: '0 13 * * *', recurring: true,
+    prompt: 'Trae 成本刷新',
+  }]);
+  assert.ok(out.includes('→ 13:30'), out);
+  assert.ok(!out.includes('设定'), 'list 行内不掺总览的设定附注');
+});
+
+test('jittered rows never overflow, even at the 60-col floor', async (t) => {
+  const s = await setup(t);
+  for (const width of [60, 80, 100, 200]) {
+    s.deps.terminalWidth = () => width;
+    const out = await s.render([
+      // 同日顶格 + 长摘要；以及跨天箭头（状态列最长形态）。
+      { id: 'c1363d8b', cron: '0 13 * * *', recurring: true, prompt: '短' },
+      { id: '6b6c321b', cron: '30 23 * * *', recurring: true,
+        prompt: '很'.repeat(300) },
+    ]);
+    for (const line of out.split('\n')) {
+      assert.ok(dispWidth(line) <= width, `${width} 列下溢出：${line}`);
+    }
+  }
+});

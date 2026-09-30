@@ -1,7 +1,7 @@
 // 分钟级 cron 解析与下一次触发计算。字段全是别的程序写的，畸形表达式在
 // 边界处返回 null/不可满足，绝不抛进巡检循环。
 
-import { SEARCH_DAYS } from './constants.mjs';
+import { SEARCH_DAYS, DISPLAY_SEARCH_DAYS, CC_JITTER } from './constants.mjs';
 
 const MS_DAY = 86400_000;
 const MS_MINUTE = 60_000;
@@ -113,6 +113,42 @@ export class Cron {
     }
     return null;
   }
+
+  // 不晚于 t 所在分钟的最近一次匹配（含当前分钟）；withinDays 天前还没有
+  // 则 null。与 nextAfter 对称做整月/整小时快进，366 天窗口也便宜。用于
+  // 判断「现在是否落在某次触发的投递延迟尾窗里」。
+  prevAtOrBefore(t, withinDays = SEARCH_DAYS) {
+    if (!this.satisfiable) return null;
+    const cur = new Date(t.getTime());
+    cur.setSeconds(0, 0);
+    const deadline = cur.getTime() - withinDays * MS_DAY;
+    while (cur.getTime() >= deadline) {
+      if (!this.months.has(cur.getMonth() + 1)) {
+        // 退到上个月最后一分钟：置本月 1 号 00:00 再退 1 分钟。
+        cur.setDate(1);
+        cur.setHours(0, 0, 0, 0);
+        cur.setMinutes(cur.getMinutes() - 1);
+        continue;
+      }
+      if (!this.hours.has(cur.getHours())) {
+        // 退到严格更早的最近匹配小时的 59 分；当天已无更早匹配则落到前一
+        // 天的最大匹配小时（小时集合每天相同，satisfiable 保证其非空）。
+        let h = cur.getHours() - 1;
+        while (h >= 0 && !this.hours.has(h)) h -= 1;
+        if (h < 0) {
+          const maxH = Math.max(...this.hours);
+          cur.setDate(cur.getDate() - 1);
+          cur.setHours(maxH, 59, 0, 0);
+        } else {
+          cur.setHours(h, 59, 0, 0);
+        }
+        continue;
+      }
+      if (this.matches(cur)) return cur;
+      cur.setMinutes(cur.getMinutes() - 1);
+    }
+    return null;
+  }
 }
 
 // CronCreate 产生的一次性任务形状像 'M H DoM Mon *'，作为没有 recurring
@@ -168,6 +204,18 @@ function wanted(cron, task, now, leadMs) {
       span,
     );
     if (first && first.getTime() <= now.getTime()) return true;
+    return false;
+  }
+  // 周期任务：投递不是在落点，而是落点 + 按 id 确定的抖动（每日任务通常
+  // 30 分）。落点已过、抖动投递时刻未到的这段「投递尾窗」里会话仍必须在
+  // 场——否则 window 模式会把执行完近邻任务后空闲下来的会话回收且不重
+  // 拉，让本次触发漏跑（周期任务没有补执行）。找上一落点用 366 天窗口，
+  // 覆盖月/年任务；prevAtOrBefore 有日历快进，不贵。
+  const prev = cron.prevAtOrBefore(now, DISPLAY_SEARCH_DAYS);
+  if (prev !== null) {
+    const fireAt = prev.getTime()
+      + recurringDelayMs(cron, prev, task.id, DISPLAY_SEARCH_DAYS + 1);
+    if (now.getTime() < fireAt) return true;
   }
   return false;
 }
@@ -181,3 +229,55 @@ export function taskWanted(task, now, leadMs) {
 
 // wanted 供展示视图复用（同一个已解析 cron 顺带回答巡检问题）。
 export { wanted };
+
+// ---- Claude Code 投递抖动（预计实际触发时间）----
+// 复刻 v2.1.285 内部的 M()：任务 id 前 8 位十六进制除以 2^32，得 [0,1) 的
+// 固定哈希——同一任务每次触发的抖动完全相同，不是随机数。id 缺失或前 8
+// 位都不是十六进制时 parseInt 得 NaN，上游回退 0；任务文件由别的程序书
+// 写，这里同样永不抛。
+export function taskIdHash(taskId) {
+  if (typeof taskId !== 'string') return 0;
+  const n = parseInt(taskId.slice(0, 8), 16) / 2 ** 32;
+  return Number.isFinite(n) ? n : 0;
+}
+
+// 任务按 Claude Code 的抖动规则预计的实际触发时刻；cron 无效、不可满足或
+// 窗口内没有落点时返回 null。基准为 now（上游调度器以上次触发时刻为基
+// 准，展示只关心从现在起的下一次，两者算出的落点一致）。
+export function predictedFire(task, now, withinDays = DISPLAY_SEARCH_DAYS) {
+  const cron = parseCronOrNone(task?.cron);
+  if (cron === null || !cron.satisfiable) return null;
+  const i = cron.nextAfter(now, withinDays);
+  if (i === null) return null;
+  const h = taskIdHash(task?.id);
+
+  if (taskIsOneshot(task)) {
+    // 复刻 Wsn()：只有落点分钟落在 :00/:30 网格上才提前一个按哈希缩放的
+    // 小量（0~90 秒），其余分钟整点不抖；提前量不越过 now。
+    if (i.getMinutes() % CC_JITTER.oneShotMinuteMod !== 0) return i;
+    const ahead = CC_JITTER.oneShotFloorMs
+      + h * (CC_JITTER.oneShotMaxMs - CC_JITTER.oneShotFloorMs);
+    return new Date(Math.max(i.getTime() - ahead, now.getTime()));
+  }
+
+  // 复刻 bOt()：抖动按「本落点到下一落点」的周期比例缩放并封顶。nextAfter
+  // 语义是严格晚于入参（内部进位一分钟），传 slot 本身即取下一落点；窗口
+  // 边缘取不到时与上游一致：视为无后续，不抖动。
+  return new Date(i.getTime() + recurringDelayMs(cron, i, task?.id, withinDays));
+  // 注：上游 bOt 另有一个 cacheLeadMs 分支——仅当相邻落点间隔落在
+  // [300000, 315000)ms（约 5 分钟周期的高频 cron，如 */5）且表达式匹配
+  // 其内部步进正则时，调度时刻提前 15 秒。日/周/月任务周期远大于此，不
+  // 经过该分支，故不予复刻。
+}
+
+// 周期任务从某个落点起的投递延迟（ms）：hash(id)·frac·周期，封顶 30 分。
+// slot 后取不到下一落点（窗口边缘、不可满足）时返回 0。
+export function recurringDelayMs(cron, slot, taskId, withinDays = SEARCH_DAYS) {
+  const next = cron.nextAfter(new Date(slot.getTime()), withinDays);
+  if (next === null) return 0;
+  const period = next.getTime() - slot.getTime();
+  return Math.min(
+    taskIdHash(taskId) * CC_JITTER.recurringFrac * period,
+    CC_JITTER.recurringCapMs,
+  );
+}

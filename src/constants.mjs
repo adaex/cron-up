@@ -14,6 +14,12 @@ export const DEFAULT_CONFIG = {
   // 全部补标。配置里 autoRenew:false 可关（下轮生效），或安装时
   // --no-auto-renew。
   autoRenew: true,
+  // 每轮巡检把周期任务的 id 改写成小哈希值，把投递抖动压到
+  // AUTO_MIN_ID_TARGET_DELAY_MS 以内（每日任务约 1 分钟），观感近乎准点。
+  // 只改显式周期任务、只分配文件内空号、幂等。配置 autoMinId:false 可关，
+  // 或安装时 --no-auto-min-id。机制见 CC_JITTER 与 findings 主题
+  // claude-code-scheduled-task-jitter。
+  autoMinId: true,
   // 会话保留策略：'window'（默认）——会话生命周期对齐「一次执行」：任务
   // 触发过、执行完毕且距下次需要还有余量即回收，下次窗口重拉，任务之间
   // 上下文不互相累积；'always'——旧常驻行为，执行间隔里也保留会话，仅受
@@ -61,6 +67,33 @@ export const PRUNE_DIRS = new Set([
   'Movies', 'Music', 'Pictures', 'Public', '.Trash',
   '.cache', '.npm', '.local', '.config',
 ]);
+
+// Claude Code 会话投递定时任务时的抖动参数，两处使用：list/总览预测
+// 「预计实际触发时间」；巡检把「落点之后、延迟投递点之前」这段投递尾窗
+// 也算作需要会话在场，避免 window 模式在任务真正投递前回收会话。逆向自
+// Claude Code v2.1.285
+// （darwin-arm64 原生二进制，2026-09-30 安装）内部 createCronScheduler 的
+// gV 默认值：周期任务 fire = 落点 + min(hash(id)·recurringFrac·周期,
+// recurringCapMs)；一次性任务在 :00/:30 网格点提前 0~oneShotMaxMs。
+// 这些值没有稳定性承诺——版本升级可能改，运行时还可能被远程配置键
+// tengu_kairos_cron_config（60 秒刷新，校验失败回退默认）覆盖。预测与
+// 实际系统性对不上时，按 findings 主题
+// claude-code-scheduled-task-jitter 的排查步骤复核新版本。
+export const CC_JITTER = {
+  recurringFrac: 0.5,
+  recurringCapMs: 30 * 60 * 1000,
+  oneShotMaxMs: 90 * 1000,
+  oneShotFloorMs: 0,
+  oneShotMinuteMod: 30,
+};
+
+// autoMinId 改小 id 的目标投递延迟上界。周期延迟 = hash(id)·frac·周期，
+// 按每日周期（86400000ms，周期最短、要求最严）反解 id 数值上界：
+//   maxN = floor(目标延迟 / (frac·每日ms) · 2^32) ≈ 5_965_232 (0x005b05b0)
+// id 数值不超过它的每日任务延迟 ≤ 60 秒；周/月任务周期更长，同阈值下延迟
+// 更小。改小逻辑（src/tasks.mjs 的 minifyIds）从这里与 CC_JITTER 现算
+// maxN，常量只保留「目标延迟」这一个可调项。
+export const AUTO_MIN_ID_TARGET_DELAY_MS = 60 * 1000;
 
 // 定时任务 7 天过期（周期任务被调度器删除，一次性任务早就触发过），巡检
 // 不需要看得更远。展示页另算。

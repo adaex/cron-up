@@ -136,6 +136,28 @@ test('string autoRenew is rejected loudly', (t) => {
   });
 });
 
+test('string autoMinId is rejected loudly', (t) => {
+  // 同 autoRenew：写成 "false" 绝不能静默回退成默认 true 继续改任务 id。
+  const tmp = mkTmp(t);
+  mockDeps(t);
+  const file = path.join(tmp, 'cfg.json');
+  writeJson(file, { autoMinId: 'false' });
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('autoMinId'));
+    return true;
+  });
+});
+
+test('autoMinId defaults to true for old configs', (t) => {
+  const tmp = mkTmp(t);
+  mockDeps(t);
+  const file = path.join(tmp, 'cfg.json');
+  writeJson(file, {}); // 老配置无该键：默认补缺为开
+  assert.equal(loadConfig(file).autoMinId, true);
+});
+
 test('bool maxdepth is rejected loudly', (t) => {
   const tmp = mkTmp(t);
   mockDeps(t);

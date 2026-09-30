@@ -64,6 +64,18 @@ test('task inventory and soonest line', async (t) => {
   assert.ok(out.includes('最近：'));
 });
 
+test('soonest line uses predicted fire with the slot annotated', async (t) => {
+  const s = await setup(t);
+  const out = await s.render([{
+    id: 'c1363d8b', cron: '0 13 * * *', recurring: true,
+    prompt: 'Trae 成本刷新',
+  }]);
+  // 顶格 30 分钟：最近按 13:30 排，并附注设定落点 13:00。
+  assert.ok(out.includes('最近：'), out);
+  assert.ok(out.includes('13:30'), out);
+  assert.ok(out.includes('设定 13:00'), out);
+});
+
 test('wanted without consumer is an alert', async (t) => {
   const s = await setup(t);
   const fire = new Date(Date.now() + 2 * 60_000);

@@ -82,6 +82,12 @@ test('--no-auto-renew and --auto-renew map to booleans', () => {
   assert.equal(parseCli(['install', '--auto-renew=false']).opts.autoRenew, false);
 });
 
+test('--no-auto-min-id and --auto-min-id map to booleans', () => {
+  assert.equal(parseCli(['install', '--no-auto-min-id']).opts.autoMinId, false);
+  assert.equal(parseCli(['install', '--auto-min-id']).opts.autoMinId, true);
+  assert.equal(parseCli(['install', '--auto-min-id=false']).opts.autoMinId, false);
+});
+
 test('logs -f maps to follow and captures positional workspace', () => {
   const p = parseCli(['logs', '-f', 'team-space']);
   assert.equal(p.command, 'logs');

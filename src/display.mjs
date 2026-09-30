@@ -1,6 +1,11 @@
 // 等宽终端展示原语与任务的展示视图。
 
-import { parseCronOrNone, taskIsOneshot, wanted } from './cron.mjs';
+import {
+  parseCronOrNone,
+  taskIsOneshot,
+  wanted,
+  predictedFire,
+} from './cron.mjs';
 import { DISPLAY_SEARCH_DAYS, ZERO_LEAD_MS } from './constants.mjs';
 
 // 等宽终端里的宽字符区间（CJK 文字、全角标点、谚文、常用 emoji）：启发式
@@ -81,6 +86,7 @@ export function taskView(task, now, leadMs = undefined) {
       summary: taskSummary(task),
       permanent: false,
       wanted: null,
+      fire: null,
     };
   }
   const nxt = cron.nextAfter(now, DISPLAY_SEARCH_DAYS);
@@ -98,7 +104,44 @@ export function taskView(task, now, leadMs = undefined) {
     // wanted 恒为 null 或布尔：没传 leadMs（不问）与 cron 无效（问不了）
     // 都是 null，键的形状不随参数变化。
     wanted: leadMs !== undefined ? wanted(cron, task, now, leadMs) : null,
+    // 计入 Claude Code 投递抖动后的预计实际触发时刻；已错过的一次性任务
+    // 没有未来触发，为 null。与 nxt 同为 Date 或 null。
+    fire: missed ? null : predictedFire(task, now),
   };
+}
+
+// MM-DD HH:MM 口径下是否同一天/同一分钟。
+function sameDay(a, b) {
+  return a.getFullYear() === b.getFullYear()
+    && a.getMonth() === b.getMonth()
+    && a.getDate() === b.getDate();
+}
+function sameMinute(a, b) {
+  return sameDay(a, b) && a.getHours() === b.getHours()
+    && a.getMinutes() === b.getMinutes();
+}
+
+// 「设定落点 → 预计实际触发」文案。抖动四舍五入到秒（调度器秒级轮询）：
+// 同日省略第二个日期；预计值带非零秒时显示 HH:MM:SS（如 05:15:37）；落
+// 在同一分钟（无抖动）则只显示落点，不画无意义的箭头。
+export function fmtFireRange(nxt, fire) {
+  if (!(fire instanceof Date) || !Number.isFinite(fire.getTime())) {
+    return fmtMDHM(nxt);
+  }
+  const r = new Date(Math.round(fire.getTime() / 1000) * 1000);
+  if (sameMinute(nxt, r)) return fmtMDHM(nxt);
+  const p = (n) => String(n).padStart(2, '0');
+  const tail = sameDay(nxt, r)
+    ? `${p(r.getHours())}:${p(r.getMinutes())}`
+      + (r.getSeconds() ? `:${p(r.getSeconds())}` : '')
+    : `${fmtMDHM(r)}${r.getSeconds() ? `:${p(r.getSeconds())}` : ''}`;
+  return `${fmtMDHM(nxt)} → ${tail}`;
+}
+
+// 仅 HH:MM（总览「（设定 HH:MM）」附注用）。
+export function fmtHM(d) {
+  const p = (n) => String(n).padStart(2, '0');
+  return `${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
 // MM-DD HH:MM（任务触发点的统一展示格式）。

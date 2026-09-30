@@ -9,6 +9,8 @@ import {
   taskIsOneshot,
   taskWanted,
   wanted,
+  taskIdHash,
+  predictedFire,
 } from '../src/cron.mjs';
 import { taskView } from '../src/display.mjs';
 import { DISPLAY_SEARCH_DAYS } from '../src/constants.mjs';
@@ -277,4 +279,129 @@ test('wanted is exported for the display view', () => {
   const soon = new Cron('*/5 * * * *');
   assert.equal(typeof wanted(soon, { recurring: true }, NOW, LEAD_MS),
     'boolean');
+});
+
+// ---- Claude Code 投递抖动预测 ----
+// 固定参考 NOW=2026-09-20 15:47（文件头）；hash 容差覆盖双精度表达差异。
+test('taskIdHash mirrors the upstream M(id) hash', () => {
+  assert.ok(Math.abs(taskIdHash('0ff0d1b5') - 0.062268) < 1e-6);
+  assert.ok(Math.abs(taskIdHash('c1363d8b') - 0.754734) < 1e-6);
+  assert.ok(Math.abs(taskIdHash('058e0149') - 0.021698) < 1e-6);
+  // 只取前 8 位：后面的字符不影响结果。
+  assert.equal(taskIdHash('058e0149-aaaa-bbbb') > 0, true);
+  assert.equal(taskIdHash('058e0149-aaaa-bbbb'),
+    taskIdHash('058e0149'));
+  // 缺失或前 8 位全非十六进制：回退 0，绝不抛。
+  assert.equal(taskIdHash(undefined), 0);
+  assert.equal(taskIdHash({}), 0);
+  assert.equal(taskIdHash('zzzzzzzz'), 0);
+});
+
+test('recurring fire is the slot plus the deterministic jitter', () => {
+  // 从固定时刻算：daily cron '0 13' 的下一落点是 09-21 13:00（NOW 当天
+  // 13:00 已过），再下一个 09-22 13:00，周期 1 天。
+  const slot = new Date(2026, 8, 21, 13, 0, 0);
+  const day = 86400_000;
+  for (const [id, expectedDelayS] of [
+    ['c1363d8b', 1800],    // hash 0.7547 → min(…, cap) 顶格 30 分钟
+    ['058e0149', 937.4],   // hash 0.02170 → 约 15:37.4，不顶格
+    [undefined, 0],        // 无 id → hash 0，无抖动
+    ['zzzzzzzz', 0],       // 坏 id 同 0
+  ]) {
+    const fire = predictedFire(
+      { id, cron: '0 13 * * *', recurring: true }, NOW);
+    assert.ok(fire instanceof Date, `id=${id} 应返回 Date`);
+    const delayS = (fire.getTime() - slot.getTime()) / 1000;
+    assert.ok(Math.abs(delayS - expectedDelayS) < 1.5,
+      `id=${id} 延迟 ${delayS}s 与预期 ${expectedDelayS}s 不符`);
+  }
+});
+
+test('jitter cap also binds for long-period crons', () => {
+  // 周期 7 天不设顶会是 hash·0.5·7 天（数小时），顶格后只有 30 分钟。
+  const fire = predictedFire(
+    { id: 'c1363d8b', cron: '0 10 * * 0', recurring: true }, NOW);
+  // 下一落点：09-27 10:00（见 day of week 测试），顶格 → 10:30。
+  assert.equal(fire.getTime(), new Date(2026, 8, 27, 10, 30, 0).getTime());
+});
+
+test('one-shot grid slots fire early, other minutes do not', () => {
+  // 09-25 14:00（:00 网格）：提前 hash·90s，但不早于 NOW。
+  const grid = predictedFire(
+    { id: 'c1363d8b', cron: '0 14 25 9 *', recurring: false,
+      createdAt: NOW.getTime() - 86400_000 }, NOW);
+  const slot = new Date(2026, 8, 25, 14, 0, 0);
+  assert.ok(slot.getTime() - grid.getTime() > 0);
+  assert.ok(slot.getTime() - grid.getTime() <= 90_000);
+
+  // 09-25 14:07（非网格）：不抖。
+  const plain = predictedFire(
+    { id: 'c1363d8b', cron: '7 14 25 9 *', recurring: false,
+      createdAt: NOW.getTime() - 86400_000 }, NOW);
+  assert.equal(plain.getTime(), new Date(2026, 8, 25, 14, 7, 0).getTime());
+});
+
+test('predictedFire never throws on malformed input', () => {
+  assert.equal(predictedFire(null, NOW), null);
+  assert.equal(predictedFire({ cron: 'not a cron' }, NOW), null);
+  assert.equal(predictedFire({ cron: '0 0 30 2 *', recurring: true }, NOW),
+    null);
+});
+
+// ---- prevAtOrBefore 与投递尾窗 ----
+function brutePrev(expr, t, days) {
+  const c = new Cron(expr);
+  const cur = new Date(t.getTime());
+  cur.setSeconds(0, 0);
+  const deadline = cur.getTime() - days * 86400_000;
+  while (cur.getTime() >= deadline) {
+    if (c.matches(cur)) return new Date(cur.getTime());
+    cur.setMinutes(cur.getMinutes() - 1);
+  }
+  return null;
+}
+
+test('prevAtOrBefore matches naive backward scan', () => {
+  const exprs = [
+    '0 5 * * *', '30 13 * * *', '30 13 * * 5', '0 0 1 * *',
+    '*/7 * * * *', '0,30 9-17 * * 1-5', '0 0 29 2 *', '15 23 * * *',
+  ];
+  for (const expr of exprs) {
+    const c = new Cron(expr);
+    for (const offset of [0, 1, 37, 600, 86400 * 30]) {
+      const t = new Date(NOW.getTime() - offset * 60_000);
+      const fast = c.prevAtOrBefore(t, 400);
+      const expect = brutePrev(expr, t, 400);
+      assert.equal(fast?.getTime() ?? null, expect?.getTime() ?? null,
+        `${expr} offset=${offset}`);
+    }
+  }
+});
+
+test('prevAtOrBefore includes the current matching minute', () => {
+  const t = new Date(2026, 8, 21, 13, 30, 23); // 周一 13:30:23
+  assert.equal(new Cron('30 13 * * *').prevAtOrBefore(t, 7)?.getTime(),
+    new Date(2026, 8, 21, 13, 30, 0).getTime());
+});
+
+test('wanted covers the recurring post-slot jitter tail window', () => {
+  // NOW = 周日 15:47。cron 30 15 的落点 15:30 已过：
+  // 顶格 id → 投递点 16:00，15:47 仍在尾窗内，需要会话。
+  const slotCron = '30 15 * * *';
+  assert.equal(taskWanted(
+    { id: 'c1363d8b', cron: slotCron, recurring: true }, NOW, 0), true);
+  // 小哈希 id → 只延迟 15:37，投递点 15:45:37 已过，尾窗结束。
+  assert.equal(taskWanted(
+    { id: '058e0149', cron: slotCron, recurring: true }, NOW, 0), false);
+});
+
+test('wanted tail window is bounded by the actual delay, not the 30m cap', () => {
+  // 非顶格任务：尾窗在落点+15:37 关闭，而不是落点+30 分。用 15:44（尾窗
+  // 内，距落点 14 分）与 15:46（尾窗外，距落点 16 分）夹住。
+  const cron = '30 15 * * *';
+  const at = (h, m) => new Date(2026, 8, 20, h, m, 0);
+  assert.equal(wanted(new Cron(cron),
+    { id: '058e0149', recurring: true }, at(15, 44), 0), true);
+  assert.equal(wanted(new Cron(cron),
+    { id: '058e0149', recurring: true }, at(15, 46), 0), false);
 });

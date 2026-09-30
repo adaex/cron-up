@@ -18,7 +18,7 @@ import {
   PATROL_LOG_ROTATE_BYTES,
 } from './constants.mjs';
 import { loadConfig, loadState, saveState } from './config.mjs';
-import { renewWorkspace, TaskFileChanged } from './tasks.mjs';
+import { maintainWorkspace, TaskFileChanged } from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wanted } from './cron.mjs';
 import {
   sessionLogPath,
@@ -353,21 +353,30 @@ export async function cmdRun(args) {
 
     for (const [ws, taskfile] of deps.discover(cfg.roots, cfg.maxDepth)) {
       // 一个工作区读不动不能中断整轮：discover 是生成器，这里抛了会跳过
-      // 后面所有工作区。续期与保活各自独立守卫——续期失败绝不压制该工作
-      // 区的会话保活。
-      if (cfg.autoRenew) {
+      // 后面所有工作区。续期/改 id 与保活各自独立守卫——维护失败绝不压制
+      // 该工作区的会话保活。两者合并为同一次原子写（见 maintainWorkspace）。
+      if (cfg.autoRenew || cfg.autoMinId) {
         try {
-          const n = renewWorkspace(taskfile);
-          if (n) {
-            deps.log(`已续期 ${ws}：${n} 个周期任务标记为 permanent，`
+          const { renewed, minified } = maintainWorkspace(taskfile, {
+            renew: cfg.autoRenew,
+            minify: cfg.autoMinId,
+          }) ?? { renewed: null, minified: null };
+          if (renewed) {
+            deps.log(`已续期 ${ws}：${renewed} 个周期任务标记为 permanent，`
               + '不再受 7 天过期限制');
+          }
+          if (minified) {
+            deps.log(`已改小 id ${ws}：${minified} 个周期任务的 id 改为小哈希`
+              + '值，投递延迟降到约 1 分钟内；下次预热拉起的新会话起生效，'
+              + '已在运行的会话要等其结束重拉（window 模式执行完即回收、'
+              + 'always 模式换代）后才读到新 id');
           }
         } catch (e) {
           if (e instanceof TaskFileChanged) {
-            deps.log(`续期暂缓 ${ws}：任务文件刚被 Claude Code 改动，`
-              + '本轮不覆盖，下轮再续');
+            deps.log(`维护暂缓 ${ws}：任务文件刚被 Claude Code 改动，`
+              + '本轮不覆盖，下轮再来');
           } else {
-            deps.log(`续期错误 ${ws}：${e.constructor.name}：${e.message}`);
+            deps.log(`维护错误 ${ws}：${e.constructor.name}：${e.message}`);
           }
         }
       }
@@ -402,8 +411,9 @@ export async function cmdRun(args) {
   }
 }
 
-// 立即给所有周期任务补 permanent。忽略 cfg.autoRenew——手动跑命令本身就
-// 是显式指令。与巡检共用同一把锁。
+// 立即给所有周期任务补 permanent 并把 id 改小。忽略 cfg.autoRenew /
+// cfg.autoMinId——手动跑命令本身就是显式指令（想只续期不改 id 的场景极
+// 少，真需要可临时关掉配置后跑巡检）。与巡检共用同一把锁。
 export async function cmdRenew(args) {
   const lock = deps.acquireRunLock();
   if (lock === null) {
@@ -414,13 +424,14 @@ export async function cmdRenew(args) {
     const cfg = loadConfig(args?.config ?? deps.paths.configPath);
     let files = 0;
     let tagged = 0;
+    let minified = 0;
     let unchanged = 0;
     const skipped = [];
     for (const [ws, taskfile] of deps.discover(cfg.roots, cfg.maxDepth)) {
       files += 1;
-      let n;
+      let r;
       try {
-        n = renewWorkspace(taskfile);
+        r = maintainWorkspace(taskfile, { renew: true, minify: true });
       } catch (e) {
         if (e instanceof TaskFileChanged) {
           deps.print(`暂缓 ${ws}：任务文件刚被 Claude Code 改动，本次未写入，`
@@ -432,20 +443,30 @@ export async function cmdRenew(args) {
         skipped.push(ws);
         continue;
       }
-      if (n === null) {
+      if (r === null) {
         deps.print(`跳过 ${ws}：任务文件读不出或格式损坏`);
         skipped.push(ws);
-      } else if (n) {
-        tagged += n;
-        deps.print(`已续期 ${ws}：${n} 个周期任务标记为 permanent`);
+        continue;
+      }
+      if (r.renewed || r.minified) {
+        if (r.renewed) {
+          tagged += r.renewed;
+          deps.print(`已续期 ${ws}：${r.renewed} 个周期任务标记为 permanent`);
+        }
+        if (r.minified) {
+          minified += r.minified;
+          deps.print(`已改小 id ${ws}：${r.minified} 个周期任务投递延迟降到约`
+            + ' 1 分钟内（下次预热的新会话起生效）');
+        }
       } else {
         unchanged += 1;
-        deps.print(`已是最新 ${ws}：周期任务均已 permanent，无需改动`);
+        deps.print(`已是最新 ${ws}：周期任务均已 permanent 且 id 已足够小，`
+          + '无需改动');
       }
     }
     deps.print('');
-    let line = `扫描 ${files} 个任务文件：本次续期 ${tagged} 个任务，`
-      + `${unchanged} 个文件无需改动`;
+    let line = `扫描 ${files} 个任务文件：本次续期 ${tagged} 个、改小 id `
+      + `${minified} 个任务，${unchanged} 个文件无需改动`;
     if (skipped.length) line += `，${skipped.length} 个跳过`;
     deps.print(line);
     if (tagged) {

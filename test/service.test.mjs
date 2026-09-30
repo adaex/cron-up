@@ -377,6 +377,16 @@ test('auto-renew flags set the value; omitted preserves', async (t) => {
   assert.equal(s.cfg().autoRenew, false); // 省略则保留
 });
 
+test('auto-min-id flags set the value; omitted preserves', async (t) => {
+  let s = await setupInstall(t);
+  await s.install({ autoMinId: false });
+  assert.equal(s.cfg().autoMinId, false);
+  await s.install({ autoMinId: true });
+  assert.equal(s.cfg().autoMinId, true);
+  await s.install();
+  assert.equal(s.cfg().autoMinId, true); // 省略则保留
+});
+
 test('bootstrap failure exits 1', async (t) => {
   const s = await setupInstall(t);
   s.deps.launchctl = (...a) => (a[0] === 'bootstrap'
@@ -407,11 +417,13 @@ test('without --force, ignored flags are named in output', async (t) => {
   const lines2 = [];
   s.deps.print = (m) => lines2.push(m);
   await cmdInstall({
-    roots: '/other', interval: 120, lead: 30, autoRenew: false, force: false,
+    roots: '/other', interval: 120, lead: 30, autoRenew: false,
+    autoMinId: false, force: false,
   });
   assert.ok(lines2.some((l) => l.includes('未生效')
     && l.includes('--roots') && l.includes('--interval')
-    && l.includes('--lead') && l.includes('--auto-renew')));
+    && l.includes('--lead') && l.includes('--auto-renew')
+    && l.includes('--auto-min-id')));
   // 参数全部忽略，配置原样。
   assert.deepEqual(s.cfg().roots, [s.tmp]);
   assert.equal(s.cfg().intervalSeconds, 300);

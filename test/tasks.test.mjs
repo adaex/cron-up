@@ -7,6 +7,10 @@ import {
   readTasks,
   loadTaskDoc,
   renewWorkspace,
+  maintainWorkspace,
+  minifyIds,
+  parseTaskIdN,
+  minTaskIdMaxN,
   atomicWriteJson,
   TaskFileChanged,
 } from '../src/tasks.mjs';
@@ -203,4 +207,127 @@ test('task view exposes the permanent flag', () => {
   assert.equal(taskView({ ...base, recurring: true }, NOW).permanent, false);
   assert.equal(taskView({ ...base, recurring: false, permanent: true }, NOW)
     .permanent, false);
+});
+
+// ---- autoMinId：id 改小 ----
+
+test('minTaskIdMaxN keeps daily delay within the target', () => {
+  const maxN = minTaskIdMaxN();
+  assert.equal(maxN, 5_965_232); // floor(60s / (0.5·86400s) · 2^32)
+  const delayOf = (n) => n / 2 ** 32 * 0.5 * 86400_000;
+  assert.ok(delayOf(maxN) <= 60_000);
+  assert.ok(delayOf(maxN + 1) > 60_000);
+});
+
+test('parseTaskIdN accepts only strict 8-hex ids', () => {
+  assert.equal(parseTaskIdN('00000001'), 1);
+  assert.equal(parseTaskIdN('058e0149'), 0x058e0149);
+  assert.equal(parseTaskIdN('abc'), null);          // 太短
+  assert.equal(parseTaskIdN('058e0149-aaaa-bbbb'), null); // UUID 长串
+  assert.equal(parseTaskIdN('zzzzzzzz'), null);     // 非 hex
+  assert.equal(parseTaskIdN(undefined), null);
+  assert.equal(parseTaskIdN(123), null);
+});
+
+test('minifyIds assigns free small numbers to oversized recurring ids', () => {
+  const tasks = [
+    { id: 'c1363d8b', recurring: true },
+    { id: '668aafd9', recurring: true },
+  ];
+  assert.equal(minifyIds(tasks), 2);
+  assert.equal(tasks[0].id, '00000001');
+  assert.equal(tasks[1].id, '00000002');
+});
+
+test('minifyIds never reuses an id already taken in the file', () => {
+  // 一个一次性任务占着 00000001，另一个达标周期任务占着 00000003：大 id
+  // 周期任务只能拿空号 00000002。
+  const tasks = [
+    { id: '00000001', recurring: false },
+    { id: '00000003', recurring: true },
+    { id: 'c1363d8b', recurring: true },
+  ];
+  assert.equal(minifyIds(tasks), 1);
+  assert.equal(tasks[2].id, '00000002');
+  const ids = tasks.map((t) => t.id);
+  assert.equal(new Set(ids).size, ids.length, '文件内 id 唯一');
+});
+
+test('minifyIds keeps qualifying ids and is idempotent', () => {
+  const maxN = minTaskIdMaxN();
+  const atEdge = maxN.toString(16).padStart(8, '0');
+  const over = (maxN + 1).toString(16).padStart(8, '0');
+  const tasks = [
+    { id: '00000000', recurring: true }, // hash 0，延迟 0
+    { id: atEdge, recurring: true },     // 恰好达标
+    { id: over, recurring: true },       // 超界 1 号
+    { id: 'c1363d8b', recurring: false }, // 一次性：再大也不动
+    { cron: '0 5 * * *' },               // 无 recurring 标志：不碰
+  ];
+  assert.equal(minifyIds(tasks), 1);
+  assert.equal(tasks[0].id, '00000000');
+  assert.equal(tasks[1].id, atEdge);
+  assert.equal(tasks[2].id, '00000001');
+  assert.equal(tasks[3].id, 'c1363d8b');
+  assert.equal(tasks[4].id, undefined);
+  // 第二轮：全部达标，0 改动。
+  assert.equal(minifyIds(tasks), 0);
+});
+
+test('maintainWorkspace minifies in one atomic round-trip', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({
+    tasks: [
+      { id: 'c1363d8b', cron: '0 13 * * *', recurring: true, prompt: 'x' },
+    ],
+    version: 7,
+  }));
+  const r = maintainWorkspace(file, { minify: true });
+  assert.deepEqual(r, { renewed: 0, minified: 1 });
+  const doc = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  assert.equal(doc.tasks[0].id, '00000001');
+  assert.equal(doc.version, 7, '未知顶层键 round-trip 保留');
+});
+
+test('maintainWorkspace does renew and minify together', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({
+    tasks: [{ id: 'c1363d8b', cron: '0 13 * * *', recurring: true }],
+  }));
+  const r = maintainWorkspace(file, { renew: true, minify: true });
+  assert.deepEqual(r, { renewed: 1, minified: 1 });
+  const task = JSON.parse(fs.readFileSync(file, 'utf-8')).tasks[0];
+  assert.equal(task.permanent, true);
+  assert.equal(task.id, '00000001');
+});
+
+test('maintainWorkspace minify=false leaves ids alone', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({
+    tasks: [{ id: 'c1363d8b', recurring: true, permanent: true }],
+  }));
+  const before = fs.readFileSync(file, 'utf-8');
+  const r = maintainWorkspace(file, { renew: true, minify: false });
+  assert.deepEqual(r, { renewed: 0, minified: 0 });
+  assert.equal(fs.readFileSync(file, 'utf-8'), before);
+});
+
+test('maintainWorkspace second round is a byte-level noop', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({
+    tasks: [{ id: 'c1363d8b', recurring: true }],
+  }));
+  maintainWorkspace(file, { minify: true });
+  const st1 = fs.statSync(file);
+  const r2 = maintainWorkspace(file, { minify: true });
+  const st2 = fs.statSync(file);
+  assert.deepEqual(r2, { renewed: 0, minified: 0 });
+  assert.equal(st2.ino, st1.ino);
+  assert.equal(st2.mtimeNs, st1.mtimeNs);
+});
+
+test('maintainWorkspace returns null on a broken file', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, '{ broken');
+  assert.equal(maintainWorkspace(file, { minify: true }), null);
 });

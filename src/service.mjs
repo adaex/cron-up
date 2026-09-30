@@ -280,6 +280,7 @@ export async function cmdInstall(args) {
     if (args.interval !== undefined) ignored.push('--interval');
     if (args.lead !== undefined) ignored.push('--lead');
     if (args.autoRenew !== undefined) ignored.push('--auto-renew');
+    if (args.autoMinId !== undefined) ignored.push('--auto-min-id');
     if (args.sessionRetain !== undefined) ignored.push('--session-retain');
     if (ignored.length > 0) {
       deps.print(`警告：参数 ${ignored.join('、')} 未生效（现有配置保留）；`
@@ -338,6 +339,7 @@ export async function cmdInstall(args) {
       overrides.leadSeconds = args.lead;
     }
     if (args.autoRenew !== undefined) overrides.autoRenew = args.autoRenew;
+    if (args.autoMinId !== undefined) overrides.autoMinId = args.autoMinId;
     if (args.sessionRetain !== undefined) {
       if (args.sessionRetain !== 'window' && args.sessionRetain !== 'always') {
         deps.printErr(`--session-retain 只接受 window 或 always，当前为 ${JSON.stringify(args.sessionRetain)}`);
