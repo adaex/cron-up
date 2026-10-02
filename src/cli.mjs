@@ -4,7 +4,7 @@
 
 // 先引全量入口，保证所有业务模块都已向 deps 自注册，再引命令函数。
 import './index.mjs';
-import { deps, ExitError } from './internals.mjs';
+import { deps, ExitError, isDecInt } from './internals.mjs';
 import { cmdRun, cmdRenew } from './patrol.mjs';
 import { cmdInstall, cmdUninstall } from './service.mjs';
 import { cmdList } from './list.mjs';
@@ -40,10 +40,10 @@ const SPECS = {
   },
 };
 
-// 严格十进制整数命令行值：Number("0x10")、parseInt("5x") 都会静默给出错
-// 误结果，必须显式拒绝。
+// 严格十进制整数命令行值（谓词 isDecInt 见 internals）：
+// Number("0x10")、parseInt("5x") 都会静默给出错误结果，必须显式拒绝。
 function cliInt(s) {
-  if (!/^-?\d+$/.test(s)) {
+  if (!isDecInt(s)) {
     throw new ExitError(2, `需要整数却得到：${s}`);
   }
   return parseInt(s, 10);
@@ -157,7 +157,7 @@ export function parseCli(argv) {
   return result;
 }
 
-export const USAGE = `cron-up —— 为定时任务提前备好交互会话
+const USAGE = `cron-up —— 为定时任务提前备好交互会话
 
 用法：
   cron-up                    查看总览（服务、配置、任务、会话）

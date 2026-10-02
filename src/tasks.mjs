@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps } from './internals.mjs';
+import { deps, isPlainObject } from './internals.mjs';
 import { TASK_REL } from './paths.mjs';
 import {
   PRUNE_DIRS,
@@ -20,7 +20,7 @@ export function expandHome(p) {
   return p; // ~user 形式不支持（macOS 实践中不会出现）
 }
 
-function isDir(p) {
+export function isDir(p) {
   try {
     return fs.statSync(p).isDirectory();
   } catch {
@@ -36,22 +36,33 @@ function realpathOrNull(p) {
   }
 }
 
+// 宽容版 realpath：失败时退回词法绝对路径（输入须已绝对）。与
+// realpathOrNull 的「失败即 null」是两种降级口径：会话登记匹配（registry）
+// 与日志定位（logs）要的是一个还能用的路径，而不是 null。
+export function lexReal(p) {
+  try {
+    return fs.realpathSync(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+// 任务文件是否还在：readTasks 读出 null 时区分「文件已消失」（一次性任务
+// 执行完被删的正常竞态）与「文件在但损坏」（要告警）。路径拼法归任务层，
+// 巡检与总览不必各自重建。
+export function taskFileExists(ws) {
+  return fs.existsSync(path.join(ws, TASK_REL));
+}
+
 // 路径在磁盘上真实存储的大小写形态；任何一段读不出时原样返回。
 // macOS 默认文件系统大小写不敏感，而 realpath 不规范化大小写：敲错大小
 // 写的路径照样通过 isDirectory，却与会话登记里真实大小写的 cwd 永远匹配
 // 不上。在扫描边界认回一次真实写法，下游就不必各自提防。
 export function onDiskCase(p) {
-  const parts = [];
-  let cur = path.resolve(p).replace(/\/+$/, '') || '/';
-  while (true) {
-    const head = path.dirname(cur);
-    const tail = path.basename(cur);
-    if (!tail || head === cur) break;
-    parts.push(tail);
-    cur = head;
-  }
-  // cur 停在根，自顶向下逐段认回磁盘上的真实条目名。
-  for (const name of parts.reverse()) {
+  // resolve 的输出不含双斜杠与尾部斜杠（根除外），按段拆开自顶向下认回。
+  const parts = path.resolve(p).split('/').filter(Boolean);
+  let cur = '/';
+  for (const name of parts) {
     let entries;
     try {
       entries = fs.readdirSync(cur);
@@ -91,16 +102,19 @@ export function* discover(roots, maxDepth) {
         ? []
         : entries.filter((e) => e.isDirectory() && !PRUNE_DIRS.has(e.name));
       const candidate = path.join(dirpath, TASK_REL);
-      const ws = realpathOrNull(dirpath);
       let isFile = false;
       try {
         isFile = fs.statSync(candidate).isFile();
       } catch {
-        isFile = false;
+        // 不存在按非文件处理。
       }
-      if (ws && isFile && !seen.has(ws)) {
-        seen.add(ws);
-        yield [ws, candidate];
+      // 先判有没有任务文件再 realpath：绝大多数目录没有，省一次 syscall。
+      if (isFile) {
+        const ws = realpathOrNull(dirpath);
+        if (ws && !seen.has(ws)) {
+          seen.add(ws);
+          yield [ws, candidate];
+        }
       }
       for (const d of subdirs) {
         yield* walk(path.join(dirpath, d.name));
@@ -108,10 +122,6 @@ export function* discover(roots, maxDepth) {
     }
     yield* walk(root);
   }
-}
-
-function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
 // 读一个工作区的任务列表，坏形状一律返回 null。
@@ -245,11 +255,11 @@ export function minifyIds(tasks) {
 }
 
 // 一轮巡检对一个任务文件做的维护：renew（补 permanent）与 minify（id 改
-// 小）合并为同一次受 mtime 乐观锁保护的原子写。外壳与旧 renewWorkspace
-// 完全一致：先取 mtimeNs、清残留 .cron-up-tmp、loadTaskDoc round-trip 整
-// 文档；两项计数都为 0 时字节级不动。返回 {renewed,minified}；null 表示
-// 文件缺失/损坏；读到写间被改抛 TaskFileChanged。
-export function maintainWorkspace(taskfile, { renew = false, minify = false } = {}) {
+// 小）合并为同一次受 mtime 乐观锁保护的原子写。先取 mtimeNs、清残留
+// .cron-up-tmp、loadTaskDoc round-trip 整文档；两项计数都为 0 时字节级
+// 不动。返回 {renewed,minified}；null 表示文件缺失/损坏；读到写间被改抛
+// TaskFileChanged。
+export function maintainWorkspace(taskfile, { renew = false, minify = false }) {
   let mtimeNs;
   try {
     mtimeNs = fs.statSync(taskfile, { bigint: true }).mtimeNs;
@@ -283,12 +293,6 @@ export function maintainWorkspace(taskfile, { renew = false, minify = false } = 
   if (renewed === 0 && minified === 0) return { renewed: 0, minified: 0 };
   atomicWriteJson(taskfile, doc, mtimeNs);
   return { renewed, minified };
-}
-
-// 手动 renew 的薄封装：只补 permanent（不改 id），保持 null/0/N 三态契约。
-export function renewWorkspace(taskfile) {
-  const r = maintainWorkspace(taskfile, { renew: true });
-  return r === null ? null : r.renewed;
 }
 
 Object.assign(deps, { discover, readTasks, loadTaskDoc });

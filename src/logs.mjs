@@ -6,8 +6,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { deps, ExitError } from './internals.mjs';
-import { onDiskCase } from './tasks.mjs';
+import { onDiskCase, lexReal } from './tasks.mjs';
 import { sessionLogPath } from './sessions.mjs';
+import { fmtMDHM } from './display.mjs';
 
 export function resolveLogPath(workspace, announce) {
   const say = announce ?? ((m) => deps.printErr(m));
@@ -15,13 +16,7 @@ export function resolveLogPath(workspace, announce) {
     if (path.isAbsolute(workspace)) {
       // 日志名由工作区路径折成，而 spawn 记的是 discover 规范化后的真实
       // 大小写：敲错大小写的绝对路径必须认回同一个文件。
-      let real;
-      try {
-        real = fs.realpathSync(workspace);
-      } catch {
-        real = workspace;
-      }
-      const file = sessionLogPath(onDiskCase(real));
+      const file = sessionLogPath(onDiskCase(lexReal(workspace)));
       return fs.existsSync(file) ? file : null;
     }
     // 只匹配当前日志（*.log）：.log.1 若参与匹配，轮转过一次的工作区会永
@@ -48,11 +43,8 @@ export function resolveLogPath(workspace, announce) {
   if (!fs.existsSync(out)) return err;
   try {
     if (fs.statSync(err).size > 0) {
-      const mtime = fs.statSync(err).mtime;
-      const p = (n) => String(n).padStart(2, '0');
-      const stamp = `${p(mtime.getMonth() + 1)}-${p(mtime.getDate())} `
-        + `${p(mtime.getHours())}:${p(mtime.getMinutes())}`;
-      say(`注：${err} 有内容（最后写入 ${stamp}），巡检若异常先看它`);
+      say(`注：${err} 有内容（最后写入 ${fmtMDHM(fs.statSync(err).mtime)}），`
+        + '巡检若异常先看它');
     }
   } catch {
     // err 不存在：无事。

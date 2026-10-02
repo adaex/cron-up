@@ -4,10 +4,8 @@ import {
   parseCronOrNone,
   taskIsOneshot,
   wanted,
-  predictedFire,
-  recurringTailWindow,
+  nextDelivery,
 } from './cron.mjs';
-import { DISPLAY_SEARCH_DAYS, ZERO_LEAD_MS } from './constants.mjs';
 
 // 等宽终端里的宽字符区间（CJK 文字、全角标点、谚文、常用 emoji）：启发式
 // 只覆盖任务摘要里真实出现的形态，区间外一律按 1 列——判错的代价仅是对
@@ -64,7 +62,7 @@ export function humanDelta(ms) {
 
 // list/总览上代表任务身份的一句话：prompt 的首个非空行。真实任务第一行
 // 通常自带标题；取不到时如实标注，不留空白格。
-export function taskSummary(task) {
+function taskSummary(task) {
   const prompt = task?.prompt;
   if (typeof prompt !== 'string' || !prompt.trim()) return '（无任务描述）';
   const first = prompt.split('\n').map((l) => l.trim()).find((l) => l) ?? '';
@@ -74,7 +72,7 @@ export function taskSummary(task) {
 // 把一个任务整理成展示数据。字段来自别的程序写的文件，畸形也不抛。
 // 传 leadMs 时顺带在同一个已解析 cron 上回答「现在是否需要预热会话」
 // （wanted），总览页就不必为同一任务再解析一遍 cron。
-export function taskView(task, now, leadMs = undefined) {
+export function taskView(task, now, leadMs) {
   const expr = task?.cron;
   const cron = parseCronOrNone(expr);
   if (cron === null || !cron.satisfiable) {
@@ -92,23 +90,21 @@ export function taskView(task, now, leadMs = undefined) {
   }
   const oneshot = taskIsOneshot(task);
   // nxt 按定义不晚于展示语境里的下一次投递，「已错过」完全由补执行判定
-  // 回答。
-  const missed = oneshot && wanted(cron, task, now, ZERO_LEAD_MS);
-  // 周期任务的投递尾窗内，即将到来的投递属于上一落点：展示落点对齐到
-  // 那个已过的 slot，箭头才画得出「09:00 → 09:30」，而不是从明天的落点
-  // 拐回来（2 月 29 日任务尾窗内 nextAfter 甚至找不到下一落点）。fire 与
-  // 落点同源，两边不会各说各话。
-  const tail = oneshot ? null : recurringTailWindow(cron, task?.id, now);
-  const nxt = tail ? tail[0] : cron.nextAfter(now, DISPLAY_SEARCH_DAYS);
+  // 回答：lead 传 0（不带前瞻），与巡检的补执行判定同一口径。
+  const missed = oneshot && wanted(cron, task, now, 0);
+  // 落点与投递由 nextDelivery 同源算出：尾窗内的周期任务即将到来的是上
+  // 一落点的这次延迟投递，箭头才画得出「09:00 → 09:30」，而不是从明天
+  // 的落点拐回来（2 月 29 日任务尾窗内 nextAfter 甚至找不到下一落点）。
+  const { slot, fire } = nextDelivery(cron, task, now);
   return {
     valid: true,
     // 已错过的一次性任务没有未来触发：nxt 置 null，否则「一年内无」的判
     // 断和总览「最近」（fire ?? nxt）会把它当成明年同刻的安排。
-    nxt: missed ? null : nxt,
+    nxt: missed ? null : slot,
     missed,
     kind: oneshot ? '一次性' : '周期',
     permanent: Boolean(task.permanent) && !oneshot,
-    cadence: typeof expr === 'string' ? expr : String(expr),
+    cadence: String(expr),
     summary: taskSummary(task),
     // wanted 恒为 null 或布尔：没传 leadMs（不问）与 cron 无效（问不了）
     // 都是 null，键的形状不随参数变化。
@@ -116,7 +112,7 @@ export function taskView(task, now, leadMs = undefined) {
     // 计入 Claude Code 投递抖动后的预计实际触发时刻；已错过的一次性任务
     // 没有未来触发，为 null；尾窗内的周期任务是即将到来的这次延迟投递。
     // 与 nxt 同为 Date 或 null。
-    fire: missed ? null : (tail ? new Date(tail[1]) : predictedFire(task, now)),
+    fire: missed ? null : fire,
   };
 }
 
@@ -131,6 +127,12 @@ function sameMinute(a, b) {
     && a.getMinutes() === b.getMinutes();
 }
 
+// 两位数字补零：时间戳格式的公共零件，巡检日志的时间戳（patrol 的 log）
+// 也复用。
+export function pad2(n) {
+  return String(n).padStart(2, '0');
+}
+
 // 「设定落点 → 预计实际触发」文案。抖动四舍五入到秒（调度器秒级轮询）：
 // 同日省略第二个日期；预计值带非零秒时显示 HH:MM:SS（如 05:15:37）；落
 // 在同一分钟（无抖动）则只显示落点，不画无意义的箭头。
@@ -140,25 +142,22 @@ export function fmtFireRange(nxt, fire) {
   }
   const r = new Date(Math.round(fire.getTime() / 1000) * 1000);
   if (sameMinute(nxt, r)) return fmtMDHM(nxt);
-  const p = (n) => String(n).padStart(2, '0');
   const tail = sameDay(nxt, r)
-    ? `${p(r.getHours())}:${p(r.getMinutes())}`
-      + (r.getSeconds() ? `:${p(r.getSeconds())}` : '')
-    : `${fmtMDHM(r)}${r.getSeconds() ? `:${p(r.getSeconds())}` : ''}`;
+    ? `${pad2(r.getHours())}:${pad2(r.getMinutes())}`
+      + (r.getSeconds() ? `:${pad2(r.getSeconds())}` : '')
+    : `${fmtMDHM(r)}${r.getSeconds() ? `:${pad2(r.getSeconds())}` : ''}`;
   return `${fmtMDHM(nxt)} → ${tail}`;
 }
 
 // 仅 HH:MM（总览「（设定 HH:MM）」附注用）。
 export function fmtHM(d) {
-  const p = (n) => String(n).padStart(2, '0');
-  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
 // MM-DD HH:MM（任务触发点的统一展示格式）。
 export function fmtMDHM(d) {
-  const p = (n) => String(n).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:`
-    + `${p(d.getMinutes())}`;
+  return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
+    + `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
 }
 
 // 会话年龄的粗粒度中文：长驻按天计，否则按分钟。

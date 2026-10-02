@@ -18,6 +18,18 @@ export class ExitError extends Error {
   }
 }
 
+// 外部程序写的 JSON 顶层形状守卫：config/state/任务文件三个入口共用，要收紧
+// （如拒绝类实例）只改这一处。
+export function isPlainObject(v) {
+  return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+// 严格十进制整数（可选负号 + 纯数字）：parseInt("5x")、Number("0x10") 都会
+// 静默给出错误结果，来自外部字符串的整数一律先过这个谓词再 parseInt。
+export function isDecInt(s) {
+  return /^-?\d+$/.test(s);
+}
+
 // 非 0 退出不抛：调用 ps/launchctl 的地方只关心 status 与输出，抛了反而
 // 要在每个调用点 catch。返回 {status, stdout, stderr}。
 function execFile(file, args, opts = {}) {

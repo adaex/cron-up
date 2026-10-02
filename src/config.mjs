@@ -4,9 +4,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, ExitError } from './internals.mjs';
-import { DEFAULT_CONFIG, PID_T_MAX } from './constants.mjs';
-import { expandHome } from './tasks.mjs';
+import { deps, ExitError, isPlainObject, isDecInt } from './internals.mjs';
+import { DEFAULT_CONFIG, PID_T_MAX, HEARTBEAT_STALE_FACTOR } from './constants.mjs';
+import { expandHome, isDir } from './tasks.mjs';
 
 // Shell 的 tilde 展开只发生在词首："--roots ~/a,~/b" 穿过 shell 后第二个
 // 条目前的 ~ 还在。读和写两边都规范化，配置里永远存绝对路径。
@@ -20,10 +20,6 @@ export function normalizeRoots(roots) {
     out.push(path.resolve(expandHome(s)));
   }
   return out;
-}
-
-function isPlainObject(v) {
-  return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
 // 配置数值校验用：JSON 的 true 是布尔不能冒充秒数/深度
@@ -41,10 +37,23 @@ export function lenientInt(v) {
     if (!Number.isFinite(v)) throw new Error('数值越界');
     return Math.trunc(v); // 1.5 → 1
   }
-  if (typeof v === 'string' && /^-?\d+$/.test(v.trim())) {
+  if (typeof v === 'string' && isDecInt(v.trim())) {
     return parseInt(v.trim(), 10);
   }
   throw new Error(`无法整型化：${String(v)}`);
+}
+
+// pid 清洗：宽容解析后卡 pid_t 值域，不合法返回 null。state.json 与会话
+// 登记两个外部来源共用同一条入口规则——超大整数能穿过类型转换直到
+// process.kill 才抛，负数 pid 会被 kill 当成进程组号误伤无辜进程组。
+export function parsePid(v) {
+  let pid;
+  try {
+    pid = lenientInt(v);
+  } catch {
+    return null;
+  }
+  return pid > 0 && pid <= PID_T_MAX ? pid : null;
 }
 
 // 配置字段的类型规则，loadConfig 与 install --force 继承旧配置共用。返回
@@ -136,13 +145,7 @@ export function loadState() {
   for (const [ws, raw] of Object.entries(state)) {
     if (!isPlainObject(raw)) continue;
     const ent = { ...raw };
-    let pid = null;
-    try {
-      pid = lenientInt(ent.pid);
-    } catch {
-      pid = null;
-    }
-    ent.pid = pid && pid > 0 && pid <= PID_T_MAX ? pid : null;
+    ent.pid = parsePid(ent.pid);
     for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince']) {
       if (ent[k] !== null && ent[k] !== undefined) {
         try {
@@ -205,6 +208,12 @@ export function saveHeartbeat(doc) {
   atomicSave(deps.paths.heartbeatPath, doc);
 }
 
+// 心跳是否已沉默超过 HEARTBEAT_STALE_FACTOR 个轮次间隔：轮首的漏轮提示与
+// 总览页的「服务在但巡检没在跑」共用同一判据，两边不会各说各话。
+export function heartbeatStale(hb, intervalSeconds, nowSec) {
+  return hb !== null && nowSec - hb.ranAt > intervalSeconds * HEARTBEAT_STALE_FACTOR;
+}
+
 export function saveConfig(cfg) {
   atomicSave(deps.paths.configPath, cfg);
 }
@@ -224,13 +233,7 @@ export function validateConfig(cfg, announce = () => {}) {
       + '两轮巡检之间到期而来不及提前启动会话，建议 lead ≥ interval');
   }
   for (const root of cfg.roots ?? []) {
-    let dir = false;
-    try {
-      dir = fs.statSync(root).isDirectory();
-    } catch {
-      dir = false;
-    }
-    if (!dir) warnings.push(`扫描目录不存在，巡检不会覆盖它：${root}`);
+    if (!isDir(root)) warnings.push(`扫描目录不存在，巡检不会覆盖它：${root}`);
   }
   for (const w of warnings) announce(`警告：${w}`);
   return warnings;

@@ -7,8 +7,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { deps } from './internals.mjs';
-import { lenientInt } from './config.mjs';
-import { PID_T_MAX } from './constants.mjs';
+import { parsePid } from './config.mjs';
+import { lexReal } from './tasks.mjs';
 
 // npm/bun 形态的 claude 是解释器跑的脚本：进程 comm 是 node/bun/deno，
 // 只能从完整命令行认 claude 入口（bin/claude 符号链接或包目录 cli.js）。
@@ -41,7 +41,7 @@ export function pidIsClaude(pid) {
 // 读一个登记文件；读不出返回 null。Claude Code 会就地（非原子）重写登
 // 记，读写相撞读到半个 JSON 时睡一拍重读一次；文件消失不是竞态，不重
 // 试。
-export async function readSessionFile(file) {
+async function readSessionFile(file) {
   for (let attempt = 0; attempt < 2; attempt++) {
     let text;
     try {
@@ -58,16 +58,6 @@ export async function readSessionFile(file) {
     await deps.sleep(100);
   }
   return null;
-}
-
-// 宽容版 realpath：fs.realpathSync 对不存在的路径抛 ENOENT，这里失败时退
-// 回词法绝对路径（调用方已保证输入是绝对路径）。
-function lexReal(p) {
-  try {
-    return fs.realpathSync(p);
-  } catch {
-    return path.resolve(p);
-  }
 }
 
 // 返回 [拥有活消费者会话的工作区集合, 告警字符串|null]。
@@ -99,15 +89,9 @@ export async function scanSessions() {
     // 数都读不出活进程。这段代码在 per-workspace 保护圈之外，一个畸形登
     // 记抛出去就是整轮巡检失败；缺失时兜底 -1 还会被 kill(-1,0)（对全
     // 部进程的权限探测，不是存在性检查）误读为存活。
-    let pid;
-    try {
-      pid = lenientInt(s.pid);
-    } catch {
+    const pid = parsePid(s.pid);
+    if (pid === null) {
       suspect += 1; // 正常登记必带可解析 pid：缺失/变质即字段漂移
-      continue;
-    }
-    if (!(pid > 0 && pid <= PID_T_MAX)) {
-      suspect += 1;
       continue;
     }
     if (!deps.alive(pid)) continue; // 陈旧登记（崩溃留下）：正常，不计
@@ -120,11 +104,8 @@ export async function scanSessions() {
       // 热被静默跳过。
       const cwd = s.cwd;
       if (typeof cwd === 'string' && path.isAbsolute(cwd)) {
-        const real = lexReal(cwd);
-        if (real) {
-          consumers.add(real);
-          continue;
-        }
+        consumers.add(lexReal(cwd));
+        continue;
       }
       suspect += 1; // 活着的 claude 却没有可用 cwd：cwd 字段漂移
     } else {

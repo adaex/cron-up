@@ -11,10 +11,11 @@ import {
   loadState,
   validateConfig,
   loadHeartbeat,
+  heartbeatStale,
 } from './config.mjs';
-import { packageVersion, TASK_REL } from './paths.mjs';
+import { taskFileExists } from './tasks.mjs';
+import { packageVersion } from './paths.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
-import { HEARTBEAT_STALE_FACTOR } from './constants.mjs';
 import {
   humanDelta,
   clip,
@@ -47,7 +48,7 @@ function overviewTasks(cfg, cols, consumers, state) {
     if (tasks === null) {
       // 与巡检同一条规则：文件还在却读不出，总览页要把它摆进「需要留
       // 意」，而不是装作这个工作区不存在。
-      if (fs.existsSync(path.join(ws, TASK_REL))) {
+      if (taskFileExists(ws)) {
         alerts.push(`${ws} 的任务文件读不出：其中的定时任务一个都不会执行`);
       }
       continue;
@@ -94,7 +95,7 @@ function overviewTasks(cfg, cols, consumers, state) {
         // 失败计数放在句子中部：总览告警按终端宽度截尾，计数比尾部的
         // 「下轮会自动启动」更该活下来；满额后的去向由「冷却中」那条合并
         // 告警解释，这里不重复。
-        const fails = (state[ws] ?? {}).fails ?? 0;
+        const fails = ent.fails ?? 0;
         const streak = fails > 0 ? `，近期已失败 ${fails} 次` : '';
         alerts.push(`${ws} 有任务即将执行（或错过待补执行）${streak}，`
           + '但当前没有交互会话，下轮巡检会自动启动');
@@ -124,8 +125,7 @@ function overviewTasks(cfg, cols, consumers, state) {
   return [alerts, coolingWarned, discovered];
 }
 
-function overviewSessions(cols, state, suppressCooling = new Set(),
-  discovered = null) {
+function overviewSessions(cols, state, suppressCooling, discovered) {
   const alerts = [];
   const cur = Math.floor(Date.now() / 1000);
   const live = [];
@@ -243,16 +243,14 @@ export async function cmdOverview(args) {
     // 心跳能戳穿。服务未加载（info 为 null）时不告警，服务行已说明未安装。
     if (heartbeat) {
       deps.print(`上次巡检：${elapsedZh(curOv - heartbeat.ranAt)}前`);
-      if (info
-          && curOv - heartbeat.ranAt
-            > cfg.intervalSeconds * HEARTBEAT_STALE_FACTOR) {
+      if (info && heartbeatStale(heartbeat, cfg.intervalSeconds, curOv)) {
         alerts.push(`巡检已沉默 ${elapsedZh(curOv - heartbeat.ranAt)}：launchd `
           + `显示服务已加载（配置每 ${cfg.intervalSeconds} 秒一轮），但最近没有`
           + '成功跑完的轮次，启动链可能已失效；请运行 cron-up logs 查看巡检'
           + '日志，必要时重跑 cron-up install');
       }
     }
-    alerts.push(...validateConfig(cfg, () => {}));
+    alerts.push(...validateConfig(cfg));
     deps.print('');
     const [taskAlerts, cooled, found] = overviewTasks(cfg, cols, consumers, state);
     alerts.push(...taskAlerts);

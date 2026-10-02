@@ -24,16 +24,22 @@ import {
   saveState,
   loadHeartbeat,
   saveHeartbeat,
+  heartbeatStale,
 } from './config.mjs';
-import { maintainWorkspace, TaskFileChanged } from './tasks.mjs';
+import {
+  maintainWorkspace,
+  TaskFileChanged,
+  taskFileExists,
+} from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wanted } from './cron.mjs';
 import {
   sessionLogPath,
   sessionLogIdleSeconds,
   scriptProcLogPath,
+  rotateOnce,
 } from './sessions.mjs';
 import { TASK_REL, packageVersion } from './paths.mjs';
-import { elapsedZh } from './display.mjs';
+import { elapsedZh, pad2 } from './display.mjs';
 
 // 事件类型 → 轮末汇总里的中文标签。patrolWorkspace 与 cmdRun 往同一个
 // stats 计数器里记账，平静轮也会打出「本轮无动作」。
@@ -56,10 +62,9 @@ function bump(stats, kind) {
 
 export function log(msg) {
   const d = new Date();
-  const p = (n) => String(n).padStart(2, '0');
   deps.print(
-    `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
-    + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())} ${msg}`,
+    `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
+    + `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())} ${msg}`,
   );
 }
 
@@ -137,15 +142,14 @@ export function releaseLock(handle) {
 
 export function rotatePatrolLogs() {
   // launchd 按路径每次重开文件，轮初改名是安全的：本轮 fd 继续写改名后
-  // 的 inode，下轮打开新文件。
+  // 的 inode，下轮打开新文件。超阈值才轮转，与会话日志的「无条件保留一
+  // 代」共用 rotateOnce 的 rm+rename 顺序。
   for (const name of ['launchd.out.log', 'launchd.err.log']) {
     const file = path.join(deps.paths.logDir, name);
     try {
       if (fs.existsSync(file)
           && fs.statSync(file).size > PATROL_LOG_ROTATE_BYTES) {
-        const old = `${file}.1`;
-        fs.rmSync(old, { force: true });
-        fs.renameSync(file, old);
+        rotateOnce(file);
       }
     } catch {
       // 轮转失败不阻断巡检。
@@ -168,9 +172,11 @@ function needHorizonMs(tasks, now) {
 }
 
 // 保证一个工作区里有一个健康的消费者会话。原地修改 state。retain 来自
-// cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。
+// cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。scriptProcs
+// 是进程表快照或 null：null 时仅在需要认领孤儿（state 丢失的兜底分支）当
+// 下才拍快照，平静轮不付全量 ps 的代价。
 export async function patrolWorkspace(
-  ws, state, now, leadMs, cur, consumers, scriptProcs = [],
+  ws, state, now, leadMs, cur, consumers, scriptProcs = null,
   retain = 'always', stats = null,
 ) {
   const tasks = deps.readTasks(ws);
@@ -186,7 +192,7 @@ export async function patrolWorkspace(
     // 任务文件读不出：证据太弱，绝不动会话；但不能不吭声——文件还在却读
     // 不出意味着这个目录的定时任务一个都不会执行。文件已消失则是正常竞
     // 态（一次性任务执行完被删），不报。
-    if (fs.existsSync(path.join(ws, TASK_REL))) {
+    if (taskFileExists(ws)) {
       note('warn', `任务文件读不出 ${ws}：格式损坏或不可读，本轮跳过该目录，`
         + `其中 ${TASK_REL} 里的定时任务都不会执行`);
     }
@@ -222,8 +228,7 @@ export async function patrolWorkspace(
       mineAlive = false;
       // 消费者快照拍于轮初，被换代的这代可能正是快照里的消费者：重扫一
       // 次，别让陈旧登记挡住下面的重拉。
-      const [fresh] = await deps.scanSessions();
-      consumers = fresh;
+      consumers = (await deps.scanSessions())[0];
     }
   }
 
@@ -252,8 +257,7 @@ export async function patrolWorkspace(
     mineAlive = false;
     // 同上：快照里的消费者可能正是刚结束的这代。用户自己的会话若在场，
     // 重扫依旧看见，不会在同目录双开。
-    const [fresh] = await deps.scanSessions();
-    consumers = fresh;
+    consumers = (await deps.scanSessions())[0];
   }
 
   // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
@@ -263,17 +267,16 @@ export async function patrolWorkspace(
     ent.fails = 0;
   }
 
+  // 任务正在被消费。可能是我们的预热会话（已登记——上面的健康清零已覆
+  // 盖），也可能是用户的交互会话——后者放手：不在这里删死条目，失败计数
+  // 要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），由轮
+  // 末 kept 过滤统一处理。先于 wanted 判定返回：有消费者在场的平稳态不必
+  // 为整组任务跑一遍 cron 求值。
+  if (consumers.has(ws)) return;
+
   if (!tasks.some((t) => taskWanted(t, now, leadMs))) return;
 
   const cooling = Boolean(ent && (ent.cooldownUntil ?? 0) > cur);
-
-  if (consumers.has(ws)) {
-    // 任务正在被消费。可能是我们的预热会话（已登记——上面的健康清零已覆
-    // 盖），也可能是用户的交互会话——后者放手：不在这里删死条目，失败计数
-    // 要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），由轮
-    // 末 kept 过滤统一处理。
-    return;
-  }
 
   // 活着但没有消费。健康只在真实启动所需的时间内成立；超时就是卡在无人
   // 应答的提问界面，永不登记——退休它并推进失败计数。
@@ -316,7 +319,7 @@ export async function patrolWorkspace(
     // 不会出现在登记里，直接再拉就是同目录双开。认回孤儿，重新纳入正常
     // 生命周期（卡死的 3 分钟后照退休处理）。
     const logPath = sessionLogPath(ws);
-    for (const [procPid, procArgs] of scriptProcs) {
+    for (const [procPid, procArgs] of scriptProcs ?? deps.listScriptProcesses()) {
       // alive 复核：快照拍于本轮开头，可能含着刚被换代/回收杀掉的 pid——
       // 把死人认回来会白记一次失败。
       if (scriptProcLogPath(procArgs) === logPath && deps.alive(procPid)) {
@@ -367,12 +370,21 @@ export async function cmdRun(args) {
     return false;
   }
   // 包一层 stopSession 记下本轮主动结束的 pid：轮末凭它区分「我们回收的」
-  // 与「会话自行退出/被外部杀掉的」，后者以前是无声丢失。finally 还原。
+  // 与「会话自行退出/被外部杀掉的」，后者以前是无声丢失。同样包一层
+  // procStartedAt：同一 pid 的 lstart 一轮内不会变，而轮初分区、各工作区
+  // 的 trackedAlive、轮末复核与 kept 过滤都会查指纹，缓存后每个 pid 只
+  // spawn 一次 ps。finally 一并还原。
   const prevStopSession = deps.stopSession;
   const stoppedPids = new Set();
   deps.stopSession = async (ent) => {
     if (ent?.pid) stoppedPids.add(ent.pid);
     return prevStopSession(ent);
+  };
+  const prevProcStartedAt = deps.procStartedAt;
+  const lstartCache = new Map();
+  deps.procStartedAt = (pid) => {
+    if (!lstartCache.has(pid)) lstartCache.set(pid, prevProcStartedAt(pid));
+    return lstartCache.get(pid);
   };
   try {
     const startedAtMs = Date.now();
@@ -388,8 +400,7 @@ export async function cmdRun(args) {
     // 时日志会一片寂静，无法和「平安无事」区分。上轮心跳过老说明中间漏
     // 轮——休眠期间错过的 StartInterval，launchd 醒来只补跑一轮。
     const hb = loadHeartbeat();
-    if (hb !== null
-        && cur - hb.ranAt > cfg.intervalSeconds * HEARTBEAT_STALE_FACTOR) {
+    if (heartbeatStale(hb, cfg.intervalSeconds, cur)) {
       bump(stats, 'warn');
       deps.log(`距上次巡检已 ${elapsedZh(cur - hb.ranAt)}，超过 `
         + `${HEARTBEAT_STALE_FACTOR} 个轮次间隔（${cfg.intervalSeconds} 秒），`
@@ -404,27 +415,29 @@ export async function cmdRun(args) {
     }
 
     // 轮初拍一份「上轮末仍相信活着」的会话快照（entry 复制，本轮原地改写
-    // 不影响），分成「轮初已没气」与「轮初还活着」两组。不能只收此刻
+    // 不影响），一遍分成「轮初已没气」与「轮初还活着」两组。不能只收此刻
     // kill -0 成功的——两轮之间崩溃正是最典型的被动死亡，本轮开始时它早
     // 已没气；带 deadSince 的是上轮已报过死亡的旧条目，跳过以免每轮重复报。
-    const prevTracked = Object.entries(state)
-      .filter(([, ent]) => ent.pid && !ent.deadSince)
-      .map(([ws, ent]) => [ws, { ...ent }]);
-    const prevDead = prevTracked.filter(([, ent]) => !deps.trackedAlive(ent));
-    const prevAlive = prevTracked.filter(([, ent]) => deps.trackedAlive(ent));
+    const prevDead = [];
+    const prevAlive = [];
+    for (const [ws, ent] of Object.entries(state)) {
+      if (!ent.pid || ent.deadSince) continue;
+      const copy = [ws, { ...ent }];
+      (deps.trackedAlive(copy[1]) ? prevAlive : prevDead).push(copy);
+    }
     const exitLine = (ws, old) => `会话退出 ${ws} pid=${old.pid}：非巡检主动结束`
       + `（已存活 ${elapsedZh(cur - (old.startedAt ?? cur))}），可能自行退出或`
       + '被外部终止；若反复出现请用 cron-up logs '
       + `${path.basename(ws)} 排查启动过程`;
 
     // 登记每轮只读一次：否则每个工作区都要 readdir + ps 一遍，自检也归
-    // 属这里。
+    // 属这里。进程表快照不在这里拍：只有孤儿认领分支需要，按需现拍（见
+    // patrolWorkspace 的 scriptProcs 形参）。
     const [consumers, registryAlert] = await deps.scanSessions();
     if (registryAlert) {
       bump(stats, 'warn');
       deps.log(`告警：${registryAlert}`);
     }
-    const scriptProcs = deps.listScriptProcesses();
 
     // 轮间死亡在进入工作区循环前先报：随后该工作区若需要会话会打印重拉，
     // 日志时间线就是「退出 → 重拉」，而不是反过来。
@@ -444,7 +457,7 @@ export async function cmdRun(args) {
           const { renewed, minified } = maintainWorkspace(taskfile, {
             renew: cfg.autoRenew,
             minify: cfg.autoMinId,
-          }) ?? { renewed: null, minified: null };
+          }) ?? {};
           if (renewed) {
             deps.log(`已续期 ${ws}：${renewed} 个周期任务标记为 permanent，`
               + '不再受 7 天过期限制');
@@ -467,7 +480,7 @@ export async function cmdRun(args) {
       }
       try {
         await patrolWorkspace(
-          ws, state, now, leadMs, cur, consumers, scriptProcs,
+          ws, state, now, leadMs, cur, consumers, null,
           cfg.sessionRetain, stats);
       } catch (e) {
         bump(stats, 'error');
@@ -525,6 +538,7 @@ export async function cmdRun(args) {
     return true;
   } finally {
     deps.stopSession = prevStopSession;
+    deps.procStartedAt = prevProcStartedAt;
     releaseLock(lock);
   }
 }

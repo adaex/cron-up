@@ -4,7 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, ExitError } from './internals.mjs';
+import { deps, ExitError, isPlainObject } from './internals.mjs';
 import { paths, LABEL } from './paths.mjs';
 // paths.home 仅用于 resolveLauncher 的默认 HOME；其余产物路径一律走
 // deps.paths（测试要整体重定向）。
@@ -22,7 +22,7 @@ import {
   configFieldErrors,
 } from './config.mjs';
 
-export function guiTarget() {
+function guiTarget() {
   return `gui/${process.getuid()}`;
 }
 
@@ -51,7 +51,7 @@ const LAUNCHD_STATES = new Map([
   ['not running', '空闲中（按间隔触发）'],
 ]);
 
-export function launchdStateZh(state) {
+function launchdStateZh(state) {
   // launchd 的 "not running" 是间隔触发型服务两轮之间的正常空闲态，直译
   // 会让人以为服务停了；未识别的值原样保留以便排查。
   if (!state) return '未知';
@@ -243,6 +243,17 @@ export function launcherHealth() {
 
 // ---- install / uninstall ----
 
+// install 的可覆盖项（配置键 → 命令行旗标）：--force 缺席时逐项点名「未
+// 生效的参数」，与 SPECS 的选项表保持同一批名字。
+const IGNORED_INSTALL_FLAGS = [
+  ['roots', '--roots'],
+  ['interval', '--interval'],
+  ['lead', '--lead'],
+  ['autoRenew', '--auto-renew'],
+  ['autoMinId', '--auto-min-id'],
+  ['sessionRetain', '--session-retain'],
+];
+
 export async function cmdInstall(args) {
   // --config 在这里只会造成误解：install 写盘、launchd 每轮读取的都是固定
   // 路径的配置，指定别的路径不改变任何行为——静默忽略等于让人以为装到了
@@ -275,13 +286,8 @@ export async function cmdInstall(args) {
     deps.print(`保留现有配置：${deps.paths.configPath}（需要更新时加 --force）`);
     // 不带 --force 时配置原样保留，命令行显式给的参数一律不生效：点名说清
     // 被忽略的是哪些，而不是让用户以为已经改了。
-    const ignored = [];
-    if (args.roots !== undefined) ignored.push('--roots');
-    if (args.interval !== undefined) ignored.push('--interval');
-    if (args.lead !== undefined) ignored.push('--lead');
-    if (args.autoRenew !== undefined) ignored.push('--auto-renew');
-    if (args.autoMinId !== undefined) ignored.push('--auto-min-id');
-    if (args.sessionRetain !== undefined) ignored.push('--session-retain');
+    const ignored = IGNORED_INSTALL_FLAGS
+      .filter(([k]) => args[k] !== undefined).map(([, flag]) => flag);
     if (ignored.length > 0) {
       deps.print(`警告：参数 ${ignored.join('、')} 未生效（现有配置保留）；`
         + '要更新这些字段请带 --force 重跑，--force 只覆盖显式给出的字段');
@@ -296,10 +302,10 @@ export async function cmdInstall(args) {
       try {
         old = JSON.parse(fs.readFileSync(deps.paths.configPath, 'utf-8'));
       } catch {
-        old = null;
+        // 读不出（损坏 JSON）：没有可继承的旧值。
       }
-      // 手改成非对象（123、["a"]）：没有可继承的旧值，静默按默认走。
-      if (old && typeof old === 'object' && !Array.isArray(old)) {
+      // 手改成非对象（123、["a"]）：同样没有可继承的旧值，静默按默认走。
+      if (isPlainObject(old)) {
         // 类型坏的字段不继承（回到默认值）并当面说明，其余照旧——force 不
         // 该把类型错误写进新配置，也不该因一个字段坏了丢掉其余设置。
         const errs = configFieldErrors({ ...DEFAULT_CONFIG, ...old });
@@ -359,8 +365,9 @@ export async function cmdInstall(args) {
   validateConfig(cfg, (m) => deps.print(m));
   if (JSON.stringify(cfg.roots)
       === JSON.stringify(normalizeRoots(DEFAULT_CONFIG.roots))) {
-    // 与 README 安全说明同一句话，在配置落定的这一刻当面再说一遍。
-    deps.print('提示：未指定 --roots，默认扫描 ~/space、~/workspace、~/tasks'
+    // 与 README 安全说明同一句话，在配置落定的这一刻当面再说一遍。默认目
+    // 录清单从 DEFAULT_CONFIG 插值：改默认值时提示不会留在旧清单上。
+    deps.print(`提示：未指定 --roots，默认扫描 ${DEFAULT_CONFIG.roots.join('、')}`
       + '（不存在的目录跳过）；今后 clone 进这些容器的仓库也会进入巡检，'
       + '自动续期会把其中的周期任务永久化。目录布局不同或需收窄时用 '
       + '--roots 指定（见 README 安全说明）');
@@ -406,25 +413,32 @@ export async function cmdUninstall(args) {
   if (r.status === 0) deps.print('已从 launchd 卸载');
 
   // 服务没了就没有回收者：默认结束自己拉起的保活会话，不留以 bypass 权限
-  // 空转的孤儿。--keep-sessions 显式保留（例如马上重装）。
+  // 空转的孤儿。--keep-sessions 显式保留（例如马上重装）。各会话的停轮询
+  // （SIGTERM→等→SIGKILL）互不依赖，先逐个发信号再并行等齐，N 个会话不
+  // 用串行吃 N 轮等待。
   if (!args.keepSessions) {
+    const stopping = [];
+    const handled = new Set();
     for (const [ws, ent] of Object.entries(loadState())) {
       if (deps.trackedAlive(ent)) {
+        handled.add(ent.pid);
         deps.print(`正在结束保活会话 ${ws} pid=${ent.pid}`);
-        await deps.stopSession(ent);
+        stopping.push(deps.stopSession(ent));
       }
     }
     // state 丢失时的兜底：没进登记的孤儿会话（卡在提问界面就不会出现在
     // state 里）从进程表按日志目录精确认领。
     for (const [pid, procArgs] of deps.listScriptProcesses()) {
+      if (handled.has(pid)) continue; // state 循环已发起，别对同 pid 二次发信号
       const log = scriptProcLogPath(procArgs);
       if (log === null
           || !log.startsWith(`${deps.paths.sessionLogDir}${path.sep}`)) continue;
       const ent = { pid, procStart: deps.procStartedAt(pid) };
       if (!deps.trackedAlive(ent)) continue;
       deps.print(`正在结束保活会话（state 已丢失） pid=${pid}`);
-      await deps.stopSession(ent);
+      stopping.push(deps.stopSession(ent));
     }
+    await Promise.all(stopping);
   }
 
   if (fs.existsSync(deps.paths.plistPath)) {

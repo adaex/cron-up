@@ -36,8 +36,9 @@ export const COOLDOWN_SECONDS = 1800;
 // 稠密任务生效。保留 48 小时让稀疏任务跨窗口累积；老化防止陈年计数误伤
 // 已修好的环境。
 export const FAIL_TTL_SECONDS = 48 * 3600;
-// pid 合法值域。state.json 与会话登记两个外部来源都在入口处按它校验：
-// 超大整数能穿过类型转换，直到 process.kill 才抛，所以必须入口卡范围。
+// pid 合法值域。state.json 与会话登记两个外部来源的 pid 都在入口处
+// （config 的 parsePid）按它统一校验：超大整数能穿过类型转换，直到
+// process.kill 才抛，所以必须入口卡范围。
 export const PID_T_MAX = 2 ** 31 - 1;
 // 健康会话约 10 秒内完成登记。超时仍存活却没登记，是卡在无人应答的提问
 // 界面（目录信任、工具授权）；只看存活会把它当健康，只有这个时限兜得住。
@@ -48,9 +49,10 @@ export const WARMUP_GRACE_SECONDS = 180;
 export const SESSION_MAX_AGE_SECONDS = 7 * 86400;
 export const SESSION_IDLE_SECONDS = 3600;
 // window 模式回收判据一：界面静默超过此时长视为「本次执行已结束」。TUI
-// 工作时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；与
-// WARMUP_GRACE 同值，对齐「3 分钟定生死」的既有心智。
-export const SESSION_RECYCLE_IDLE_SECONDS = 180;
+// 工作时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；取
+// WARMUP_GRACE 同值，结构上对齐「3 分钟定生死」的既有心智（调一个跟着
+// 动）。
+export const SESSION_RECYCLE_IDLE_SECONDS = WARMUP_GRACE_SECONDS;
 // window 模式回收判据二：距下次「需要会话在场」的时刻至少还有这么多秒。
 // 回收后同轮重拉的新会话约 10 秒完成登记，余量保的是登记抖动；更近的触
 // 发直接复用现有会话（时间紧邻的任务共享）。
@@ -111,5 +113,3 @@ export const SEARCH_DAYS = 7;
 // list/总览回答「下次何时触发」，要看到一年后：年度任务必须显示真实日期，
 // 不能误报成「无安排」。nextAfter 的日历快进让长窗口依然便宜。
 export const DISPLAY_SEARCH_DAYS = 366;
-// list 问「一次性任务是否被错过」，与巡检同一个补执行判定，只是不带前瞻。
-export const ZERO_LEAD_MS = 0;

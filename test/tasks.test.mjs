@@ -6,7 +6,6 @@ import path from 'node:path';
 import {
   readTasks,
   loadTaskDoc,
-  renewWorkspace,
   maintainWorkspace,
   minifyIds,
   parseTaskIdN,
@@ -16,6 +15,13 @@ import {
 } from '../src/tasks.mjs';
 import { taskView } from '../src/display.mjs';
 import { mockDeps } from '../test-support/helpers.mjs';
+
+// renew 语义的测试接缝：生产入口已并入 maintainWorkspace（renew + minify
+// 合一），这里按旧的 null/0/N 三态薄封装，测试用例保持以 renew 契约书写。
+const renewWorkspace = (file) => {
+  const r = maintainWorkspace(file, { renew: true });
+  return r === null ? null : r.renewed;
+};
 
 const NOW = new Date(2026, 8, 20, 15, 47);
 

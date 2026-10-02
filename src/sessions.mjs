@@ -6,9 +6,6 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { deps } from './internals.mjs';
-import {
-  SESSION_IDLE_SECONDS,
-} from './constants.mjs';
 
 // pid 是否对应活进程。走到这儿的 pid 已经过入口范围校验。
 export function alive(pid) {
@@ -88,6 +85,15 @@ export function buildChildEnv(parentEnv) {
   return env;
 }
 
+// 日志保留一代（.1）：删旧代后把现役改名顶上。「.1」命名与 rm-先-于-
+// rename 的顺序是两处调用（会话 typescript、launchd 巡检日志）共同的承重
+// 约定——script(1) 打开即截断、launchd 按路径重开，轮转失败都不阻断调用方。
+export function rotateOnce(file) {
+  const old = `${file}.1`;
+  fs.rmSync(old, { force: true });
+  fs.renameSync(file, old);
+}
+
 // 拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
 export function spawnSession(ws) {
   const logPath = sessionLogPath(ws);
@@ -102,11 +108,7 @@ export function spawnSession(ws) {
   // 一代（.1）——总量上界两代，活着的一代增长再快也只影响自身，不会经
   // 轮转放大。
   try {
-    if (fs.existsSync(logPath)) {
-      const old = `${logPath}.1`;
-      fs.rmSync(old, { force: true });
-      fs.renameSync(logPath, old);
-    }
+    if (fs.existsSync(logPath)) rotateOnce(logPath);
   } catch {
     // 轮转失败不阻断拉起。
   }
@@ -165,12 +167,14 @@ export async function stopSession(ent) {
   }
 }
 
-// typescript 多少秒没被写。文件缺失读作「没有活动证据」，不挡轮转。
+// typescript 多少秒没被写。文件缺失读作「没有任何活动证据」：Infinity 大
+// 于任何静默阈值，天然不挡换代与回收（哨兵值曾绑定 SESSION_IDLE_SECONDS
+// + 1，阈值调低后会悄悄翻转语义）。
 export function sessionLogIdleSeconds(logPath, cur) {
   try {
     return Math.max(0, cur - Math.floor(fs.statSync(logPath).mtimeMs / 1000));
   } catch {
-    return SESSION_IDLE_SECONDS + 1;
+    return Infinity;
   }
 }
 
