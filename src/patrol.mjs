@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps } from './internals.mjs';
+import { deps, packageVersion } from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
@@ -25,6 +25,7 @@ import {
   loadHeartbeat,
   saveHeartbeat,
   heartbeatStale,
+  isCooling,
 } from './config.mjs';
 import {
   maintainWorkspace,
@@ -38,7 +39,7 @@ import {
   scriptProcLogPath,
   rotateOnce,
 } from './sessions.mjs';
-import { TASK_REL, packageVersion } from './paths.mjs';
+import { TASK_REL } from './paths.mjs';
 import { elapsedZh, pad2 } from './display.mjs';
 
 // 事件类型 → 轮末汇总里的中文标签。patrolWorkspace 与 cmdRun 往同一个
@@ -129,7 +130,7 @@ export function acquireRunLock() {
   return null;
 }
 
-export function releaseLock(handle) {
+function releaseLock(handle) {
   if (!handle?.lockPath) return;
   try {
     fs.unlinkSync(handle.lockPath);
@@ -158,7 +159,11 @@ export function rotatePatrolLogs() {
 }
 
 // 下次「需要会话在场」的时刻（ms）：各任务下次触发的最小值；有错过待补
-// 执行的一次性任务时视为立刻需要。窗口内无安排返回 Infinity。
+// 执行的一次性任务时视为立刻需要。窗口内无安排返回 Infinity。锚点刻意取
+// cron 裸落点而非 nextDelivery 的抖动后投递时刻：落点总不晚于投递时刻，
+// 按落点算余量更小、回收更保守，是安全方向；真正的重拉闸门是下面的
+// wanted(leadMs)，margin 只需保住新会话登记。若改用 fire，落点后、投递
+// 前的整段延迟窗内都不会回收，回收频率被悄悄改变。
 function needHorizonMs(tasks, now) {
   let horizon = Infinity;
   for (const t of tasks) {
@@ -212,23 +217,28 @@ export async function patrolWorkspace(
     return;
   }
 
+  // 结束本代会话的完整收尾：停掉 → 摘 state → 重扫消费者。换代与 window
+  // 回收是同一个动作，差别只在触发条件与文案；消费者快照拍于轮初，刚结束
+  // 的这代可能正是快照里的消费者，不重扫会让陈旧登记挡住下面的重拉。
+  let mineAlive = deps.trackedAlive(ent);
+  const retire = async (kind, msg) => {
+    await deps.stopSession(ent);
+    note(kind, msg);
+    delete state[ws];
+    ent = null;
+    mineAlive = false;
+    consumers = (await deps.scanSessions())[0];
+  };
+
   // 换代：超龄且日志静默（无任务在执行的证据）的会话主动结束，需要时下
   // 文自然重拉。换代是维护，不计失败。
-  let mineAlive = deps.trackedAlive(ent);
   if (ent !== null && mineAlive) {
     const age = cur - (ent.startedAt ?? cur);
     if (age > SESSION_MAX_AGE_SECONDS
         && sessionLogIdleSeconds(
           ent.log || sessionLogPath(ws), cur) > SESSION_IDLE_SECONDS) {
-      await deps.stopSession(ent);
-      note('ageout', `换代 ${ws} pid=${ent.pid}：会话已连续运行 `
+      await retire('ageout', `换代 ${ws} pid=${ent.pid}：会话已连续运行 `
         + `${Math.floor(age / 86400)} 天且近期无输出，结束后按需重拉`);
-      delete state[ws];
-      ent = null;
-      mineAlive = false;
-      // 消费者快照拍于轮初，被换代的这代可能正是快照里的消费者：重扫一
-      // 次，别让陈旧登记挡住下面的重拉。
-      consumers = (await deps.scanSessions())[0];
     }
   }
 
@@ -248,16 +258,9 @@ export async function patrolWorkspace(
         > SESSION_RECYCLE_IDLE_SECONDS
       && needHorizonMs(tasks, now) - now.getTime()
         > SESSION_FIRE_MARGIN_SECONDS * 1000) {
-    const pid = ent.pid;
-    await deps.stopSession(ent);
-    note('recycle', `回收 ${ws} pid=${pid}：本代任务已执行完毕且界面静默，`
-      + '结束会话，下次需要时重拉');
-    delete state[ws];
-    ent = null;
-    mineAlive = false;
-    // 同上：快照里的消费者可能正是刚结束的这代。用户自己的会话若在场，
-    // 重扫依旧看见，不会在同目录双开。
-    consumers = (await deps.scanSessions())[0];
+    // 用户自己的会话若在场，retire 的重扫依旧看见，不会在同目录双开。
+    await retire('recycle', `回收 ${ws} pid=${ent.pid}：本代任务已执行完毕且`
+      + '界面静默，结束会话，下次需要时重拉');
   }
 
   // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
@@ -276,7 +279,7 @@ export async function patrolWorkspace(
 
   if (!tasks.some((t) => taskWanted(t, now, leadMs))) return;
 
-  const cooling = Boolean(ent && (ent.cooldownUntil ?? 0) > cur);
+  const cooling = isCooling(ent, cur);
 
   // 活着但没有消费。健康只在真实启动所需的时间内成立；超时就是卡在无人
   // 应答的提问界面，永不登记——退休它并推进失败计数。
@@ -507,7 +510,7 @@ export async function cmdRun(args) {
     const kept = Object.fromEntries(
       Object.entries(state).filter(([, ent]) => {
         if (deps.trackedAlive(ent)) return true;
-        if ((ent.cooldownUntil ?? 0) > cur) return true;
+        if (isCooling(ent, cur)) return true;
         if ((ent.fails ?? 0) > 0) {
           ent.deadSince ??= cur;
           return cur - ent.deadSince < FAIL_TTL_SECONDS;

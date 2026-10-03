@@ -122,7 +122,8 @@ function sameDay(a, b) {
     && a.getMonth() === b.getMonth()
     && a.getDate() === b.getDate();
 }
-function sameMinute(a, b) {
+// 「同一分钟」的唯一判据，fmtFireRange 的箭头省略与总览「设定」附注共用。
+export function sameMinute(a, b) {
   return sameDay(a, b) && a.getHours() === b.getHours()
     && a.getMinutes() === b.getMinutes();
 }
@@ -142,10 +143,10 @@ export function fmtFireRange(nxt, fire) {
   }
   const r = new Date(Math.round(fire.getTime() / 1000) * 1000);
   if (sameMinute(nxt, r)) return fmtMDHM(nxt);
+  const secs = r.getSeconds() ? `:${pad2(r.getSeconds())}` : '';
   const tail = sameDay(nxt, r)
-    ? `${pad2(r.getHours())}:${pad2(r.getMinutes())}`
-      + (r.getSeconds() ? `:${pad2(r.getSeconds())}` : '')
-    : `${fmtMDHM(r)}${r.getSeconds() ? `:${pad2(r.getSeconds())}` : ''}`;
+    ? `${pad2(r.getHours())}:${pad2(r.getMinutes())}${secs}`
+    : `${fmtMDHM(r)}${secs}`;
   return `${fmtMDHM(nxt)} → ${tail}`;
 }
 

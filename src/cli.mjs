@@ -10,35 +10,7 @@ import { cmdInstall, cmdUninstall } from './service.mjs';
 import { cmdList } from './list.mjs';
 import { cmdOverview } from './overview.mjs';
 import { cmdLogs } from './logs.mjs';
-
-// 选项类型：string 吃一个值；int 吃一个值且必须是严格十进制；bool 是无值
-// 开关；tri 支持 --name / --no-name（install 的 auto-renew、auto-min-id）。
-const SPECS = {
-  install: {
-    options: {
-      roots: 'string',
-      interval: 'int',
-      lead: 'int',
-      force: 'bool',
-      'auto-renew': 'tri',
-      'auto-min-id': 'tri',
-      'session-retain': 'string',
-    },
-  },
-  uninstall: {
-    options: {
-      purge: 'bool',
-      'keep-sessions': 'bool',
-    },
-  },
-  list: { options: {} },
-  run: { options: {} },
-  renew: { options: {} },
-  logs: {
-    options: { follow: 'bool', f: 'bool' },
-    positionalMax: 1,
-  },
-};
+import { SPECS, thisCamel } from './args.mjs';
 
 // 严格十进制整数命令行值（谓词 isDecInt 见 internals）：
 // Number("0x10")、parseInt("5x") 都会静默给出错误结果，必须显式拒绝。
@@ -100,11 +72,6 @@ function consumeOption(tok, tokens, i, spec, opts) {
   }
   opts[thisCamel(name)] = kind === 'int' ? cliInt(value) : value;
   return inlineValue !== undefined ? i + 1 : i + 2;
-}
-
-// 选项名统一成代码里用的 camelCase（--keep-sessions → keepSessions）。
-function thisCamel(name) {
-  return name.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 }
 
 export function parseCli(argv) {

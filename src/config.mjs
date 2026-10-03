@@ -4,7 +4,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, ExitError, isPlainObject, isDecInt } from './internals.mjs';
+import {
+  deps,
+  ExitError,
+  isPlainObject,
+  isDecInt,
+  ensurePrivateDir,
+} from './internals.mjs';
 import { DEFAULT_CONFIG, PID_T_MAX, HEARTBEAT_STALE_FACTOR } from './constants.mjs';
 import { expandHome, isDir } from './tasks.mjs';
 
@@ -31,7 +37,7 @@ export function isInt(x) {
 // 宽容整型化（手改的 state/登记文件里字段可能是字符串或浮点）：纯十进制
 // 字符串接受，浮点截断，布尔拒绝；非法输入抛错由调用方按「字段不存在」
 // 处理。
-export function lenientInt(v) {
+function lenientInt(v) {
   if (typeof v === 'boolean') throw new Error('布尔不是整数字段');
   if (typeof v === 'number') {
     if (!Number.isFinite(v)) throw new Error('数值越界');
@@ -160,18 +166,11 @@ export function loadState() {
   return out;
 }
 
-// 自产物按私密收紧（与会话日志、任务文件写入同一纪律）：state 含工作区路
-// 径与 pid，多用户机器上不给其他账号读面。chmod 顺带收回老版本留下的宽松
-// 权限——state 每轮都写、config 每次 install 都写，存量会自动跟进；失败维
-// 持现状。
+// state 含工作区路径与 pid，目录按 ensurePrivateDir 收紧；文件以 0600 原
+// 子替换——state 每轮都写、config 每次 install 都写，老版本留下的宽松权
+// 限会自动跟进。
 function atomicSave(file, doc) {
-  const dir = path.dirname(file);
-  fs.mkdirSync(dir, { recursive: true });
-  try {
-    fs.chmodSync(dir, 0o700);
-  } catch {
-    // 维持现状。
-  }
+  ensurePrivateDir(path.dirname(file));
   const tmp = `${file}.tmp`;
   // 以 0600 创建；残留的旧 tmp 更宽时也收回来，rename 保持该模式位。
   fs.writeFileSync(tmp, `${JSON.stringify(doc, null, 2)}\n`, {
@@ -212,6 +211,17 @@ export function saveHeartbeat(doc) {
 // 总览页的「服务在但巡检没在跑」共用同一判据，两边不会各说各话。
 export function heartbeatStale(hb, intervalSeconds, nowSec) {
   return hb !== null && nowSec - hb.ranAt > intervalSeconds * HEARTBEAT_STALE_FACTOR;
+}
+
+// 失败冷却的唯一判据：cooldownUntil 是秒级时间戳，0/缺省表示无冷却。巡检
+// 决策、kept 过滤与总览展示共用，冷却表示法只渗到这两个函数。
+export function isCooling(ent, cur) {
+  return (ent?.cooldownUntil ?? 0) > cur;
+}
+
+// 距冷却结束还有多少整分钟（已结束为 0），只用于总览文案。
+export function cooldownEtaMinutes(ent, cur) {
+  return Math.max(0, Math.floor(((ent?.cooldownUntil ?? 0) - cur) / 60));
 }
 
 export function saveConfig(cfg) {

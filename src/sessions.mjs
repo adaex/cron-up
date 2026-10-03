@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps } from './internals.mjs';
+import { deps, ensurePrivateDir } from './internals.mjs';
 
 // pid 是否对应活进程。走到这儿的 pid 已经过入口范围校验。
 export function alive(pid) {
@@ -97,12 +97,7 @@ export function rotateOnce(file) {
 // 拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
 export function spawnSession(ws) {
   const logPath = sessionLogPath(ws);
-  fs.mkdirSync(path.dirname(logPath), { recursive: true });
-  try {
-    fs.chmodSync(path.dirname(logPath), 0o700);
-  } catch {
-    // 目录权限维持现状。
-  }
+  ensurePrivateDir(path.dirname(logPath));
   // window 模式下「一代会话 = 一次执行」：script(1) 打开即截断，不轮转的
   // 话上一代（上一次任务执行）的界面记录会随本次拉起被抹掉。无条件保留
   // 一代（.1）——总量上界两代，活着的一代增长再快也只影响自身，不会经

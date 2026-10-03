@@ -6,7 +6,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps } from './internals.mjs';
+import { deps, isPlainObject } from './internals.mjs';
 import { parsePid } from './config.mjs';
 import { lexReal } from './tasks.mjs';
 
@@ -73,7 +73,7 @@ export async function scanSessions() {
   const interactive = [];
   for (const f of files) {
     const s = await readSessionFile(f);
-    if (s && typeof s === 'object' && s.kind === 'interactive') {
+    if (isPlainObject(s) && s.kind === 'interactive') {
       interactive.push(s);
     }
   }

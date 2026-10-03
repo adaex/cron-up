@@ -42,8 +42,9 @@ export function resolveLogPath(workspace, announce) {
   const err = path.join(deps.paths.logDir, 'launchd.err.log');
   if (!fs.existsSync(out)) return err;
   try {
-    if (fs.statSync(err).size > 0) {
-      say(`注：${err} 有内容（最后写入 ${fmtMDHM(fs.statSync(err).mtime)}），`
+    const st = fs.statSync(err);
+    if (st.size > 0) {
+      say(`注：${err} 有内容（最后写入 ${fmtMDHM(st.mtime)}），`
         + '巡检若异常先看它');
     }
   } catch {

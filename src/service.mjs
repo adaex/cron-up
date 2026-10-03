@@ -4,8 +4,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, ExitError, isPlainObject } from './internals.mjs';
+import {
+  deps,
+  ExitError,
+  isPlainObject,
+  ensurePrivateDir,
+} from './internals.mjs';
 import { paths, LABEL } from './paths.mjs';
+import { SPECS, thisCamel } from './args.mjs';
 // paths.home 仅用于 resolveLauncher 的默认 HOME；其余产物路径一律走
 // deps.paths（测试要整体重定向）。
 import { scriptProcLogPath } from './sessions.mjs';
@@ -33,7 +39,9 @@ export function launchctl(...args) {
 }
 
 export function launchctlInfo() {
-  const r = launchctl('print', `${guiTarget()}/${LABEL}`);
+  // 走 deps 而非同文件裸名：与 bootout/bootstrap 的打桩面保持一致，测试可
+  // 在 launchctl 一层整体模拟 launchd。
+  const r = deps.launchctl('print', `${guiTarget()}/${LABEL}`);
   if (r.status !== 0) return null;
   const info = {};
   for (const key of ['state', 'last exit code']) {
@@ -244,15 +252,11 @@ export function launcherHealth() {
 // ---- install / uninstall ----
 
 // install 的可覆盖项（配置键 → 命令行旗标）：--force 缺席时逐项点名「未
-// 生效的参数」，与 SPECS 的选项表保持同一批名字。
-const IGNORED_INSTALL_FLAGS = [
-  ['roots', '--roots'],
-  ['interval', '--interval'],
-  ['lead', '--lead'],
-  ['autoRenew', '--auto-renew'],
-  ['autoMinId', '--auto-min-id'],
-  ['sessionRetain', '--session-retain'],
-];
+// 生效的参数」。名单直接从解析器的选项表派生——force 不落盘，其余选项都
+// 会写进配置；新加可持久化选项时这里自动跟进，不会静默漏报。
+const IGNORED_INSTALL_FLAGS = Object.keys(SPECS.install.options)
+  .filter((name) => name !== 'force')
+  .map((name) => [thisCamel(name), `--${name}`]);
 
 export async function cmdInstall(args) {
   // --config 在这里只会造成误解：install 写盘、launchd 每轮读取的都是固定
@@ -263,12 +267,8 @@ export async function cmdInstall(args) {
       + `使用 ${deps.paths.configPath}，如需临时改配置请直接编辑该文件`);
   }
   fs.mkdirSync(deps.paths.dataDir, { recursive: true });
-  fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
-  try {
-    fs.chmodSync(deps.paths.sessionLogDir, 0o700);
-  } catch {
-    // 维持现状。
-  }
+  // dataDir 只建不 chmod：本分支可能保留旧配置而不写盘，不搭车改权限。
+  ensurePrivateDir(deps.paths.sessionLogDir);
 
   let cfg;
   if (fs.existsSync(deps.paths.configPath) && !args.force) {

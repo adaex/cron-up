@@ -14,7 +14,7 @@ import {
   TaskFileChanged,
 } from '../src/tasks.mjs';
 import { taskView } from '../src/display.mjs';
-import { mockDeps } from '../test-support/helpers.mjs';
+import { mockDeps, mkTmp, readJson } from '../test-support/helpers.mjs';
 
 // renew 语义的测试接缝：生产入口已并入 maintainWorkspace（renew + minify
 // 合一），这里按旧的 null/0/N 三态薄封装，测试用例保持以 renew 契约书写。
@@ -26,8 +26,7 @@ const renewWorkspace = (file) => {
 const NOW = new Date(2026, 8, 20, 15, 47);
 
 function taskDir(t) {
-  const tmp = fs.mkdtempSync(path.join('/tmp', 'cr-renew-'));
-  t.after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+  const tmp = mkTmp(t);
   const dir = path.join(tmp, '.claude');
   fs.mkdirSync(dir, { recursive: true });
   return { tmp, dir, file: path.join(dir, 'scheduled_tasks.json') };
@@ -76,7 +75,7 @@ test('tags recurring and preserves everything else', (t) => {
   const { file } = taskDir(t);
   fs.writeFileSync(file, JSON.stringify({ tasks: [{ ...RECURRING }], version: 7 }));
   assert.equal(renewWorkspace(file), 1);
-  const doc = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  const doc = readJson(file);
   const task = doc.tasks[0];
   assert.equal(task.permanent, true);
   for (const [k, v] of Object.entries(RECURRING)) assert.equal(task[k], v);
@@ -125,7 +124,7 @@ test('only explicit recurring tasks are eligible', (t) => {
     { id: 'flagless', cron: '0 9 * * *', createdAt: 1 },
   ] }));
   assert.equal(renewWorkspace(file), 1);
-  const tasks = JSON.parse(fs.readFileSync(file, 'utf-8')).tasks;
+  const tasks = readJson(file).tasks;
   assert.equal(tasks[0].permanent, true);
   assert.equal(tasks[1].permanent, true);
   assert.equal('permanent' in tasks[2], false);
@@ -163,7 +162,7 @@ test('nondict entries and unknown keys survive', (t) => {
     extraTop: { nested: true },
   }));
   renewWorkspace(file);
-  const doc = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  const doc = readJson(file);
   assert.deepEqual(doc.extraTop, { nested: true });
   assert.deepEqual(doc.tasks.slice(1), ['junk', null, 5]);
 });
@@ -186,7 +185,7 @@ test('atomic write refuses a stale mtime', (t) => {
   assert.throws(
     () => atomicWriteJson(file, { tasks: [{ x: 1 }] }, staleMtime),
     TaskFileChanged);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf-8')).tasks, []);
+  assert.deepEqual(readJson(file).tasks, []);
   assert.equal(fs.existsSync(`${file}.cron-up-tmp`), false);
 });
 
@@ -201,7 +200,7 @@ test('concurrent change mid-update is not clobbered', (t) => {
     return doc;
   };
   assert.throws(() => renewWorkspace(file), TaskFileChanged);
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf-8')),
+  assert.deepEqual(readJson(file),
     { tasks: [{ id: 'cc-wins' }] });
   assert.equal(fs.existsSync(`${file}.cron-up-tmp`), false);
 });
@@ -290,7 +289,7 @@ test('maintainWorkspace minifies in one atomic round-trip', (t) => {
   }));
   const r = maintainWorkspace(file, { minify: true });
   assert.deepEqual(r, { renewed: 0, minified: 1 });
-  const doc = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  const doc = readJson(file);
   assert.equal(doc.tasks[0].id, '00000001');
   assert.equal(doc.version, 7, '未知顶层键 round-trip 保留');
 });
@@ -302,7 +301,7 @@ test('maintainWorkspace does renew and minify together', (t) => {
   }));
   const r = maintainWorkspace(file, { renew: true, minify: true });
   assert.deepEqual(r, { renewed: 1, minified: 1 });
-  const task = JSON.parse(fs.readFileSync(file, 'utf-8')).tasks[0];
+  const task = readJson(file).tasks[0];
   assert.equal(task.permanent, true);
   assert.equal(task.id, '00000001');
 });

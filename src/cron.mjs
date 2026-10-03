@@ -249,9 +249,9 @@ export function taskIdHash(taskId) {
 // 不是 nextAfter 给出的下个落点——后者严格在未来，会把展示拐到明天），
 // 否则是下一落点 + 按 id 的抖动。先于窗口检查尾窗：2 月 29 日这类长周期
 // 任务的下一落点可能在展示窗口之外，正在等待的投递却依然成立。taskView
-// 的 nxt/fire 与 predictedFire 共用这一个口径，落点与投递同源，两边不会
-// 各说各话。返回 {slot, fire}，均为 Date 或 null（窗口内没有落点时双双
-// 为 null）。cron 须已解析且 satisfiable。
+// 的 nxt/fire 与 wanted 都以这里的落点为单一来源，两边不会各说各话。返回
+// {slot, fire}，均为 Date 或 null（窗口内没有落点时双双为 null）。cron 须
+// 已解析且 satisfiable。
 export function nextDelivery(cron, task, now, withinDays = DISPLAY_SEARCH_DAYS) {
   if (taskIsOneshot(task)) {
     const slot = cron.nextAfter(now, withinDays);
@@ -283,16 +283,6 @@ export function nextDelivery(cron, task, now, withinDays = DISPLAY_SEARCH_DAYS) 
   // [300000, 315000)ms（约 5 分钟周期的高频 cron，如 */5）且表达式匹配
   // 其内部步进正则时，调度时刻提前 15 秒。日/周/月任务周期远大于此，不
   // 经过该分支，故不予复刻。
-}
-
-// 任务按 Claude Code 的抖动规则预计的实际触发时刻（nextDelivery 的
-// fire）；cron 无效、不在尾窗内、窗口内没有落点时返回 null。基准为 now
-// （上游调度器以上次触发时刻为基准，展示只关心从现在起的下一次，两者算
-// 出的落点一致）。
-export function predictedFire(task, now, withinDays = DISPLAY_SEARCH_DAYS) {
-  const cron = parseCronOrNone(task?.cron);
-  if (cron === null || !cron.satisfiable) return null;
-  return nextDelivery(cron, task, now, withinDays).fire;
 }
 
 // 周期任务从某个落点起的投递延迟（ms）：hash(id)·frac·周期，封顶 30 分。

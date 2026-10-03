@@ -100,7 +100,7 @@ export const CC_JITTER = {
 // maxN，常量只保留「目标延迟」这一个可调项。
 export const AUTO_MIN_ID_TARGET_DELAY_MS = 60 * 1000;
 
-// 投递尾窗判定的回看/前探窗口（wanted 与 predictedFire 共用，见
+// 投递尾窗判定的回看/前探窗口（wanted 与 nextDelivery 共用，见
 // src/cron.mjs 的 recurringTailWindow）：找上一落点用 prevAtOrBefore、算
 // 周期用 nextAfter，两个方向都要罩住月/年任务之外的 2 月 29 日——相邻落
 // 点隔 4 年，世纪非闰年（2100）隔 8 年；窗口小了尾窗会塌缩成零：落点已

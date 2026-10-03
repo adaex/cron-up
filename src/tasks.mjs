@@ -124,17 +124,11 @@ export function* discover(roots, maxDepth) {
   }
 }
 
-// 读一个工作区的任务列表，坏形状一律返回 null。
+// 读一个工作区的任务列表，坏形状一律返回 null。读盘与顶层形状校验复用
+// loadTaskDoc（renew 也要同一口径 round-trip 整份文档）。
 export function readTasks(ws) {
-  let doc;
-  try {
-    doc = JSON.parse(fs.readFileSync(
-      path.join(ws, TASK_REL), 'utf-8'));
-  } catch {
-    return null;
-  }
-  if (!isPlainObject(doc) || !Array.isArray(doc.tasks)) return null;
-  return doc.tasks.filter(isPlainObject);
+  const doc = deps.loadTaskDoc(path.join(ws, TASK_REL));
+  return doc === null ? null : doc.tasks.filter(isPlainObject);
 }
 
 // 任务文件在「读到」与「写回」之间被别的写者改了（Claude Code 更新

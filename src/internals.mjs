@@ -6,7 +6,9 @@
 // 纯系统叶子的默认实现放这里；业务函数（discover、spawnSession…）由各自
 // 模块注册。
 
+import fs from 'node:fs';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { paths } from './paths.mjs';
 
 export class ExitError extends Error {
@@ -62,6 +64,29 @@ function execFile(file, args, opts = {}) {
 
 function terminalWidth() {
   return Math.max(60, process.stdout.columns ?? 100);
+}
+
+// 自产物目录（state/config、会话日志）含工作区路径与会话记录，按私密收紧：
+// 建好后 chmod 0700，顺带收回老版本留下的宽松权限；失败维持现状。三处写入
+// 点共用这一条纪律。
+export function ensurePrivateDir(dir) {
+  fs.mkdirSync(dir, { recursive: true });
+  try {
+    fs.chmodSync(dir, 0o700);
+  } catch {
+    // 维持现状。
+  }
+}
+
+// 版本号读 package.json（用 fs 读而非 JSON import attribute，避免对 Node
+// 版本实验特性的依赖）；读不到返回 null，总览页降级显示。
+export function packageVersion() {
+  try {
+    const pkg = fileURLToPath(new URL('../package.json', import.meta.url));
+    return JSON.parse(fs.readFileSync(pkg, 'utf-8')).version ?? null;
+  } catch {
+    return null;
+  }
 }
 
 export const deps = {

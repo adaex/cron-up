@@ -3,8 +3,6 @@
 
 import os from 'node:os';
 import path from 'node:path';
-import fs from 'node:fs';
-import { fileURLToPath } from 'node:url';
 
 export const LABEL = 'local.cron-up';
 
@@ -56,14 +54,3 @@ export const paths = makePaths({
   plistPath: path.join(HOME, 'Library', 'LaunchAgents', `${LABEL}.plist`),
   sessionDir: path.join(HOME, '.claude', 'sessions'),
 });
-
-// 版本号读 package.json（用 fs 读而非 JSON import attribute，避免对 Node
-// 版本实验特性的依赖）；读不到返回 null，总览页降级显示。
-export function packageVersion() {
-  try {
-    const pkg = fileURLToPath(new URL('../package.json', import.meta.url));
-    return JSON.parse(fs.readFileSync(pkg, 'utf-8')).version ?? null;
-  } catch {
-    return null;
-  }
-}

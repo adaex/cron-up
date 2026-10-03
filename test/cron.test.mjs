@@ -11,13 +11,19 @@ import {
   taskWanted,
   wanted,
   taskIdHash,
-  predictedFire,
+  nextDelivery,
 } from '../src/cron.mjs';
 import { taskView } from '../src/display.mjs';
 import { DISPLAY_SEARCH_DAYS } from '../src/constants.mjs';
 
 const NOW = new Date(2026, 8, 20, 15, 47); // Sunday
 const LEAD_MS = 10 * 60_000;
+
+// 直接测 nextDelivery 的 fire：它是 taskView nxt/fire 的唯一来源，生产侧
+// 已无第二入口（原 predictedFire 薄封装已删）。
+function fireOf(task, now = NOW) {
+  return nextDelivery(new Cron(task.cron), task, now).fire;
+}
 
 function dt(y, m, d, h = 0, min = 0) {
   return new Date(y, m - 1, d, h, min).getTime();
@@ -319,8 +325,8 @@ test('recurring fire is the slot plus the deterministic jitter', () => {
     [undefined, 0],        // 无 id → hash 0，无抖动
     ['zzzzzzzz', 0],       // 坏 id 同 0
   ]) {
-    const fire = predictedFire(
-      { id, cron: '0 13 * * *', recurring: true }, NOW);
+    const fire = fireOf(
+      { id, cron: '0 13 * * *', recurring: true });
     assert.ok(fire instanceof Date, `id=${id} 应返回 Date`);
     const delayS = (fire.getTime() - slot.getTime()) / 1000;
     assert.ok(Math.abs(delayS - expectedDelayS) < 1.5,
@@ -330,33 +336,33 @@ test('recurring fire is the slot plus the deterministic jitter', () => {
 
 test('jitter cap also binds for long-period crons', () => {
   // 周期 7 天不设顶会是 hash·0.5·7 天（数小时），顶格后只有 30 分钟。
-  const fire = predictedFire(
-    { id: 'c1363d8b', cron: '0 10 * * 0', recurring: true }, NOW);
+  const fire = fireOf(
+    { id: 'c1363d8b', cron: '0 10 * * 0', recurring: true });
   // 下一落点：09-27 10:00（见 day of week 测试），顶格 → 10:30。
   assert.equal(fire.getTime(), new Date(2026, 8, 27, 10, 30, 0).getTime());
 });
 
 test('one-shot grid slots fire early, other minutes do not', () => {
   // 09-25 14:00（:00 网格）：提前 hash·90s，但不早于 NOW。
-  const grid = predictedFire(
+  const grid = fireOf(
     { id: 'c1363d8b', cron: '0 14 25 9 *', recurring: false,
-      createdAt: NOW.getTime() - 86400_000 }, NOW);
+      createdAt: NOW.getTime() - 86400_000 });
   const slot = new Date(2026, 8, 25, 14, 0, 0);
   assert.ok(slot.getTime() - grid.getTime() > 0);
   assert.ok(slot.getTime() - grid.getTime() <= 90_000);
 
   // 09-25 14:07（非网格）：不抖。
-  const plain = predictedFire(
+  const plain = fireOf(
     { id: 'c1363d8b', cron: '7 14 25 9 *', recurring: false,
-      createdAt: NOW.getTime() - 86400_000 }, NOW);
+      createdAt: NOW.getTime() - 86400_000 });
   assert.equal(plain.getTime(), new Date(2026, 8, 25, 14, 7, 0).getTime());
 });
 
-test('predictedFire never throws on malformed input', () => {
-  assert.equal(predictedFire(null, NOW), null);
-  assert.equal(predictedFire({ cron: 'not a cron' }, NOW), null);
-  assert.equal(predictedFire({ cron: '0 0 30 2 *', recurring: true }, NOW),
-    null);
+test('nextDelivery yields no fire for an unsatisfiable cron', () => {
+  // 2 月 30 日：解析成功但任何分钟都不匹配，展示读作「无安排」。
+  const fire = nextDelivery(
+    new Cron('0 0 30 2 *'), { recurring: true }, NOW).fire;
+  assert.equal(fire, null);
 });
 
 // ---- prevAtOrBefore 与投递尾窗 ----
@@ -417,34 +423,34 @@ test('wanted tail window is bounded by the actual delay, not the 30m cap', () =>
     { id: '058e0149', recurring: true }, at(15, 46), 0), false);
 });
 
-test('predictedFire answers the pending tail delivery, not the next slot', () => {
+test('nextDelivery answers the pending tail delivery, not the next slot', () => {
   // NOW 15:47：落点 15:30 已过、顶格 id 的投递点 16:00 未到——预计触发是
   // 今天 16:00，而不是明天的落点 + 抖动。落点与预计同刻的任务文件里
   // list 会画出「15:30 → 16:00」（见 display 测试的落点对齐）。
   const task = { id: 'c1363d8b', cron: '30 15 * * *', recurring: true };
-  assert.equal(predictedFire(task, NOW).getTime(),
+  assert.equal(fireOf(task, NOW).getTime(),
     new Date(2026, 8, 20, 16, 0, 0).getTime());
   // 尾窗一过（16:30），回到下一落点 + 抖动：明天 15:30 → 16:00。
   const after = new Date(2026, 8, 20, 16, 30, 0);
-  assert.equal(predictedFire(task, after).getTime(),
+  assert.equal(fireOf(task, after).getTime(),
     new Date(2026, 8, 21, 16, 0, 0).getTime());
 });
 
 test('tail window survives multi-year slot gaps (Feb 29)', () => {
   // 2028-02-29 09:15：上一落点在 1461 天前（2024-02-29），任何 366 天窗口
-  // 都找不到它，尾窗会塌缩成零——wanted 仍须答 true、predictedFire 仍须
-  // 答今天 09:30（顶格 30 分钟）；且下一落点（2032 年）在展示窗口之外，
-  // predictedFire 不能先死在窗口检查上。
+  // 都找不到它，尾窗会塌缩成零——wanted 仍须答 true、nextDelivery 仍须答
+  // 今天 09:30（顶格 30 分钟）；且下一落点（2032 年）在展示窗口之外，
+  // nextDelivery 不能先死在窗口检查上。
   const now = new Date(2028, 1, 29, 9, 15, 0);
   const task = { id: 'c1363d8b', cron: '0 9 29 2 *', recurring: true };
   assert.equal(taskWanted(task, now, 0), true);
-  assert.equal(predictedFire(task, now).getTime(),
+  assert.equal(fireOf(task, now).getTime(),
     new Date(2028, 1, 29, 9, 30, 0).getTime());
   // 投递一过，回正常的「下一落点」口径：2032-02-29 超出 366 天展示窗
-  // 口，predictedFire 如实答 null（「一年内无」）——但尾窗判定不受影响，
+  // 口，nextDelivery 如实答 null（「一年内无」）——但尾窗判定不受影响，
   // 明年同日再次进入尾窗时仍能保住会话。
   const after = new Date(2028, 1, 29, 10, 0, 0);
-  assert.equal(predictedFire(task, after), null);
+  assert.equal(fireOf(task, after), null);
   const nextYear = new Date(2029, 1, 28, 9, 15, 0);
   assert.equal(taskWanted(task, nextYear, 0), false);
 });

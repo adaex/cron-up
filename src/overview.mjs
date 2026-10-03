@@ -5,16 +5,17 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps } from './internals.mjs';
+import { deps, packageVersion } from './internals.mjs';
 import {
   loadConfig,
   loadState,
   validateConfig,
   loadHeartbeat,
   heartbeatStale,
+  isCooling,
+  cooldownEtaMinutes,
 } from './config.mjs';
 import { taskFileExists } from './tasks.mjs';
-import { packageVersion } from './paths.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
 import {
   humanDelta,
@@ -26,6 +27,7 @@ import {
   elapsedZh,
   fmtMDHM,
   fmtHM,
+  sameMinute,
 } from './display.mjs';
 
 // 总览页任务盘点。返回 [告警, 已在告警里说明冷却的工作区集合, 本轮发现
@@ -81,11 +83,10 @@ function overviewTasks(cfg, cols, consumers, state) {
     }
     if (wanted && !consumers.has(ws)) {
       const ent = state[ws] ?? {};
-      const cooldown = ent.cooldownUntil ?? 0;
-      if (cooldown > cur) {
+      if (isCooling(ent, cur)) {
         // 与「下轮会自动启动」互斥：冷却中就是不会启动，两条同现会自相
         // 矛盾，这里合并成一条。
-        const eta = Math.max(0, Math.floor((cooldown - cur) / 60));
+        const eta = cooldownEtaMinutes(ent, cur);
         alerts.push(
           `${ws} 有任务即将执行（或错过待补执行），但保活会话连续失败 `
           + `${ent.fails ?? '?'} 次正处冷却中，约 ${eta} 分钟后才会重试；`
@@ -109,8 +110,7 @@ function overviewTasks(cfg, cols, consumers, state) {
   if (soonest) {
     const [fire, ws, summary, nxt] = soonest;
     // 预计与设定不在同一分钟时，附注 cron 落点，解释两个时间的差。
-    const setTag = (nxt && (fmtHM(fire) !== fmtHM(nxt)
-      || fire.getDate() !== nxt.getDate()))
+    const setTag = (nxt && !sameMinute(fire, nxt))
       ? `，设定 ${fmtHM(nxt)}` : '';
     const line = `最近：${fmtMDHM(fire)}（${humanDelta(fire.getTime() - now.getTime())}`
       + `${setTag}） ${path.basename(ws)} · ${summary}`;
@@ -132,7 +132,7 @@ function overviewSessions(cols, state, suppressCooling, discovered) {
   const cooling = [];
   const dead = [];
   for (const [ws, ent] of Object.entries(state)) {
-    if ((ent.cooldownUntil ?? 0) > cur) cooling.push([ws, ent]);
+    if (isCooling(ent, cur)) cooling.push([ws, ent]);
     else if (deps.trackedAlive(ent)) live.push([ws, ent]);
     else dead.push(ws); // 记录还在、进程已没：带失败计数的保留至老化，其余下轮清理
   }
@@ -151,7 +151,7 @@ function overviewSessions(cols, state, suppressCooling, discovered) {
   }
   for (const [ws, ent] of cooling) {
     if (suppressCooling.has(ws)) continue; // 任务区已给过带上下文的合并告警
-    const eta = Math.max(0, Math.floor(((ent.cooldownUntil ?? 0) - cur) / 60));
+    const eta = cooldownEtaMinutes(ent, cur);
     alerts.push(`${ws} 保活连续失败 ${ent.fails ?? '?'} 次，冷却中，约 ${eta} `
       + '分钟后重试');
   }
@@ -205,7 +205,7 @@ export async function cmdOverview(args) {
   const state = loadState();
   const curOv = Math.floor(Date.now() / 1000);
   const heartbeat = loadHeartbeat();
-  const coolingWarned = new Set();
+  let coolingWarned = new Set();
   let discovered = null;
 
   if (cfgError !== null) {
@@ -221,7 +221,7 @@ export async function cmdOverview(args) {
     const minIdTag = cfg.autoMinId ? '，id 自动改小' : '，id 保持原样';
     const retainTag = cfg.sessionRetain === 'always'
       ? '，会话常驻' : '，会话按执行回收';
-    if (actualIv === null || actualIv === undefined) {
+    if (actualIv == null) {
       deps.print(`巡检：配置为每 ${cfg.intervalSeconds} 秒一轮（服务未加载），`
         + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}${minIdTag}${retainTag}`);
     } else {
@@ -252,9 +252,10 @@ export async function cmdOverview(args) {
     }
     alerts.push(...validateConfig(cfg));
     deps.print('');
-    const [taskAlerts, cooled, found] = overviewTasks(cfg, cols, consumers, state);
+    const [taskAlerts, coolingWarnedNow, found] = overviewTasks(
+      cfg, cols, consumers, state);
     alerts.push(...taskAlerts);
-    for (const w of cooled) coolingWarned.add(w);
+    coolingWarned = coolingWarnedNow;
     discovered = found;
   }
 
