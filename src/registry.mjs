@@ -88,10 +88,18 @@ export function liveSessionIds(details, ws) {
     .filter((x) => typeof x === 'string'));
 }
 
-// stampOwner 的认亲结论。details/ws 是 scanSessions 的第三元素；ent 是
-// state 条目，entAlive 由调用方按指纹判好（registry 不认识 state 语义）；
-// creatorAlive 表示「至少一个窗口内任务的创建者会话还在本目录活着」：
-//   own          祖先链里有本代 script pid——在场消费者就是我们的预热；
+// 逐任务本原谓词：这条任务的创建者会话还活着吗？liveSids 是同工作区的
+// liveSessionIds 快照。认亲分类（聚合布尔）与盖印（逐任务）都从它派生。
+export function creatorSessionAlive(task, liveSids) {
+  return typeof task?.createdBySessionId === 'string'
+    && liveSids.has(task.createdBySessionId);
+}
+
+// stampOwner 的认亲结论。details/ws 是 scanSessions 的第三元素；ownPid
+// 是调用方按指纹判活的本代 script pid（没有活条目时给 null，registry 不
+// 认识 state 条目的语义）；creatorAlive 表示「至少一个窗口内任务的创建
+// 者会话还在本目录活着」：
+//   own          祖先链里有 ownPid——在场消费者就是我们的预热；
 //                target 给出可盖印详情，身份字段缺失时为 null；
 //   creatorAlive 窗口任务的创建者会话还活着——任务按 Claude Code 规则必
 //                然投给它，不另拉、不盖印（用户显式要求的最高优先级）；
@@ -99,10 +107,10 @@ export function liveSessionIds(details, ws) {
 //                是自己（如 state 丢失的孤儿预热），保守不双开；
 //   user         以上皆否——创建者已关闭/崩溃，在场的只是无关用户会话
 //                （或根本没有消费者），可以另拉独立预热承接。
-export function classifyWorkspace(details, ws, ent, entAlive, creatorAlive) {
+export function classifyWorkspace(details, ws, ownPid, creatorAlive) {
   const list = details?.get(ws) ?? [];
-  if (ent?.pid && entAlive) {
-    const own = list.find((d) => d.ancestors.includes(ent.pid));
+  if (ownPid !== null) {
+    const own = list.find((d) => d.ancestors.includes(ownPid));
     if (own) {
       return {
         kind: 'own',
@@ -255,6 +263,7 @@ Object.assign(deps, {
   processParentMap,
   ancestorChain,
   liveSessionIds,
+  creatorSessionAlive,
   classifyWorkspace,
   scanSessions,
 });

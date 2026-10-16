@@ -10,6 +10,7 @@ import {
   ancestorChain,
   classifyWorkspace,
   liveSessionIds,
+  creatorSessionAlive,
 } from '../src/registry.mjs';
 import { procStartedAt } from '../src/sessions.mjs';
 import { mkTmp, mockDeps, tmpPaths, writeJson } from '../test-support/helpers.mjs';
@@ -362,14 +363,14 @@ function detail(over = {}) {
 
 test('classifyWorkspace: own warm session recognised by ancestor pid', () => {
   const details = new Map([['/w', [detail({ ancestors: [20, 10, 1] })]]]);
-  const v = classifyWorkspace(details, '/w', { pid: 10 }, true, false);
+  const v = classifyWorkspace(details, '/w', 10, false);
   assert.equal(v.kind, 'own');
   assert.equal(v.target.sessionId, 's');
 });
 
 test('classifyWorkspace: own but identity incomplete gives no target', () => {
   const details = new Map([['/w', [detail({ sessionId: null })]]]);
-  const v = classifyWorkspace(details, '/w', { pid: 1 }, true, false);
+  const v = classifyWorkspace(details, '/w', 1, false);
   assert.equal(v.kind, 'own');
   assert.equal(v.target, null, '在场但本轮不能盖印');
 });
@@ -378,70 +379,69 @@ test('classifyWorkspace: live creator is respected over a foreign user session',
   const foreign = new Map([['/w', [
     detail({ pid: 30, sessionId: 'creator-sid', ancestors: [1] }),
   ]]]);
-  // ent 活着但链里没有它，且窗口任务的创建者会话还活着：creatorAlive
+  // 活本代 pid 但链里没有它，且窗口任务的创建者会话还活着：creatorAlive
   // 优先于 user/ambiguous，不另拉。
-  assert.equal(classifyWorkspace(foreign, '/w', { pid: 10 }, true, true).kind,
+  assert.equal(classifyWorkspace(foreign, '/w', 10, true).kind,
     'creatorAlive');
   // 同一个现场但创建者已死：才落回 user。
-  assert.equal(classifyWorkspace(foreign, '/w', { pid: 10 }, true, false).kind,
-    'user');
-  // 没有 ent（首轮）同理。
-  assert.equal(classifyWorkspace(foreign, '/w', null, false, true).kind,
+  assert.equal(classifyWorkspace(foreign, '/w', 10, false).kind, 'user');
+  // 没有活本代（首轮）同理。
+  assert.equal(classifyWorkspace(foreign, '/w', null, true).kind,
     'creatorAlive');
-  assert.equal(classifyWorkspace(foreign, '/w', null, false, false).kind,
-    'user');
+  assert.equal(classifyWorkspace(foreign, '/w', null, false).kind, 'user');
 });
 
 test('classifyWorkspace: own takes precedence over live-creator flag', () => {
   // 已盖印给本代预热的任务，其 owner 就是预热自己——两态同时成立，own
   // 必须优先（target 还要继续供盖印判定）。
   const details = new Map([['/w', [detail({ ancestors: [20, 10, 1] })]]]);
-  const v = classifyWorkspace(details, '/w', { pid: 10 }, true, true);
+  const v = classifyWorkspace(details, '/w', 10, true);
   assert.equal(v.kind, 'own');
   assert.ok(v.target);
 });
 
 test('classifyWorkspace: dead entry or foreign chain falls back to user/ambiguous', () => {
   const foreign = new Map([['/w', [detail({ ancestors: [1] })]]]);
-  // ent 活着但链里没有它、创建者也不活：user。
-  assert.equal(classifyWorkspace(foreign, '/w', { pid: 10 }, true, false).kind,
-    'user');
-  // ent 死了同链：不能再认亲，仍是 user（接管交给调度器原生规则）。
-  assert.equal(classifyWorkspace(foreign, '/w', { pid: 10 }, false, false).kind,
-    'user');
-  // ent 为空（首轮/无条目）。
-  assert.equal(classifyWorkspace(foreign, '/w', null, false, false).kind,
-    'user');
+  // 给了 ownPid 但链里没有它、创建者也不活：user。
+  assert.equal(classifyWorkspace(foreign, '/w', 10, false).kind, 'user');
+  // 没有活本代（死条目不传 pid）。
+  assert.equal(classifyWorkspace(foreign, '/w', null, false).kind, 'user');
 });
 
-test('classifyWorkspace: broken chain is ambiguous even with a live ent', () => {
+test('classifyWorkspace: broken chain is ambiguous even with a live own pid', () => {
   const details = new Map([['/w', [
     detail({ pid: 30, ancestors: [], chainComplete: false }),
   ]]]);
-  assert.equal(classifyWorkspace(details, '/w', { pid: 10 }, true, false).kind,
-    'ambiguous');
+  assert.equal(classifyWorkspace(details, '/w', 10, false).kind, 'ambiguous');
   // 认亲命中优先于歧义：自己的预热链完整时，别的断链会话不影响结论。
   details.get('/w').push(detail({ pid: 31, ancestors: [20, 10, 1] }));
-  assert.equal(classifyWorkspace(details, '/w', { pid: 10 }, true, false).kind,
-    'own');
+  assert.equal(classifyWorkspace(details, '/w', 10, false).kind, 'own');
 });
 
 test('classifyWorkspace: missing workspace is a plain user verdict', () => {
-  assert.deepEqual(classifyWorkspace(new Map(), '/w', null, false, false),
+  assert.deepEqual(classifyWorkspace(new Map(), '/w', null, false),
     { kind: 'user', target: null });
-  assert.deepEqual(classifyWorkspace(new Map(), '/w', null, false, true),
+  assert.deepEqual(classifyWorkspace(new Map(), '/w', null, true),
     { kind: 'creatorAlive', target: null });
 });
 
 test('liveSessionIds lists only string session ids of the workspace', () => {
   const details = new Map([
     ['/w', [
-      { sessionId: 'a' },
-      { sessionId: null },
-      { sessionId: 'b' },
+      detail({ pid: 1, sessionId: 'a' }),
+      detail({ pid: 2, sessionId: null }),
+      detail({ pid: 3, sessionId: 'b' }),
     ]],
-    ['/other', [{ sessionId: 'c' }]],
+    ['/other', [detail({ pid: 4, sessionId: 'c' })]],
   ]);
   assert.deepEqual([...liveSessionIds(details, '/w')].sort(), ['a', 'b']);
   assert.deepEqual([...liveSessionIds(details, '/nope')], []);
+});
+
+test('creatorSessionAlive matches the task owner against live session ids', () => {
+  const live = new Set(['s1', 's2']);
+  assert.equal(creatorSessionAlive({ createdBySessionId: 's1' }, live), true);
+  assert.equal(creatorSessionAlive({ createdBySessionId: 'dead' }, live), false);
+  assert.equal(creatorSessionAlive({}, live), false);
+  assert.equal(creatorSessionAlive(null, live), false);
 });

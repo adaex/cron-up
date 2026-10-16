@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, packageVersion, isPlainObject } from './internals.mjs';
+import { deps, packageVersion } from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
@@ -177,16 +177,25 @@ function needHorizonMs(tasks, now) {
   return horizon;
 }
 
+// stampOwner 的活创建者判定，一处备齐 classifyWorkspace 需要的输入：
+// 返回本目录活会话 id 集合与「窗口内是否还有任务的创建者会话活着」。
+// 逐任务的 creatorSessionAlive 是本原（盖印逐个任务判定时复用同一谓词），
+// 聚合布尔只是它的派生。
+function liveCreatorWanted(tasks, details, ws, now, leadMs) {
+  const liveSids = deps.liveSessionIds(details, ws);
+  const creatorAlive = tasks.some((t) =>
+    taskWanted(t, now, leadMs) && deps.creatorSessionAlive(t, liveSids));
+  return { liveSids, creatorAlive };
+}
+
 // 保证一个工作区里有一个健康的消费者会话。原地修改 state。retain 来自
 // cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。scriptProcs
 // 是进程表快照或 null：null 时仅在需要认领孤儿（state 丢失的兜底分支）当
 // 下才拍快照，平静轮不付全量 ps 的代价。
 // stamp=null 表示 stampOwner 关（一切旧行为）；开启时为
-// {verdict, creatorAlive, recycleMarginSec}：verdict 是 classifyWorkspace
-// 对轮初快照的认亲结论（own/creatorAlive/ambiguous/user，换代或回收导致
-// 快照变化时在 retire 内重算），creatorAlive 是「窗口任务有活创建者」
-// （几分钟内不会变，retire 重算时复用），recycleMarginSec 是 window 回收
-// 余量。
+// {verdict, recycleMarginSec}：verdict 是 classifyWorkspace 对轮初消费者
+// 快照的认亲结论（own/creatorAlive/ambiguous/user，换代或回收导致快照变
+// 化时在 retire 内用新快照重算），recycleMarginSec 是 window 回收余量。
 export async function patrolWorkspace(
   ws, state, now, leadMs, cur, consumers, scriptProcs = null,
   retain = 'always', stats = null, stamp = null,
@@ -241,10 +250,10 @@ export async function patrolWorkspace(
     if (stamp) {
       const [nextConsumers, , nextDetails] = await deps.scanSessions({ lineage: true });
       consumers = nextConsumers;
-      // ent 已没，entAlive=false；creatorAlive 沿用轮初判定（活创建者在
-      // 换代这几分钟内不会变成别的状态）。
-      verdict = deps.classifyWorkspace(nextDetails, ws, null, false,
-        stamp.creatorAlive);
+      // ent 已没（ownPid 给 null）；creatorAlive 也必须按新快照重算——
+      // 重扫本身就承认换代这几秒现场会变，活创建者可能恰好开关会话。
+      verdict = deps.classifyWorkspace(nextDetails, ws, null,
+        liveCreatorWanted(tasks, nextDetails, ws, now, leadMs).creatorAlive);
     } else {
       consumers = (await deps.scanSessions())[0];
     }
@@ -292,64 +301,65 @@ export async function patrolWorkspace(
       + '界面静默，结束会话，下次需要时重拉');
   }
 
-  // 在场的消费者足以让我们放手吗？功能关时任何消费者都算；开启时三种
-  // 情况算——认到自己的预热（own）、窗口任务的创建者会话还活着
+  const wantedNow = tasks.some((t) => taskWanted(t, now, leadMs));
+  const warmAge = ent !== null ? cur - (ent.startedAt ?? cur) : 0;
+  // 我们跟踪的预热活着、超过登记宽限、且没被认成自己（own 不可能卡死）：
+  // 卡在提问界面的垃圾进程。两条善后路径共用这一个判定：
+  //  - 有别的会话可承接（consumerHolds）：只杀掉，不摘 state、不计数、不
+  //    重拉——是垃圾回收，不是一次启动失败；
+  //  - 没人承接：杀掉后继续走失败计数/冷却/重拉。
+  const warmStuck = ent !== null && mineAlive && wantedNow
+    && warmAge > WARMUP_GRACE_SECONDS
+    && (!stamp || verdict.kind !== 'own');
+  const killStuckWarm = async (held) => {
+    await deps.stopSession(ent);
+    note('stuck', `卡死 ${ws} pid=${ent.pid}：进程已存活 ${warmAge} 秒仍未登记`
+      + '会话，已终止'
+      + (held ? '；同目录已有会话可承接任务，不另拉预热' : '')
+      + `（排查：cron-up logs ${path.basename(ws)}）`);
+  };
+
+  // 在场的消费者足以让我们放手吗？功能关时任何消费者都算；开启时除 user
+  // 外的三态都算——认到自己的预热（own）、窗口任务的创建者会话还活着
   // （creatorAlive：用户显式要求尊重，绝不另拉）、父链有歧义无法排除是
-  // 自己（ambiguous）。仅无关用户会话（user）不算：创建者已关闭/崩溃，
-  // 下面继续走到 wanted→卡死退休/冷却→spawn，在同目录另起独立预热承接
-  // （全程只 stop 自己的 ent，不碰用户会话）。
+  // 自己（ambiguous）。仅 user 不算：创建者已关闭/崩溃，下面继续走到
+  // wanted→卡死退休/冷却→spawn，在同目录另起独立预热承接（全程只 stop
+  // 自己的 ent，不碰用户会话）。
   const consumerHolds = consumers.has(ws)
-    && (!stamp
-      || verdict?.kind === 'own'
-      || verdict?.kind === 'creatorAlive'
-      || verdict?.kind === 'ambiguous');
+    && (!stamp || verdict.kind !== 'user');
 
   // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
   // 次——健康会话常驻时计数会一直挂着，一次无关死亡就能把陈年计数顶满冷
-  // 却，连一次新尝试都不给。只有真的认到自己（own）才清零：creatorAlive
-  // 时在场的是活创建者、我们自己的预热可能正卡着没登记，不能替它清零；
-  // 歧义态保守当真，与「不双开」方向一致。
+  // 却，连一次新尝试都不给。只有真的认到自己（own）或歧义态才清零：
+  // creatorAlive 时在场的是活创建者、我们的预热可能正卡着没登记，不能替
+  // 它清零。
   if (ent !== null && mineAlive && consumers.has(ws)
-      && (!stamp || verdict?.kind === 'own' || verdict?.kind === 'ambiguous')) {
+      && (!stamp || verdict.kind === 'own' || verdict.kind === 'ambiguous')) {
     ent.fails = 0;
   }
 
   // 任务正在被消费。可能是我们的预热会话（已登记——上面的健康清零已覆
   // 盖），也可能是用户的交互会话——后者默认放手：不在这里删死条目，失败
   // 计数要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），
-  // 由轮末 kept 过滤统一处理。先于 wanted 判定返回：有消费者在场的平稳
-  // 态不必为整组任务跑一遍 cron 求值。
-  // creatorAlive/ambiguous 返回前还有一件事：我们自己跟踪的预热若已卡死
-  // （超登记宽限仍未认到——verdict 不是 own），它是没用的垃圾进程，任务
-  // 由活创建者承接（或歧义保守），杀掉它即可、本轮不重拉。
+  // 由轮末 kept 过滤统一处理。creatorAlive/ambiguous 返回前顺手清掉卡死
+  // 的垃圾预热；平稳态在此提前返回，不必继续后面的流程。
   if (consumerHolds) {
-    if (stamp && verdict?.kind !== 'own'
-        && ent !== null && mineAlive
-        && tasks.some((t) => taskWanted(t, now, leadMs))
-        && cur - (ent.startedAt ?? cur) > WARMUP_GRACE_SECONDS) {
-      const age = cur - (ent.startedAt ?? cur);
-      await deps.stopSession(ent);
-      note('stuck', `卡死 ${ws} pid=${ent.pid}：进程已存活 ${age} 秒仍未登记`
-        + '会话，已终止；同目录已有会话可承接任务，不另拉预热'
-        + '（排查：cron-up logs '
-        + `${path.basename(ws)}）`);
-    }
+    // 默认配置（stamp 关）沿用旧行为：用户会话在场时「掩护」卡死预热，
+    // 不在这里杀，交给 7 天换代——所以 holds 路径只在 stamp 开启时清垃圾。
+    if (stamp && warmStuck) await killStuckWarm(true);
     return;
   }
 
-  if (!tasks.some((t) => taskWanted(t, now, leadMs))) return;
+  if (!wantedNow) return;
 
   const cooling = isCooling(ent, cur);
 
   // 活着但没有消费。健康只在真实启动所需的时间内成立；超时就是卡在无人
-  // 应答的提问界面，永不登记——退休它并推进失败计数。
+  // 应答的提问界面，永不登记——退休它并推进失败计数。宽限内的年轻会话
+  // 直接返回；warmStuck 已含超宽限判定。
   if (ent !== null && mineAlive) {
-    const age = cur - (ent.startedAt ?? cur);
-    if (age <= WARMUP_GRACE_SECONDS) return;
-    await deps.stopSession(ent);
-    note('stuck', `卡死 ${ws} pid=${ent.pid}：进程已存活 ${age} 秒仍未登记会话，`
-      + '已终止（排查：cron-up logs '
-      + `${path.basename(ws)}）`);
+    if (!warmStuck) return;
+    await killStuckWarm(false);
   }
 
   if (cooling) return;
@@ -531,27 +541,23 @@ export async function cmdRun(args) {
       // 压制该工作区的会话保活。三者合并为同一次原子写（见
       // maintainWorkspace）。
       //
-      // stampOwner 的判定在这里现算（需要任务内容）：窗口内是否还有任务
+      // stampOwner 的判定在这里现算（依赖任务内容）：窗口内是否还有任务
       // 的创建者会话活着——活创建者拥有否决权，不另拉、不盖印。
-      let target = null;
       let stampArg = null;
       let liveSids = null;
       if (cfg.stampOwner) {
-        const wsTasks = deps.readTasks(ws) ?? [];
-        liveSids = deps.liveSessionIds(details, ws);
-        const creatorAlive = wsTasks.some((t) =>
-          isPlainObject(t)
-          && typeof t.createdBySessionId === 'string'
-          && liveSids.has(t.createdBySessionId)
-          && taskWanted(t, now, leadMs));
+        const wsTasks = deps.readTasks(ws) ?? []; // readTasks 已滤掉非对象
+        const creator = liveCreatorWanted(wsTasks, details, ws, now, leadMs);
+        liveSids = creator.liveSids;
         const entNow = state[ws] ?? null;
-        const verdict = deps.classifyWorkspace(
-          details, ws, entNow,
-          Boolean(entNow) && deps.trackedAlive(entNow),
-          creatorAlive);
-        target = verdict.target; // 仅 own 且身份完整时非空
-        stampArg = { verdict, creatorAlive, recycleMarginSec };
+        const ownPid = entNow && deps.trackedAlive(entNow) ? entNow.pid : null;
+        stampArg = {
+          verdict: deps.classifyWorkspace(details, ws, ownPid,
+            creator.creatorAlive),
+          recycleMarginSec,
+        };
       }
+      const target = stampArg?.verdict?.target ?? null;
       // 盖印谓词只盖「窗口内且创建者已不活」的任务：活创建者的任务永远
       // 不碰（即便本目录另有我们的预热在承接别的死主任务）；已盖给本代
       // 预热的任务因 owner 就在活会话集合里而自然跳过，幂等不靠另写比较。
@@ -566,7 +572,7 @@ export async function cmdRun(args) {
               ? {
                   ...target,
                   isWanted: (t) => taskWanted(t, now, leadMs)
-                    && !liveSids.has(t.createdBySessionId),
+                    && !deps.creatorSessionAlive(t, liveSids),
                 }
               : null,
           }) ?? {};
