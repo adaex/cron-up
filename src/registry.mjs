@@ -79,15 +79,27 @@ export function ancestorChain(pid, parentMap) {
   }
 }
 
-// stampOwner 的认亲结论。输入是 scanSessions 第三元素、工作区、state 条
-// 目与调用方按指纹判好的存活布尔（registry 不认识 state 条目的语义）：
-//   own       祖先链里有本代 script pid——在场消费者就是我们的预热；
-//             target 给出可盖印的登记详情，身份字段缺失时为 null（在场
-//             但这一轮还不能过户）；
-//   ambiguous 没有自己的预热，但在场会话父链不完整——无法证明不是自己，
-//             调用方按「不双开」保守处理；
-//   user      父链完整且不含本代 pid——只有用户的会话，可以在旁边另拉。
-export function classifyWorkspace(details, ws, ent, entAlive) {
+// 本目录活着的消费者会话 id 集合。窗口任务的 createdBySessionId 命中其中
+// 任一个，就说明创建它的会话还开着——stampOwner 的最高优先级是尊重活创
+// 建者，既不另拉也不过户。
+export function liveSessionIds(details, ws) {
+  return new Set((details?.get(ws) ?? [])
+    .map((d) => d.sessionId)
+    .filter((x) => typeof x === 'string'));
+}
+
+// stampOwner 的认亲结论。details/ws 是 scanSessions 的第三元素；ent 是
+// state 条目，entAlive 由调用方按指纹判好（registry 不认识 state 语义）；
+// creatorAlive 表示「至少一个窗口内任务的创建者会话还在本目录活着」：
+//   own          祖先链里有本代 script pid——在场消费者就是我们的预热；
+//                target 给出可盖印详情，身份字段缺失时为 null；
+//   creatorAlive 窗口任务的创建者会话还活着——任务按 Claude Code 规则必
+//                然投给它，不另拉、不盖印（用户显式要求的最高优先级）；
+//   ambiguous    没有认到自己的预热，但在场会话父链不完整——无法证明不
+//                是自己（如 state 丢失的孤儿预热），保守不双开；
+//   user         以上皆否——创建者已关闭/崩溃，在场的只是无关用户会话
+//                （或根本没有消费者），可以另拉独立预热承接。
+export function classifyWorkspace(details, ws, ent, entAlive, creatorAlive) {
   const list = details?.get(ws) ?? [];
   if (ent?.pid && entAlive) {
     const own = list.find((d) => d.ancestors.includes(ent.pid));
@@ -98,6 +110,7 @@ export function classifyWorkspace(details, ws, ent, entAlive) {
       };
     }
   }
+  if (creatorAlive) return { kind: 'creatorAlive', target: null };
   if (list.some((d) => !d.chainComplete)) return { kind: 'ambiguous', target: null };
   return { kind: 'user', target: null };
 }
@@ -241,6 +254,7 @@ Object.assign(deps, {
   processShape,
   processParentMap,
   ancestorChain,
+  liveSessionIds,
   classifyWorkspace,
   scanSessions,
 });

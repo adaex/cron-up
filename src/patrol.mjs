@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, packageVersion } from './internals.mjs';
+import { deps, packageVersion, isPlainObject } from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
@@ -182,9 +182,11 @@ function needHorizonMs(tasks, now) {
 // 是进程表快照或 null：null 时仅在需要认领孤儿（state 丢失的兜底分支）当
 // 下才拍快照，平静轮不付全量 ps 的代价。
 // stamp=null 表示 stampOwner 关（一切旧行为）；开启时为
-// {verdict, recycleMarginSec}：verdict 是 classifyWorkspace 对轮初消费者
-// 快照的认亲结论（own/ambiguous/user，换代或回收导致快照变化时在 retire
-// 内重算），recycleMarginSec 是 window 回收余量。
+// {verdict, creatorAlive, recycleMarginSec}：verdict 是 classifyWorkspace
+// 对轮初快照的认亲结论（own/creatorAlive/ambiguous/user，换代或回收导致
+// 快照变化时在 retire 内重算），creatorAlive 是「窗口任务有活创建者」
+// （几分钟内不会变，retire 重算时复用），recycleMarginSec 是 window 回收
+// 余量。
 export async function patrolWorkspace(
   ws, state, now, leadMs, cur, consumers, scriptProcs = null,
   retain = 'always', stats = null, stamp = null,
@@ -239,7 +241,10 @@ export async function patrolWorkspace(
     if (stamp) {
       const [nextConsumers, , nextDetails] = await deps.scanSessions({ lineage: true });
       consumers = nextConsumers;
-      verdict = deps.classifyWorkspace(nextDetails, ws, null, false);
+      // ent 已没，entAlive=false；creatorAlive 沿用轮初判定（活创建者在
+      // 换代这几分钟内不会变成别的状态）。
+      verdict = deps.classifyWorkspace(nextDetails, ws, null, false,
+        stamp.creatorAlive);
     } else {
       consumers = (await deps.scanSessions())[0];
     }
@@ -287,18 +292,25 @@ export async function patrolWorkspace(
       + '界面静默，结束会话，下次需要时重拉');
   }
 
-  // 在场的消费者足以让我们放手吗？功能关时任何消费者都算；开启时只有
-  // 「认到自己的预热」与「父链有歧义、无法排除是自己」算——仅用户会话
-  // 不算，下面继续走到 wanted→卡死退休/冷却→spawn，在同目录另起自己
-  // 的预热（该开关的显式目的；全程只 stop 自己的 ent，不碰用户会话）。
+  // 在场的消费者足以让我们放手吗？功能关时任何消费者都算；开启时三种
+  // 情况算——认到自己的预热（own）、窗口任务的创建者会话还活着
+  // （creatorAlive：用户显式要求尊重，绝不另拉）、父链有歧义无法排除是
+  // 自己（ambiguous）。仅无关用户会话（user）不算：创建者已关闭/崩溃，
+  // 下面继续走到 wanted→卡死退休/冷却→spawn，在同目录另起独立预热承接
+  // （全程只 stop 自己的 ent，不碰用户会话）。
   const consumerHolds = consumers.has(ws)
-    && (!stamp || verdict?.kind === 'own' || verdict?.kind === 'ambiguous');
+    && (!stamp
+      || verdict?.kind === 'own'
+      || verdict?.kind === 'creatorAlive'
+      || verdict?.kind === 'ambiguous');
 
   // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
   // 次——健康会话常驻时计数会一直挂着，一次无关死亡就能把陈年计数顶满冷
-  // 却，连一次新尝试都不给。仅用户会话在场不清零（它不证明 launchd 拉起
-  // 的环境健康）；歧义态保守当真，与「不双开」方向一致。
-  if (ent !== null && mineAlive && consumerHolds) {
+  // 却，连一次新尝试都不给。只有真的认到自己（own）才清零：creatorAlive
+  // 时在场的是活创建者、我们自己的预热可能正卡着没登记，不能替它清零；
+  // 歧义态保守当真，与「不双开」方向一致。
+  if (ent !== null && mineAlive && consumers.has(ws)
+      && (!stamp || verdict?.kind === 'own' || verdict?.kind === 'ambiguous')) {
     ent.fails = 0;
   }
 
@@ -307,7 +319,23 @@ export async function patrolWorkspace(
   // 计数要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），
   // 由轮末 kept 过滤统一处理。先于 wanted 判定返回：有消费者在场的平稳
   // 态不必为整组任务跑一遍 cron 求值。
-  if (consumerHolds) return;
+  // creatorAlive/ambiguous 返回前还有一件事：我们自己跟踪的预热若已卡死
+  // （超登记宽限仍未认到——verdict 不是 own），它是没用的垃圾进程，任务
+  // 由活创建者承接（或歧义保守），杀掉它即可、本轮不重拉。
+  if (consumerHolds) {
+    if (stamp && verdict?.kind !== 'own'
+        && ent !== null && mineAlive
+        && tasks.some((t) => taskWanted(t, now, leadMs))
+        && cur - (ent.startedAt ?? cur) > WARMUP_GRACE_SECONDS) {
+      const age = cur - (ent.startedAt ?? cur);
+      await deps.stopSession(ent);
+      note('stuck', `卡死 ${ws} pid=${ent.pid}：进程已存活 ${age} 秒仍未登记`
+        + '会话，已终止；同目录已有会话可承接任务，不另拉预热'
+        + '（排查：cron-up logs '
+        + `${path.basename(ws)}）`);
+    }
+    return;
+  }
 
   if (!tasks.some((t) => taskWanted(t, now, leadMs))) return;
 
@@ -482,22 +510,11 @@ export async function cmdRun(args) {
       deps.log(`告警：${registryAlert}`);
     }
 
-    // stampOwner 的认亲表：每个有消费者的工作区一个结论（own/ambiguous/
-    // user），判定规则全部收口在 registry.classifyWorkspace，patrol 只
-    // 消费结论。target 非空才可盖印（认到自己但身份字段缺失的一轮只
-    // own、不过户）。
-    const verdicts = new Map();
-    if (cfg.stampOwner) {
-      for (const ws0 of consumers) {
-        const ent0 = state[ws0] ?? null;
-        verdicts.set(ws0,
-          deps.classifyWorkspace(details, ws0, ent0, Boolean(ent0)
-            && deps.trackedAlive(ent0)));
-      }
-    }
-    const stampBase = cfg.stampOwner
-      ? { recycleMarginSec: SESSION_FIRE_MARGIN_SECONDS + cfg.intervalSeconds }
-      : null;
+    // stampOwner 的结论依赖任务内容（活创建者判定要看窗口任务的
+    // createdBySessionId），所以在下面 discover 循环里、读到任务后逐工
+    // 作区现算；这里只留全轮常量。
+    const recycleMarginSec = SESSION_FIRE_MARGIN_SECONDS
+      + cfg.intervalSeconds;
 
     // 轮间死亡在进入工作区循环前先报：随后该工作区若需要会话会打印重拉，
     // 日志时间线就是「退出 → 重拉」，而不是反过来。
@@ -513,7 +530,31 @@ export async function cmdRun(args) {
       // 后面所有工作区。续期/改 id/过户与保活各自独立守卫——维护失败绝不
       // 压制该工作区的会话保活。三者合并为同一次原子写（见
       // maintainWorkspace）。
-      const target = verdicts.get(ws)?.target ?? null;
+      //
+      // stampOwner 的判定在这里现算（需要任务内容）：窗口内是否还有任务
+      // 的创建者会话活着——活创建者拥有否决权，不另拉、不盖印。
+      let target = null;
+      let stampArg = null;
+      let liveSids = null;
+      if (cfg.stampOwner) {
+        const wsTasks = deps.readTasks(ws) ?? [];
+        liveSids = deps.liveSessionIds(details, ws);
+        const creatorAlive = wsTasks.some((t) =>
+          isPlainObject(t)
+          && typeof t.createdBySessionId === 'string'
+          && liveSids.has(t.createdBySessionId)
+          && taskWanted(t, now, leadMs));
+        const entNow = state[ws] ?? null;
+        const verdict = deps.classifyWorkspace(
+          details, ws, entNow,
+          Boolean(entNow) && deps.trackedAlive(entNow),
+          creatorAlive);
+        target = verdict.target; // 仅 own 且身份完整时非空
+        stampArg = { verdict, creatorAlive, recycleMarginSec };
+      }
+      // 盖印谓词只盖「窗口内且创建者已不活」的任务：活创建者的任务永远
+      // 不碰（即便本目录另有我们的预热在承接别的死主任务）；已盖给本代
+      // 预热的任务因 owner 就在活会话集合里而自然跳过，幂等不靠另写比较。
       if (cfg.autoRenew || cfg.autoMinId || target) {
         try {
           const { renewed, minified, reowned } = maintainWorkspace(taskfile, {
@@ -522,7 +563,11 @@ export async function cmdRun(args) {
             // target 多出的祖先链字段 tasks 层不读，展开即可，不必手抄
             // 三个盖印字段。
             reown: target
-              ? { ...target, isWanted: (t) => taskWanted(t, now, leadMs) }
+              ? {
+                  ...target,
+                  isWanted: (t) => taskWanted(t, now, leadMs)
+                    && !liveSids.has(t.createdBySessionId),
+                }
               : null,
           }) ?? {};
           if (renewed) {
@@ -553,10 +598,7 @@ export async function cmdRun(args) {
       try {
         await patrolWorkspace(
           ws, state, now, leadMs, cur, consumers, null,
-          cfg.sessionRetain, stats,
-          stampBase
-            ? { ...stampBase, verdict: verdicts.get(ws) ?? null }
-            : null);
+          cfg.sessionRetain, stats, stampArg);
       } catch (e) {
         bump(stats, 'error');
         deps.log(`错误 ${ws}：${e.constructor.name}：${e.message}`);

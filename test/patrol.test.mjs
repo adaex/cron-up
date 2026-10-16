@@ -797,19 +797,48 @@ async function setupStampMachine(t, opts = {}) {
   };
 }
 
-test('stampOwner: spawns beside the user session and stamps owner next round', async (t) => {
-  const m = await setupStampMachine(t);
-  m.setScene('user');
+test('stampOwner: live creator session is respected — no spawn, no stamp', async (t) => {
+  // 核心语义：任务是在当前开着的会话里创建的，它一直没关——巡检必须
+  // 放手，任务到点自然进这个会话。
+  const m = await setupStampMachine(t); // 默认任务 owner = sess-user
+  m.setScene('user'); // 在场会话正是 sess-user
 
-  // 轮 1：用户会话在场、任务在窗口——不接管它，另拉自己的预热；当轮还
-  // 没有登记，盖印要等下一轮。
+  await m.patrol();
+  assert.deepEqual(m.spawnPids, [], '活创建者在场，不另拉预热');
+  assert.ok(!(m.ws in m.state()), '不跟踪任何预热');
+  assert.equal(m.tasks()[0].createdBySessionId, 'sess-user', '归属不动');
+
+  // 再过一轮依然如此。
+  await m.patrol();
+  assert.deepEqual(m.spawnPids, []);
+  assert.equal(m.tasks()[0].createdBySessionId, 'sess-user');
+});
+
+test('stampOwner: dead creator with another session present spawns and stamps', async (t) => {
+  // 任务的创建者已经关闭/崩溃，同目录虽有别的会话（但不是创建者）——
+  // 另拉独立预热承接，不把任务丢给无关会话。
+  const m = await setupStampMachine(t, {
+    tasks: [{
+      id: '00000001',
+      cron: '*/5 * * * *',
+      prompt: 'p',
+      createdAt: Date.now(),
+      recurring: true,
+      createdBySessionId: 'sess-dead', // 建任务的会话已经没了
+      createdByPid: 800,
+      createdByProcStart: 'start-dead',
+    }],
+  });
+  m.setScene('user'); // 在场的是另一个会话 sess-user
+
+  // 轮 1：creatorAlive=false → user 态，另拉预热；当轮没登记不急盖。
   await m.patrol();
   const S1 = m.state()[m.ws].pid;
   assert.equal(S1, 100);
-  assert.equal(m.tasks()[0].createdBySessionId, 'sess-user', '当轮不急盖');
+  assert.equal(m.tasks()[0].createdBySessionId, 'sess-dead');
   assert.ok(m.logs.some((l) => l.includes('已另启动预热会话')));
 
-  // 轮 2：预热完成登记（三代祖先链认亲）→ 盖印，且不再 spawn 第二个。
+  // 轮 2：预热完成登记（三代祖先链认亲）→ 盖印，不再 spawn 第二个。
   m.setScene('userWarm');
   await m.patrol();
   const task = m.tasks()[0];
@@ -841,15 +870,14 @@ test('stampOwner: ambiguous lineage never spawns nor stamps', async (t) => {
   assert.equal(m.tasks()[0].createdBySessionId, 'sess-user');
 });
 
-test('stampOwner: stuck warm session is retired even beside a user session', async (t) => {
-  const m = await setupStampMachine(t);
-
-  // 轮 1：拉起 S1（当时没有用户会话）。
+test('stampOwner: stuck warm is retired but not respawned when a live creator holds', async (t) => {
+  // 轮 1：没人在场时拉起 S1；S1 卡死、始终没登记。
+  const m = await setupStampMachine(t); // 任务 owner = sess-user
   await m.patrol();
   const S1 = m.state()[m.ws].pid;
 
-  // 轮 2：S1 超过登记宽限仍未登记，用户会话恰在场——stampOwner 开启时
-  // 不再让它躲在用户会话身后，杀掉重拉。
+  // 轮 2：活创建者 sess-user 出现且任务在窗口（creatorAlive 成立），S1
+  // 又超过登记宽限——垃圾进程要杀，但任务由活创建者承接，不重拉。
   m.setScene('user');
   m.writeState({
     ...m.state(),
@@ -860,9 +888,38 @@ test('stampOwner: stuck warm session is retired even beside a user session', asy
   });
   await m.patrol();
   assert.ok(!m.alivePids.has(S1), '卡死的预热被退休');
+  assert.deepEqual(m.spawnPids, [S1], '活创建者承接任务，不另拉');
+  assert.equal(m.tasks()[0].createdBySessionId, 'sess-user', '不盖印');
+});
+
+test('stampOwner: stuck warm is retired and respawned when only a foreign session holds', async (t) => {
+  // 对照：在场会话不是创建者（创建者已死）时，卡死的预热退休后要重拉——
+  // user 态，不能让任务漏给无关会话。
+  const m = await setupStampMachine(t, {
+    tasks: [{
+      id: '00000001',
+      cron: '*/5 * * * *',
+      prompt: 'p',
+      createdAt: Date.now(),
+      recurring: true,
+      createdBySessionId: 'sess-dead',
+    }],
+  });
+  await m.patrol(); // 无人，拉 S1
+  const S1 = m.state()[m.ws].pid;
+  m.setScene('user'); // 只有无关会话 sess-user
+  m.writeState({
+    ...m.state(),
+    [m.ws]: {
+      ...m.state()[m.ws],
+      startedAt: m.state()[m.ws].startedAt - WARMUP_GRACE_SECONDS - 1,
+    },
+  });
+  await m.patrol();
+  assert.ok(!m.alivePids.has(S1));
   const S2 = m.state()[m.ws].pid;
   assert.notEqual(S2, S1);
-  assert.ok(m.alivePids.has(S2));
+  assert.ok(m.alivePids.has(S2), 'user 态：杀掉后重拉新预热');
 });
 
 test('stampOwner: owner is re-stamped to the new generation after a death', async (t) => {
