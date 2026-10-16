@@ -4,7 +4,9 @@ import path from 'node:path';
 
 import { cmdList } from '../src/list.mjs';
 import { dispWidth, fmtMDHM } from '../src/display.mjs';
-import { mkTmp, mockDeps, tmpPaths, writeJson } from '../test-support/helpers.mjs';
+import {
+  mkTmp, mockDeps, tmpPaths, writeJson, scanResult,
+} from '../test-support/helpers.mjs';
 
 const WS = '/x';
 
@@ -21,7 +23,7 @@ async function setup(t) {
   deps.print = (m) => lines.push(m);
   const render = async (tasks, consumers = new Set()) => {
     deps.readTasks = () => tasks;
-    deps.scanSessions = () => [consumers, null];
+    deps.scanSessions = () => scanResult(consumers);
     lines.length = 0;
     await cmdList({ config: cfgPath });
     return lines.join('\n');

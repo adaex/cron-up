@@ -25,6 +25,13 @@ export const DEFAULT_CONFIG = {
   // 上下文不互相累积；'always'——旧常驻行为，执行间隔里也保留会话，仅受
   // 7 天超龄换代约束。
   sessionRetain: 'window',
+  // 任务归属改写：默认关，维持「同目录有会话就不双开」的旧行为。开启后，
+  // 即使用户本人的交互会话在场，也另拉独立预热会话，并把投递窗口内任务的
+  // createdBySessionId/createdByPid/createdByProcStart 三字段改写成预热会话
+  // ——任务按 Claude Code 自身的「创建者会话铁拿」规则投到预热会话，用户
+  // 会话主动不碰；预热死亡则自动滑回原生的死者接管规则。依赖 Claude Code
+  // 未公开的任务文件字段与进程父子关系，见 README「任务归属预热」。
+  stampOwner: false,
 };
 
 // 预热会话连续三次启动后死亡，大概率是环境坏了（缺信任、env 不对），退避

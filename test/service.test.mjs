@@ -387,6 +387,17 @@ test('auto-min-id flags set the value; omitted preserves', async (t) => {
   assert.equal(s.cfg().autoMinId, true); // 省略则保留
 });
 
+test('stamp-owner flags set the value; omitted preserves', async (t) => {
+  let s = await setupInstall(t);
+  await s.install({ stampOwner: true });
+  assert.equal(s.cfg().stampOwner, true);
+  await s.install({ stampOwner: false });
+  assert.equal(s.cfg().stampOwner, false);
+  await s.install({ stampOwner: true });
+  await s.install({ force: true });
+  assert.equal(s.cfg().stampOwner, true); // 省略则保留上值
+});
+
 test('bootstrap failure exits 1', async (t) => {
   const s = await setupInstall(t);
   s.deps.launchctl = (...a) => (a[0] === 'bootstrap'

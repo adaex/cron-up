@@ -93,6 +93,10 @@ export function configFieldErrors(cfg) {
     errs.push(['sessionRetain',
       `sessionRetain 应是 "window" 或 "always"，当前为 ${JSON.stringify(cfg.sessionRetain)}`]);
   }
+  if (typeof cfg.stampOwner !== 'boolean') {
+    errs.push(['stampOwner',
+      `stampOwner 应是布尔值（true/false），当前为 ${JSON.stringify(cfg.stampOwner)}`]);
+  }
   return errs;
 }
 

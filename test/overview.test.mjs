@@ -5,7 +5,9 @@ import path from 'node:path';
 
 import { cmdOverview } from '../src/overview.mjs';
 import { readTasks } from '../src/tasks.mjs';
-import { mkTmp, mockDeps, tmpPaths, writeJson } from '../test-support/helpers.mjs';
+import {
+  mkTmp, mockDeps, tmpPaths, writeJson, scanResult,
+} from '../test-support/helpers.mjs';
 
 const WS = '/x';
 
@@ -21,7 +23,7 @@ async function setup(t) {
     roots: [tmp], maxDepth: 3, intervalSeconds: 300, leadSeconds: 600,
   });
   deps.discover = () => [[WS, 'x']];
-  deps.scanSessions = () => [new Set(), null];
+  deps.scanSessions = () => scanResult();
   deps.launchctlInfo = () => ({
     state: 'running', 'last exit code': '0', interval: 300,
   });
@@ -52,6 +54,16 @@ test('no cooling tail when nothing is cooling', async (t) => {
   const out = await (await setup(t)).render();
   assert.ok(out.includes('会话：无保活会话'));
   assert.ok(!out.includes('冷却'));
+});
+
+test('patrol line shows stampOwner tag only when enabled', async (t) => {
+  const s = await setup(t);
+  assert.ok(!(await s.render()).includes('任务归属预热'));
+  writeJson(s.cfgPath, {
+    roots: [s.tmp], maxDepth: 3, intervalSeconds: 300, leadSeconds: 600,
+    stampOwner: true,
+  });
+  assert.ok((await s.render()).includes('任务归属预热'));
 });
 
 test('task inventory and soonest line', async (t) => {

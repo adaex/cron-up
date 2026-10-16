@@ -13,6 +13,7 @@ export const SPECS = {
       'auto-renew': 'tri',
       'auto-min-id': 'tri',
       'session-retain': 'string',
+      'stamp-owner': 'tri',
     },
   },
   uninstall: {

@@ -5,11 +5,13 @@ import path from 'node:path';
 
 import { cmdRun, patrolWorkspace, rotatePatrolLogs } from '../src/patrol.mjs';
 import { sessionLogPath } from '../src/sessions.mjs';
+import { readTasks } from '../src/tasks.mjs';
 import {
   WARMUP_GRACE_SECONDS,
   SESSION_MAX_AGE_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
   FAIL_TTL_SECONDS,
+  SESSION_FIRE_MARGIN_SECONDS,
 } from '../src/constants.mjs';
 import { ExitError } from '../src/internals.mjs';
 import {
@@ -18,9 +20,17 @@ import {
   tmpPaths,
   readJson,
   writeJson,
+  scanResult,
 } from '../test-support/helpers.mjs';
 
 const WS = '/x';
+
+// 「距现在 offsetSec 后的时刻」的一次性 cron 五字段（月/日按当前日历取）。
+function cronAt(offsetSec) {
+  const d = new Date(Date.now() + offsetSec * 1000);
+  return `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
+    + `${d.getMonth() + 1} *`;
+}
 
 async function setupMachine(t, cfgExtra = {}) {
   const tmp = mkTmp(t);
@@ -36,11 +46,14 @@ async function setupMachine(t, cfgExtra = {}) {
     ...cfgExtra,
   });
   const alivePids = new Set();
+  const spawnPids = [];
   let nextPid = 100;
   const holder = { consumer: false };
   deps.discover = () => [[WS, 'x']];
   deps.readTasks = () => [{ cron: '*/5 * * * *', createdAt: 0 }];
-  deps.scanSessions = () => [holder.consumer ? new Set([WS]) : new Set(), null];
+  deps.scanSessions = () => (holder.consumer
+    ? scanResult(new Set([WS]))
+    : scanResult());
   deps.listScriptProcesses = () => [];
   deps.alive = (p) => alivePids.has(p);
   deps.procStartedAt = (p) => (alivePids.has(p) ? `start-${p}` : null);
@@ -48,6 +61,7 @@ async function setupMachine(t, cfgExtra = {}) {
     const pid = nextPid;
     nextPid += 1;
     alivePids.add(pid);
+    spawnPids.push(pid);
     return { pid, procStart: `start-${pid}` };
   };
   deps.stopSession = async (ent) => { alivePids.delete(ent.pid); };
@@ -60,7 +74,8 @@ async function setupMachine(t, cfgExtra = {}) {
   const patrol = () => cmdRun({ config: cfgPath });
   const writeState = (s) => writeJson(deps.paths.statePath, s);
   return {
-    tmp, deps, cfgPath, alivePids, state, writeState, patrol, holder, nextPid,
+    tmp, deps, cfgPath, alivePids, spawnPids, state, writeState, patrol,
+    holder, nextPid,
   };
 }
 
@@ -489,10 +504,7 @@ test('recycle respawns in the same round when a window is still open', async (t)
   staleLog();
   // 4 分钟后要触发的任务：在 lead 窗口内、且超出回收余量——回收旧会话后
   // 同一轮就要拉新会话，等下一轮可能就错过触发点了。
-  const soon = new Date(Date.now() + 4 * 60_000);
-  const soonCron = `${soon.getMinutes()} ${soon.getHours()} ${soon.getDate()} `
-    + `${soon.getMonth() + 1} *`;
-  m.deps.readTasks = recycleTasks(soonCron);
+  m.deps.readTasks = recycleTasks(cronAt(4 * 60));
   await m.patrol();
   const ent = m.state()[WS];
   assert.ok(!m.alivePids.has(pid1), '旧会话被回收');
@@ -528,10 +540,7 @@ test('session nearing its next fire is kept for reuse', async (t) => {
   const pid = m.state()[WS].pid;
   staleLog();
   // 下次触发 60 秒后，小于回收余量：宁可直接复用现有会话。
-  const soon = new Date(Date.now() + 60_000);
-  const soonCron = `${soon.getMinutes()} ${soon.getHours()} ${soon.getDate()} `
-    + `${soon.getMonth() + 1} *`;
-  m.deps.readTasks = recycleTasks(soonCron);
+  m.deps.readTasks = recycleTasks(cronAt(60));
   await m.patrol();
   assert.equal(m.state()[WS].pid, pid, '距下次触发太近，不回收');
 });
@@ -541,13 +550,11 @@ test('pending missed one-shot blocks recycle', async (t) => {
   await m.patrol();
   const pid = m.state()[WS].pid;
   staleLog();
-  const past = new Date(Date.now() - 86400_000);
-  const pastCron = `${past.getMinutes()} ${past.getHours()} ${past.getDate()} `
-    + `${past.getMonth() + 1} *`;
   m.deps.readTasks = () => [
     { cron: '0 9 1 1 *', recurring: true, createdAt: 0,
       lastFiredAt: Date.now() },
-    { cron: pastCron, createdAt: Date.now() - 2 * 86400_000, recurring: false },
+    { cron: cronAt(-86400), createdAt: Date.now() - 2 * 86400_000,
+      recurring: false },
   ];
   await m.patrol();
   assert.ok(m.alivePids.has(pid), '错过待补执行的任务需要会话，不能回收');
@@ -570,10 +577,7 @@ test('our session recycles beside a user session without respawning', async (t) 
   const pid = m.state()[WS].pid;
   m.holder.consumer = true; // 用户会话在场：快照与重扫都看见
   staleLog();
-  const soon = new Date(Date.now() + 4 * 60_000);
-  const soonCron = `${soon.getMinutes()} ${soon.getHours()} ${soon.getDate()} `
-    + `${soon.getMonth() + 1} *`;
-  m.deps.readTasks = recycleTasks(soonCron);
+  m.deps.readTasks = recycleTasks(cronAt(4 * 60));
   const spawnedBefore = m.nextPid;
   await m.patrol();
   assert.ok(!m.alivePids.has(pid), '我们的一代会被回收');
@@ -645,13 +649,13 @@ async function setupTailWindow(t) {
   };
   return {
     deps, alivePids, file, quiet, spawnCount: () => spawns,
-    run(now, tasks, consumers) {
+    run(now, tasks, consumers, stamp = null) {
       const cur = Math.floor(now.getTime() / 1000);
-      deps.scanSessions = () => [consumers, null];
+      deps.scanSessions = () => scanResult(consumers);
       deps.readTasks = () => tasks;
       const state = { [WS]: { pid: 100, startedAt: cur - 2700, fails: 0, log: file } };
       return patrolWorkspace(WS, state, now, 600_000, cur,
-        consumers, [], 'window').then(() => state);
+        consumers, [], 'window', null, stamp).then(() => state);
     },
   };
 }
@@ -713,6 +717,203 @@ test('each round writes a heartbeat and logs start/end summary', async (t) => {
   assert.match(end2, /活动交互会话 1 个；本轮无动作/);
   assert.ok(!logs.some((x) => x.includes('漏轮')));
   assert.ok(!logs.some((x) => x.includes('会话退出')));
+});
+
+// ---- stampOwner：即使用户会话在场也要另拉预热并过户任务 ----
+
+// stampOwner 专用夹具：在 setupMachine 上换成 tmp 下真实工作区（盖印要
+// 落盘断言，readTasks/maintainWorkspace 走真实文件），scanSessions 改为
+// 可注入的场景函数。进程机器、state、锁与日志全部沿用 setupMachine。
+const STAMP_USER_DETAIL = {
+  pid: 900, sessionId: 'sess-user', procStart: 'start-user',
+  ancestors: [1], chainComplete: true,
+};
+const STAMP_AMBIGUOUS_DETAIL = {
+  pid: 901, sessionId: 'sess-x', procStart: 'start-x',
+  ancestors: [], chainComplete: false,
+};
+
+async function setupStampMachine(t, opts = {}) {
+  const m = await setupMachine(t);
+  const { deps, tmp } = m;
+  const ws = path.join(tmp, 'proj');
+  const taskfile = path.join(ws, '.claude', 'scheduled_tasks.json');
+  fs.mkdirSync(path.dirname(taskfile), { recursive: true });
+  writeJson(taskfile, {
+    tasks: opts.tasks ?? [{
+      id: '00000001',
+      cron: '*/5 * * * *',
+      prompt: 'p',
+      createdAt: Date.now(),
+      recurring: true,
+      createdBySessionId: 'sess-user',
+      createdByPid: 900,
+      createdByProcStart: 'start-user',
+    }],
+  });
+  writeJson(m.cfgPath, {
+    roots: [ws], maxDepth: 3, intervalSeconds: 300, leadSeconds: 600,
+    autoRenew: false, autoMinId: false, stampOwner: true,
+  });
+  deps.discover = () => [[ws, taskfile]];
+  deps.readTasks = readTasks; // 恢复 mockDeps 快照里的真实读盘实现
+
+  // 登记里 claude 的 pid 伪装成 script pid + 1000，父链三代。S 从 state
+  // 现读，换代后自然指向新代。
+  const warmDetail = (S) => ({
+    pid: S + 1000,
+    sessionId: `sess-warm-${S}`,
+    procStart: `start-${S}`,
+    ancestors: [S + 500, S, 1], // script(S) → zsh(S+500) → claude
+    chainComplete: true,
+  });
+  const readSPid = () => m.state()[ws]?.pid;
+  // 场景就是一个返回登记详情数组的函数（null=没有消费者）。
+  const scenes = {
+    none: () => null,
+    user: () => [STAMP_USER_DETAIL],
+    warm: () => {
+      const S = readSPid();
+      return S ? [warmDetail(S)] : [];
+    },
+    userWarm: () => {
+      const S = readSPid();
+      return S ? [STAMP_USER_DETAIL, warmDetail(S)] : [STAMP_USER_DETAIL];
+    },
+    ambiguous: () => [STAMP_AMBIGUOUS_DETAIL],
+  };
+  let sceneList = scenes.none;
+  deps.scanSessions = () => {
+    const list = sceneList();
+    return list ? scanResult(new Set([ws]), new Map([[ws, list]]))
+      : scanResult();
+  };
+  const logs = [];
+  deps.log = (msg) => logs.push(msg);
+  return {
+    ...m, ws, logs, scenes,
+    setScene: (name) => { sceneList = scenes[name]; },
+    tasks: () => readJson(taskfile).tasks,
+  };
+}
+
+test('stampOwner: spawns beside the user session and stamps owner next round', async (t) => {
+  const m = await setupStampMachine(t);
+  m.setScene('user');
+
+  // 轮 1：用户会话在场、任务在窗口——不接管它，另拉自己的预热；当轮还
+  // 没有登记，盖印要等下一轮。
+  await m.patrol();
+  const S1 = m.state()[m.ws].pid;
+  assert.equal(S1, 100);
+  assert.equal(m.tasks()[0].createdBySessionId, 'sess-user', '当轮不急盖');
+  assert.ok(m.logs.some((l) => l.includes('已另启动预热会话')));
+
+  // 轮 2：预热完成登记（三代祖先链认亲）→ 盖印，且不再 spawn 第二个。
+  m.setScene('userWarm');
+  await m.patrol();
+  const task = m.tasks()[0];
+  assert.equal(task.createdBySessionId, 'sess-warm-100');
+  assert.equal(task.createdByPid, 1100); // 登记 pid = S + 1000
+  assert.equal(task.createdByProcStart, 'start-100');
+  assert.deepEqual(m.spawnPids, [100]);
+});
+
+test('stampOwner: nothing wanted beside user means no second session', async (t) => {
+  const m = await setupStampMachine(t, {
+    tasks: [{
+      id: '00000002', cron: '0 9 1 1 *', prompt: 'p',
+      createdAt: Date.now(), recurring: true,
+      createdBySessionId: 'sess-user',
+    }],
+  });
+  m.setScene('user');
+  await m.patrol();
+  assert.deepEqual(m.spawnPids, [], '窗口外不双开');
+  assert.ok(!(m.ws in m.state()));
+});
+
+test('stampOwner: ambiguous lineage never spawns nor stamps', async (t) => {
+  const m = await setupStampMachine(t);
+  m.setScene('ambiguous');
+  await m.patrol();
+  assert.deepEqual(m.spawnPids, [], '父链读不完整时保守不双开');
+  assert.equal(m.tasks()[0].createdBySessionId, 'sess-user');
+});
+
+test('stampOwner: stuck warm session is retired even beside a user session', async (t) => {
+  const m = await setupStampMachine(t);
+
+  // 轮 1：拉起 S1（当时没有用户会话）。
+  await m.patrol();
+  const S1 = m.state()[m.ws].pid;
+
+  // 轮 2：S1 超过登记宽限仍未登记，用户会话恰在场——stampOwner 开启时
+  // 不再让它躲在用户会话身后，杀掉重拉。
+  m.setScene('user');
+  m.writeState({
+    ...m.state(),
+    [m.ws]: {
+      ...m.state()[m.ws],
+      startedAt: m.state()[m.ws].startedAt - WARMUP_GRACE_SECONDS - 1,
+    },
+  });
+  await m.patrol();
+  assert.ok(!m.alivePids.has(S1), '卡死的预热被退休');
+  const S2 = m.state()[m.ws].pid;
+  assert.notEqual(S2, S1);
+  assert.ok(m.alivePids.has(S2));
+});
+
+test('stampOwner: owner is re-stamped to the new generation after a death', async (t) => {
+  const m = await setupStampMachine(t);
+
+  await m.patrol(); // 无人生场，拉 S1
+  const S1 = m.state()[m.ws].pid;
+  m.setScene('warm');
+  await m.patrol(); // 盖给第一代
+  assert.equal(m.tasks()[0].createdBySessionId, `sess-warm-${S1}`);
+
+  // 第一代死亡、登记消失：下一轮重拉 S2，再下一轮盖给第二代。
+  m.alivePids.delete(S1);
+  m.setScene('none');
+  await m.patrol();
+  const S2 = m.state()[m.ws].pid;
+  assert.notEqual(S2, S1);
+  m.setScene('warm');
+  await m.patrol();
+  assert.equal(m.tasks()[0].createdBySessionId, `sess-warm-${S2}`);
+  assert.equal(m.tasks()[0].createdByPid, S2 + 1000);
+});
+
+test('stampOwner: recycle margin leaves room for respawn and re-stamp', async (t) => {
+  // 直接驱动 patrolWorkspace：距落点 300s 的任务，旧余量（120s）会回收，
+  // stampOwner 余量（120+300=420s）下必须留住本代。
+  const m = await setupTailWindow(t);
+  const stamp = {
+    verdict: { kind: 'own', target: {} }, // 本代预热已登记
+    recycleMarginSec: SESSION_FIRE_MARGIN_SECONDS + 300,
+  };
+  const at = new Date();
+  m.quiet(at);
+  const present = new Set([WS]);
+
+  let state = await m.run(at, recycleTasks(cronAt(300))(), present, stamp);
+  assert.ok(m.alivePids.has(100), '300s < 420s 余量：不回收，否则来不及重盖');
+  assert.equal(m.spawnCount(), 0);
+  assert.equal(state[WS].pid, 100);
+
+  // 500s 超出新余量：正常回收，并因任务仍在 lead 窗口而同轮重拉。
+  state = await m.run(at, recycleTasks(cronAt(500))(), present, stamp);
+  assert.ok(!m.alivePids.has(100), '500s > 420s 余量：回收');
+  assert.ok(m.alivePids.has(999), '窗口还开着，同轮重拉');
+  assert.equal(state[WS].pid, 999);
+
+  // 对照：stamp 关闭时仍是旧的 120s 余量，300s 就回收。
+  m.alivePids.clear();
+  m.alivePids.add(100);
+  await m.run(at, recycleTasks(cronAt(300))(), present, null);
+  assert.ok(!m.alivePids.has(100), '开关关闭时余量退回 120s');
 });
 
 test('heartbeat older than two intervals warns about missed rounds', async (t) => {

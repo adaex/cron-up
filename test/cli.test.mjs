@@ -88,6 +88,23 @@ test('--no-auto-min-id and --auto-min-id map to booleans', () => {
   assert.equal(parseCli(['install', '--auto-min-id=false']).opts.autoMinId, false);
 });
 
+test('--no-stamp-owner and --stamp-owner map to booleans', () => {
+  assert.equal(parseCli(['install', '--no-stamp-owner']).opts.stampOwner, false);
+  assert.equal(parseCli(['install', '--stamp-owner']).opts.stampOwner, true);
+  assert.equal(parseCli(['install', '--stamp-owner=false']).opts.stampOwner, false);
+  assert.equal(parseCli(['install', '--stamp-owner=true']).opts.stampOwner, true);
+});
+
+test('usage advertises the stamp-owner flags', async (t) => {
+  const deps = mockDeps(t);
+  const lines = [];
+  deps.print = (m) => lines.push(m);
+  await main(['node', 'cron-up', '--help']);
+  const usage = lines.join('\n');
+  assert.ok(usage.includes('--stamp-owner'));
+  assert.ok(usage.includes('--no-stamp-owner'));
+});
+
 test('logs -f maps to follow and captures positional workspace', () => {
   const p = parseCli(['logs', '-f', 'team-space']);
   assert.equal(p.command, 'logs');

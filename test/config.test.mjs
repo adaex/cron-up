@@ -186,6 +186,23 @@ test('bad sessionRetain is rejected loudly', (t) => {
   });
 });
 
+test('stampOwner defaults to false and must be boolean', (t) => {
+  const tmp = mkTmp(t);
+  mockDeps(t);
+  const file = path.join(tmp, 'cfg.json');
+  writeJson(file, {});
+  assert.equal(loadConfig(file).stampOwner, false);
+  writeJson(file, { stampOwner: true });
+  assert.equal(loadConfig(file).stampOwner, true);
+  writeJson(file, { stampOwner: 'yes' });
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('stampOwner'));
+    return true;
+  });
+});
+
 test('field errors can be raised for human pages', (t) => {
   const tmp = mkTmp(t);
   mockDeps(t);

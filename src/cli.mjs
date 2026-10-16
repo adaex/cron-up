@@ -128,7 +128,7 @@ const USAGE = `cron-up —— 为定时任务提前备好交互会话
 
 用法：
   cron-up                    查看总览（服务、配置、任务、会话）
-  cron-up install            安装配置与 LaunchAgent（--roots --interval --lead --session-retain --force --no-auto-renew --no-auto-min-id）
+  cron-up install            安装配置与 LaunchAgent（--roots --interval --lead --session-retain --stamp-owner --force --no-auto-renew --no-auto-min-id --no-stamp-owner）
   cron-up uninstall          卸载（--purge 连配置日志一起删，--keep-sessions 保留后台会话）
   cron-up list               逐个列出定时任务的设定/预计实际触发时间
   cron-up run                执行一轮巡检（launchd 入口）

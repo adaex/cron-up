@@ -51,6 +51,7 @@ const EVENT_LABELS = [
   ['exit', '自行退出'],
   ['stuck', '卡死退休'],
   ['adopt', '接管'],
+  ['reown', '过户'],
   ['fail', '启动失败'],
   ['cool', '进入冷却'],
   ['warn', '告警'],
@@ -180,9 +181,13 @@ function needHorizonMs(tasks, now) {
 // cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。scriptProcs
 // 是进程表快照或 null：null 时仅在需要认领孤儿（state 丢失的兜底分支）当
 // 下才拍快照，平静轮不付全量 ps 的代价。
+// stamp=null 表示 stampOwner 关（一切旧行为）；开启时为
+// {verdict, recycleMarginSec}：verdict 是 classifyWorkspace 对轮初消费者
+// 快照的认亲结论（own/ambiguous/user，换代或回收导致快照变化时在 retire
+// 内重算），recycleMarginSec 是 window 回收余量。
 export async function patrolWorkspace(
   ws, state, now, leadMs, cur, consumers, scriptProcs = null,
-  retain = 'always', stats = null,
+  retain = 'always', stats = null, stamp = null,
 ) {
   const tasks = deps.readTasks(ws);
   let ent = state[ws] ?? null;
@@ -221,13 +226,23 @@ export async function patrolWorkspace(
   // 回收是同一个动作，差别只在触发条件与文案；消费者快照拍于轮初，刚结束
   // 的这代可能正是快照里的消费者，不重扫会让陈旧登记挡住下面的重拉。
   let mineAlive = deps.trackedAlive(ent);
+  // verdict 是轮初快照的认亲结论；换代/回收杀掉本代后消费者集合变了，
+  // 必须按重扫结果重算而不是手改布尔——幸存下来的断链会话（进程组杀不
+  // 掉的用户会话）仍应是歧义态，否则会被误当普通用户会话、在它旁边双开。
+  let verdict = stamp?.verdict ?? null;
   const retire = async (kind, msg) => {
     await deps.stopSession(ent);
     note(kind, msg);
     delete state[ws];
     ent = null;
     mineAlive = false;
-    consumers = (await deps.scanSessions())[0];
+    if (stamp) {
+      const [nextConsumers, , nextDetails] = await deps.scanSessions({ lineage: true });
+      consumers = nextConsumers;
+      verdict = deps.classifyWorkspace(nextDetails, ws, null, false);
+    } else {
+      consumers = (await deps.scanSessions())[0];
+    }
   };
 
   // 换代：超龄且日志静默（无任务在执行的证据）的会话主动结束，需要时下
@@ -246,36 +261,53 @@ export async function patrolWorkspace(
   // 缺一不可：本代会话期间真的有任务触发过（lastFiredAt 晚于 startedAt
   // ——区分「执行完的空闲」与「等待触发的空闲」，后者是预热缓存在干活，
   // 回收它只会每轮空转重拉）；界面静默超时（TUI 执行期间持续渲染，静默
-  // 即不在干活）；距下次需要会话还有余量（回收后同轮重拉，新会话来得及
-  // 登记，不会漏掉到点任务）。时间上重叠或紧邻的任务仍共享会话：任务路
-  // 由在 Claude Code 手里，同目录并发多会话无法指定归属，还有重复执行的
-  // 风险。回收不计失败——任务成功执行过是最强的健康证据，陈年计数一并
-  // 清零。
+  // 即不在干活）；距下次需要会话还有余量（回收后下轮巡检重拉的新会话来
+  // 得及登记，不会漏掉到点任务）。时间上重叠或紧邻的任务仍共享会话：任
+  // 务路由在 Claude Code 手里，同目录并发多会话无法指定归属，还有重复
+  // 执行的风险。回收不计失败——任务成功执行过是最强的健康证据，陈年计
+  // 数一并清零。
+  // 余量取值：默认只保登记抖动（约 2 分钟）；stampOwner 开启时必须再留
+  // 出一个巡检间隔——回收后要靠「下轮重拉→再下轮过户」两步把 owner 盖
+  // 到新会话，余量小于间隔就可能在过户完成前到点（cmdRun 传入
+  // SESSION_FIRE_MARGIN_SECONDS + intervalSeconds）。
+  const fireMarginSec = stamp
+    ? stamp.recycleMarginSec
+    : SESSION_FIRE_MARGIN_SECONDS;
   if (ent !== null && mineAlive && retain === 'window'
       && tasks.some((t) => typeof t?.lastFiredAt === 'number'
         && t.lastFiredAt > (ent.startedAt ?? 0) * 1000)
       && sessionLogIdleSeconds(ent.log || sessionLogPath(ws), cur)
         > SESSION_RECYCLE_IDLE_SECONDS
       && needHorizonMs(tasks, now) - now.getTime()
-        > SESSION_FIRE_MARGIN_SECONDS * 1000) {
-    // 用户自己的会话若在场，retire 的重扫依旧看见，不会在同目录双开。
+        > fireMarginSec * 1000) {
+    // stampOwner 关时：用户自己的会话若在场，retire 的重扫依旧看见，不
+    // 会在同目录双开；开启时：旧代整组结束后重扫只可能剩用户会话，下面
+    // 的逻辑会按需另拉新预热。
     await retire('recycle', `回收 ${ws} pid=${ent.pid}：本代任务已执行完毕且`
       + '界面静默，结束会话，下次需要时重拉');
   }
 
+  // 在场的消费者足以让我们放手吗？功能关时任何消费者都算；开启时只有
+  // 「认到自己的预热」与「父链有歧义、无法排除是自己」算——仅用户会话
+  // 不算，下面继续走到 wanted→卡死退休/冷却→spawn，在同目录另起自己
+  // 的预热（该开关的显式目的；全程只 stop 自己的 ent，不碰用户会话）。
+  const consumerHolds = consumers.has(ws)
+    && (!stamp || verdict?.kind === 'own' || verdict?.kind === 'ambiguous');
+
   // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
   // 次——健康会话常驻时计数会一直挂着，一次无关死亡就能把陈年计数顶满冷
-  // 却，连一次新尝试都不给。
-  if (ent !== null && mineAlive && consumers.has(ws)) {
+  // 却，连一次新尝试都不给。仅用户会话在场不清零（它不证明 launchd 拉起
+  // 的环境健康）；歧义态保守当真，与「不双开」方向一致。
+  if (ent !== null && mineAlive && consumerHolds) {
     ent.fails = 0;
   }
 
   // 任务正在被消费。可能是我们的预热会话（已登记——上面的健康清零已覆
-  // 盖），也可能是用户的交互会话——后者放手：不在这里删死条目，失败计数
-  // 要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），由轮
-  // 末 kept 过滤统一处理。先于 wanted 判定返回：有消费者在场的平稳态不必
-  // 为整组任务跑一遍 cron 求值。
-  if (consumers.has(ws)) return;
+  // 盖），也可能是用户的交互会话——后者默认放手：不在这里删死条目，失败
+  // 计数要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），
+  // 由轮末 kept 过滤统一处理。先于 wanted 判定返回：有消费者在场的平稳
+  // 态不必为整组任务跑一遍 cron 求值。
+  if (consumerHolds) return;
 
   if (!tasks.some((t) => taskWanted(t, now, leadMs))) return;
 
@@ -362,7 +394,12 @@ export async function patrolWorkspace(
     fails,
     log: sessionLogPath(ws),
   };
-  note('spawn', `已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
+  if (stamp && consumers.has(ws) && verdict?.kind === 'user') {
+    note('spawn', `已另启动预热会话 ${ws} pid=${spawned.pid}：你的交互会话仍在`
+      + `，窗口内任务将改由预热会话承接（连续失败计数 ${fails}）`);
+  } else {
+    note('spawn', `已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
+  }
 }
 
 // 跑一轮巡检；抢不到锁返回 false。
@@ -436,11 +473,31 @@ export async function cmdRun(args) {
     // 登记每轮只读一次：否则每个工作区都要 readdir + ps 一遍，自检也归
     // 属这里。进程表快照不在这里拍：只有孤儿认领分支需要，按需现拍（见
     // patrolWorkspace 的 scriptProcs 形参）。
-    const [consumers, registryAlert] = await deps.scanSessions();
+    // lineage 只在 stampOwner 开启时拍：祖先链要一次全机 ps，关闭时
+    // scanSessions 不付这个代价（见 registry 的 scanSessions 注释）。
+    const [consumers, registryAlert, details] =
+      await deps.scanSessions({ lineage: cfg.stampOwner });
     if (registryAlert) {
       bump(stats, 'warn');
       deps.log(`告警：${registryAlert}`);
     }
+
+    // stampOwner 的认亲表：每个有消费者的工作区一个结论（own/ambiguous/
+    // user），判定规则全部收口在 registry.classifyWorkspace，patrol 只
+    // 消费结论。target 非空才可盖印（认到自己但身份字段缺失的一轮只
+    // own、不过户）。
+    const verdicts = new Map();
+    if (cfg.stampOwner) {
+      for (const ws0 of consumers) {
+        const ent0 = state[ws0] ?? null;
+        verdicts.set(ws0,
+          deps.classifyWorkspace(details, ws0, ent0, Boolean(ent0)
+            && deps.trackedAlive(ent0)));
+      }
+    }
+    const stampBase = cfg.stampOwner
+      ? { recycleMarginSec: SESSION_FIRE_MARGIN_SECONDS + cfg.intervalSeconds }
+      : null;
 
     // 轮间死亡在进入工作区循环前先报：随后该工作区若需要会话会打印重拉，
     // 日志时间线就是「退出 → 重拉」，而不是反过来。
@@ -453,13 +510,20 @@ export async function cmdRun(args) {
     for (const [ws, taskfile] of deps.discover(cfg.roots, cfg.maxDepth)) {
       found += 1;
       // 一个工作区读不动不能中断整轮：discover 是生成器，这里抛了会跳过
-      // 后面所有工作区。续期/改 id 与保活各自独立守卫——维护失败绝不压制
-      // 该工作区的会话保活。两者合并为同一次原子写（见 maintainWorkspace）。
-      if (cfg.autoRenew || cfg.autoMinId) {
+      // 后面所有工作区。续期/改 id/过户与保活各自独立守卫——维护失败绝不
+      // 压制该工作区的会话保活。三者合并为同一次原子写（见
+      // maintainWorkspace）。
+      const target = verdicts.get(ws)?.target ?? null;
+      if (cfg.autoRenew || cfg.autoMinId || target) {
         try {
-          const { renewed, minified } = maintainWorkspace(taskfile, {
+          const { renewed, minified, reowned } = maintainWorkspace(taskfile, {
             renew: cfg.autoRenew,
             minify: cfg.autoMinId,
+            // target 多出的祖先链字段 tasks 层不读，展开即可，不必手抄
+            // 三个盖印字段。
+            reown: target
+              ? { ...target, isWanted: (t) => taskWanted(t, now, leadMs) }
+              : null,
           }) ?? {};
           if (renewed) {
             deps.log(`已续期 ${ws}：${renewed} 个周期任务标记为 permanent，`
@@ -470,6 +534,11 @@ export async function cmdRun(args) {
               + '值，投递延迟降到约 1 分钟内；下次预热拉起的新会话起生效，'
               + '已在运行的会话要等其结束重拉（window 模式执行完即回收、'
               + 'always 模式换代）后才读到新 id');
+          }
+          if (reowned) {
+            bump(stats, 'reown');
+            deps.log(`已过户 ${ws}：${reowned} 个窗口内任务的归属改到预热会话`
+              + ` pid=${target.pid}，这些任务将只在该会话触发`);
           }
         } catch (e) {
           bump(stats, e instanceof TaskFileChanged ? 'warn' : 'error');
@@ -484,7 +553,10 @@ export async function cmdRun(args) {
       try {
         await patrolWorkspace(
           ws, state, now, leadMs, cur, consumers, null,
-          cfg.sessionRetain, stats);
+          cfg.sessionRetain, stats,
+          stampBase
+            ? { ...stampBase, verdict: verdicts.get(ws) ?? null }
+            : null);
       } catch (e) {
         bump(stats, 'error');
         deps.log(`错误 ${ws}：${e.constructor.name}：${e.message}`);

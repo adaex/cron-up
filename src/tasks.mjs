@@ -248,12 +248,21 @@ export function minifyIds(tasks) {
   return changed;
 }
 
-// 一轮巡检对一个任务文件做的维护：renew（补 permanent）与 minify（id 改
-// 小）合并为同一次受 mtime 乐观锁保护的原子写。先取 mtimeNs、清残留
-// .cron-up-tmp、loadTaskDoc round-trip 整文档；两项计数都为 0 时字节级
-// 不动。返回 {renewed,minified}；null 表示文件缺失/损坏；读到写间被改抛
+// 一轮巡检对一个任务文件做的维护：renew（补 permanent）、minify（id 改
+// 小）、reown（把窗口内任务的 owner 三字段盖给指定预热会话）合并为同一
+// 次受 mtime 乐观锁保护的原子写。先取 mtimeNs、清残留 .cron-up-tmp、
+// loadTaskDoc round-trip 整文档；三项计数都为 0 时字节级不动。返回
+// {renewed,minified,reowned}；null 表示文件缺失/损坏；读到写间被改抛
 // TaskFileChanged。
-export function maintainWorkspace(taskfile, { renew = false, minify = false }) {
+//
+// reown 形状：{sessionId, pid, procStart, isWanted(t)} | null。isWanted
+// 由调用方注入（tasks 层不反向依赖 cron 层）；只盖 createdBySessionId/
+// createdByPid/createdByProcStart 三个字段，不碰 createdInProject。
+export function maintainWorkspace(taskfile, {
+  renew = false,
+  minify = false,
+  reown = null,
+}) {
   let mtimeNs;
   try {
     mtimeNs = fs.statSync(taskfile, { bigint: true }).mtimeNs;
@@ -284,9 +293,28 @@ export function maintainWorkspace(taskfile, { renew = false, minify = false }) {
     }
   }
   const minified = minify ? minifyIds(doc.tasks) : 0;
-  if (renewed === 0 && minified === 0) return { renewed: 0, minified: 0 };
+  let reowned = 0;
+  if (reown) {
+    for (const t of doc.tasks) {
+      // createdBySessionId 已是目标值即跳过：与 renew/minify 同一条幂等
+      // 纪律，第二轮起字节级不动。没有 owner 字段的外部条目同样盖——窗
+      // 口内任务统一归预热会话，语义不因条目来源留例外。
+      if (isPlainObject(t)
+          && t.createdBySessionId !== reown.sessionId
+          && reown.isWanted(t)) {
+        t.createdBySessionId = reown.sessionId;
+        t.createdByPid = reown.pid;
+        // ps lstart 原文（含「Oct  8」双空格），原样取自会话登记。
+        t.createdByProcStart = reown.procStart;
+        reowned += 1;
+      }
+    }
+  }
+  if (renewed === 0 && minified === 0 && reowned === 0) {
+    return { renewed: 0, minified: 0, reowned: 0 };
+  }
   atomicWriteJson(taskfile, doc, mtimeNs);
-  return { renewed, minified };
+  return { renewed, minified, reowned };
 }
 
 Object.assign(deps, { discover, readTasks, loadTaskDoc });

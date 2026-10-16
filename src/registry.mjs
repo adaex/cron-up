@@ -1,7 +1,13 @@
 // Claude Code 会话登记（~/.claude/sessions/*.json）的读取与消费者判定。
 // 登记是另一个程序未文档化的输出：一旦形状变化，所有会话都会被读成「不
-// 存在」，巡检就会在用户会话旁边反复重拉。scanSessions 因此内置三枚烟
-// 雾告警，分别盯住三种漂移形态。
+// 存在」，巡检就会在用户会话旁边反复重拉。scanSessions 因此内置四枚烟
+// 雾告警，分别盯住四种漂移形态。
+//
+// 除「某目录有没有消费者」外，它还回报每个消费者的进程祖先链：cron-up
+// 拉起的预热会话是三层结构 script(S) → zsh(Z) → claude(C)（claude 在交
+// 互 shell 里是函数，函数帧不做 tail-exec），state 只记得到 S，登记里
+// 却是 C，pgid 又被交互 shell 的作业控制改过——唯一稳定的认亲方式是沿
+// ppid 上溯。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -27,15 +33,73 @@ function ps(pid, fmt) {
   }
 }
 
-// 活 pid 是否像 claude 进程；调用方先判存活，这里用来排除回收 pid 的无关
-// 进程。
-export function pidIsClaude(pid) {
-  const comm = path.basename(ps(pid, 'comm=')).toLowerCase();
-  if (comm.includes('claude')) return true;
-  if (INTERPRETER_COMMS.has(comm)) {
-    return CLAUDE_ENTRY_RE.test(ps(pid, 'args=').toLowerCase());
+// 一次 ps 同时拿进程名与父 pid：{isClaude, ppid}。ppid 按「末尾空白+
+// 数字」取——comm 可能是含空格的路径，但不会以「空白+数字」结尾；列缺
+// 失（ps 失败/输出漂移）时 ppid 为 null，调用方按歧义保守处理。
+export function processShape(pid) {
+  const line = ps(pid, 'comm=,ppid=');
+  const m = line.match(/^(.*\S)\s+(\d+)\s*$/);
+  const comm = path.basename((m ? m[1] : line).trim()).toLowerCase();
+  const ppid = m ? parseInt(m[2], 10) : null;
+  let isClaude = comm.includes('claude');
+  if (!isClaude && INTERPRETER_COMMS.has(comm)) {
+    isClaude = CLAUDE_ENTRY_RE.test(ps(pid, 'args=').toLowerCase());
   }
-  return false;
+  return { isClaude, ppid };
+}
+
+// 全机进程父子表：一次 ps -axo pid=,ppid= 拍快照，Map<pid, ppid>。任何
+// 异常都返回 null（调用方退化为「全部歧义」的保守行为，绝不抛出）。
+export function processParentMap() {
+  const r = deps.execFile('/bin/ps', ['-axo', 'pid=,ppid='], { timeout: 5000 });
+  if (r.status !== 0) return null;
+  const map = new Map();
+  for (const line of (r.stdout ?? '').split('\n')) {
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s*$/);
+    if (m) map.set(parseInt(m[1], 10), parseInt(m[2], 10));
+  }
+  return map.size > 0 ? map : null;
+}
+
+// 沿父子表上溯（不含 pid 自身），直到 launchd(1；其父记为 0)。中途父 pid
+// 在快照里缺失（ps 退化/进程刚好退出）或成环时 chainComplete=false——
+// 「没找到目标」与「证据链断了」必须由调用方区分：后者按歧义不双开。
+export function ancestorChain(pid, parentMap) {
+  const ancestors = [];
+  const seen = new Set([pid]);
+  let cur = pid;
+  for (;;) {
+    const parent = parentMap?.get(cur);
+    if (parent === undefined) return { ancestors, chainComplete: false };
+    ancestors.push(parent);
+    if (parent <= 1) return { ancestors, chainComplete: true }; // 0/1 即根
+    if (seen.has(parent)) return { ancestors, chainComplete: false };
+    seen.add(parent);
+    cur = parent;
+  }
+}
+
+// stampOwner 的认亲结论。输入是 scanSessions 第三元素、工作区、state 条
+// 目与调用方按指纹判好的存活布尔（registry 不认识 state 条目的语义）：
+//   own       祖先链里有本代 script pid——在场消费者就是我们的预热；
+//             target 给出可盖印的登记详情，身份字段缺失时为 null（在场
+//             但这一轮还不能过户）；
+//   ambiguous 没有自己的预热，但在场会话父链不完整——无法证明不是自己，
+//             调用方按「不双开」保守处理；
+//   user      父链完整且不含本代 pid——只有用户的会话，可以在旁边另拉。
+export function classifyWorkspace(details, ws, ent, entAlive) {
+  const list = details?.get(ws) ?? [];
+  if (ent?.pid && entAlive) {
+    const own = list.find((d) => d.ancestors.includes(ent.pid));
+    if (own) {
+      return {
+        kind: 'own',
+        target: own.sessionId && own.procStart ? own : null,
+      };
+    }
+  }
+  if (list.some((d) => !d.chainComplete)) return { kind: 'ambiguous', target: null };
+  return { kind: 'user', target: null };
 }
 
 // 读一个登记文件；读不出返回 null。Claude Code 会就地（非原子）重写登
@@ -60,8 +124,12 @@ async function readSessionFile(file) {
   return null;
 }
 
-// 返回 [拥有活消费者会话的工作区集合, 告警字符串|null]。
-export async function scanSessions() {
+// 返回 [拥有活消费者会话的工作区集合, 告警字符串|null, 会话详情 Map]。
+// 第三个元素是 Map<cwd, Array<{pid, sessionId, procStart, ancestors,
+// chainComplete}>>；祖先链要付一次全机 ps，只有 stampOwner 需要，所以
+// lineage 默认关：关时恒为空 Map，总览/list/平静巡检不增加任何进程开销
+// （与本仓「全量 ps 按需现拍」的既有纪律一致）。
+export async function scanSessions({ lineage = false } = {}) {
   let files = [];
   try {
     files = fs.readdirSync(deps.paths.sessionDir)
@@ -78,12 +146,29 @@ export async function scanSessions() {
     }
   }
 
+  // 全轮一张父子表快照：所有会话的祖先链取自同一时刻，且只付一次全量
+  // ps。仅在 lineage 显式开启时拍——快照失败给 null，祖先链一律按断链
+  // 处理（stampOwner 退化为「全部歧义、绝不双开」），consumers 判定不受
+  // 影响。
+  let parentMap = null;
+  if (lineage) {
+    try {
+      parentMap = deps.processParentMap();
+    } catch {
+      parentMap = null;
+    }
+  }
+
   const consumers = new Set();
-  const commCache = new Map();
+  const details = new Map();
+  const shapeCache = new Map();
   let liveOther = 0;
   // interactive 认得出来，却读不出有效 pid 或工作目录的条目数：pid/cwd
   // 字段改名就是这种形态，而下面两条自检只看 kind 与进程形态，兜不住。
   let suspect = 0;
+  // 已是消费者、但进程父 pid 或祖先链读不完整的条目数：stampOwner 会因
+  // 此无法认亲，只能保守不双开（过户暂停），需要一行告警让人看见退化。
+  let lineageMissing = 0;
   for (const s of interactive) {
     // pid 也是外部程序写的字段：null、非数值、非正数、超 pid_t 的巨大整
     // 数都读不出活进程。这段代码在 per-workspace 保护圈之外，一个畸形登
@@ -95,16 +180,35 @@ export async function scanSessions() {
       continue;
     }
     if (!deps.alive(pid)) continue; // 陈旧登记（崩溃留下）：正常，不计
-    if (!commCache.has(pid)) {
-      commCache.set(pid, deps.pidIsClaude(pid)); // ps 调用按 pid 缓存
+    if (!shapeCache.has(pid)) {
+      shapeCache.set(pid, deps.processShape(pid)); // ps 调用按 pid 缓存
     }
-    if (commCache.get(pid)) {
+    const shape = shapeCache.get(pid);
+    if (shape.isClaude) {
       // cwd 同样不可信：非字符串当定位不到工作区；空串与相对路径会被
       // resolve 拼到巡检进程自己的 cwd 下，凭空造出消费者目录，可能令预
       // 热被静默跳过。
       const cwd = s.cwd;
       if (typeof cwd === 'string' && path.isAbsolute(cwd)) {
-        consumers.add(lexReal(cwd));
+        const ws = lexReal(cwd);
+        consumers.add(ws);
+        if (lineage) {
+          const chain = parentMap
+            ? ancestorChain(pid, parentMap)
+            : { ancestors: [], chainComplete: false };
+          if (shape.ppid === null || !chain.chainComplete) lineageMissing += 1;
+          const list = details.get(ws) ?? [];
+          list.push({
+            pid,
+            sessionId: typeof s.sessionId === 'string' ? s.sessionId : null,
+            // procStart 是 ps lstart 原文（单位数日期含双空格），只许原样
+            // 传递给任务文件，绝不能自己拼。
+            procStart: typeof s.procStart === 'string' ? s.procStart : null,
+            ancestors: chain.ancestors,
+            chainComplete: chain.chainComplete,
+          });
+          details.set(ws, list);
+        }
         continue;
       }
       suspect += 1; // 活着的 claude 却没有可用 cwd：cwd 字段漂移
@@ -125,11 +229,18 @@ export async function scanSessions() {
     alert = '会话登记中的 interactive 会话都读不出有效的 pid 或工作目录；'
       + 'Claude Code 的会话登记字段可能已变更，cron-up 会把已有会话误判为'
       + '不存在，在同目录重复拉起会话';
+  } else if (lineage && lineageMissing > 0) {
+    alert = `${lineageMissing} 个存活会话的进程父子关系读不完整（ps 输出异常或`
+      + '会话进程正在退出）；stampOwner 本轮按保守策略不另拉预热会话、暂停'
+      + '任务过户，下轮自动恢复';
   }
-  return [consumers, alert];
+  return [consumers, alert, details];
 }
 
 Object.assign(deps, {
-  pidIsClaude,
+  processShape,
+  processParentMap,
+  ancestorChain,
+  classifyWorkspace,
   scanSessions,
 });

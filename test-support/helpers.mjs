@@ -59,3 +59,8 @@ export function writeJson(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(data));
 }
+
+// scanSessions 的三元组 mock：绝大多数用例不关心告警与详情。
+export function scanResult(consumers = new Set(), details = new Map()) {
+  return [consumers, null, details];
+}

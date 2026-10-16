@@ -200,7 +200,10 @@ export async function cmdOverview(args) {
   // 都静默拉不起来，这是总览唯一能发现它的地方。
   const health = launcherHealth();
   if (health) alerts.push(health);
-  const [consumers, registryAlert] = await deps.scanSessions();
+  // 父链快照是 stampOwner 的按需成本：只有开关确实开启时才拍，总览页也
+  // 才能顺带显示「认亲退化」这第四枚告警。
+  const [consumers, registryAlert] =
+    await deps.scanSessions({ lineage: cfg?.stampOwner === true });
   if (registryAlert) alerts.push(registryAlert);
   const state = loadState();
   const curOv = Math.floor(Date.now() / 1000);
@@ -221,12 +224,13 @@ export async function cmdOverview(args) {
     const minIdTag = cfg.autoMinId ? '，id 自动改小' : '，id 保持原样';
     const retainTag = cfg.sessionRetain === 'always'
       ? '，会话常驻' : '，会话按执行回收';
+    const stampTag = cfg.stampOwner ? '，任务归属预热' : '';
     if (actualIv == null) {
       deps.print(`巡检：配置为每 ${cfg.intervalSeconds} 秒一轮（服务未加载），`
-        + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}${minIdTag}${retainTag}`);
+        + `提前 ${cfg.leadSeconds} 秒启动会话${renewTag}${minIdTag}${retainTag}${stampTag}`);
     } else {
       deps.print(`巡检：每 ${actualIv} 秒一轮，提前 ${cfg.leadSeconds} 秒启动`
-        + `会话${renewTag}${minIdTag}${retainTag}`);
+        + `会话${renewTag}${minIdTag}${retainTag}${stampTag}`);
       if (actualIv !== cfg.intervalSeconds) {
         alerts.push(`launchd 实际间隔 ${actualIv} 秒与配置 ${cfg.intervalSeconds} `
           + '秒不一致，重新运行 cron-up install 后生效');

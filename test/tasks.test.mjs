@@ -288,7 +288,7 @@ test('maintainWorkspace minifies in one atomic round-trip', (t) => {
     version: 7,
   }));
   const r = maintainWorkspace(file, { minify: true });
-  assert.deepEqual(r, { renewed: 0, minified: 1 });
+  assert.deepEqual(r, { renewed: 0, minified: 1, reowned: 0 });
   const doc = readJson(file);
   assert.equal(doc.tasks[0].id, '00000001');
   assert.equal(doc.version, 7, '未知顶层键 round-trip 保留');
@@ -300,7 +300,7 @@ test('maintainWorkspace does renew and minify together', (t) => {
     tasks: [{ id: 'c1363d8b', cron: '0 13 * * *', recurring: true }],
   }));
   const r = maintainWorkspace(file, { renew: true, minify: true });
-  assert.deepEqual(r, { renewed: 1, minified: 1 });
+  assert.deepEqual(r, { renewed: 1, minified: 1, reowned: 0 });
   const task = readJson(file).tasks[0];
   assert.equal(task.permanent, true);
   assert.equal(task.id, '00000001');
@@ -313,7 +313,7 @@ test('maintainWorkspace minify=false leaves ids alone', (t) => {
   }));
   const before = fs.readFileSync(file, 'utf-8');
   const r = maintainWorkspace(file, { renew: true, minify: false });
-  assert.deepEqual(r, { renewed: 0, minified: 0 });
+  assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0 });
   assert.equal(fs.readFileSync(file, 'utf-8'), before);
 });
 
@@ -326,7 +326,7 @@ test('maintainWorkspace second round is a byte-level noop', (t) => {
   const st1 = fs.statSync(file);
   const r2 = maintainWorkspace(file, { minify: true });
   const st2 = fs.statSync(file);
-  assert.deepEqual(r2, { renewed: 0, minified: 0 });
+  assert.deepEqual(r2, { renewed: 0, minified: 0, reowned: 0 });
   assert.equal(st2.ino, st1.ino);
   assert.equal(st2.mtimeNs, st1.mtimeNs);
 });
@@ -335,4 +335,96 @@ test('maintainWorkspace returns null on a broken file', (t) => {
   const { file } = taskDir(t);
   fs.writeFileSync(file, '{ broken');
   assert.equal(maintainWorkspace(file, { minify: true }), null);
+});
+
+// ---- reown（stampOwner 的 owner 盖印）----
+
+const WARM = {
+  sessionId: 'sess-warm',
+  pid: 4321,
+  procStart: 'Fri Oct 16 06:01:20 2026',
+};
+const reownFor = (wantedIds) => ({
+  ...WARM,
+  isWanted: (task) => wantedIds.has(task.id),
+});
+
+test('reown stamps only wanted tasks and preserves every other key', (t) => {
+  const { file } = taskDir(t);
+  const a = { ...RECURRING, id: 'a', createdInProject: '/ws' };
+  const b = { ...RECURRING, id: 'b' };
+  fs.writeFileSync(file, JSON.stringify({ tasks: [a, b] }));
+  const r = maintainWorkspace(file, { reown: reownFor(new Set(['a'])) });
+  assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 1 });
+  const [ta, tb] = readJson(file).tasks;
+  assert.equal(ta.createdBySessionId, WARM.sessionId);
+  assert.equal(ta.createdByPid, WARM.pid);
+  assert.equal(ta.createdByProcStart, WARM.procStart);
+  // createdInProject 不在盖印范围；其余字段原样。
+  assert.equal(ta.createdInProject, '/ws');
+  assert.equal(ta.prompt, a.prompt);
+  assert.equal(ta.cron, a.cron);
+  assert.equal(ta.lastFiredAt, a.lastFiredAt);
+  // 非窗口任务不碰。
+  assert.equal(tb.createdBySessionId, 'sess-1');
+  assert.equal(tb.createdByPid, undefined);
+});
+
+test('reown covers entries without an existing owner', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({ tasks: [{ id: 'a', cron: '0 5 * * *' }] }));
+  const r = maintainWorkspace(file, { reown: reownFor(new Set(['a'])) });
+  assert.equal(r.reowned, 1);
+  const ta = readJson(file).tasks[0];
+  assert.equal(ta.createdBySessionId, WARM.sessionId);
+  assert.equal(ta.createdByPid, WARM.pid);
+});
+
+test('reown is idempotent: owner already on target is a byte-level noop', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({
+    tasks: [{
+      id: 'a',
+      cron: '0 5 * * *',
+      createdBySessionId: WARM.sessionId,
+      createdByPid: WARM.pid,
+      createdByProcStart: WARM.procStart,
+    }],
+  }));
+  const before = fs.readFileSync(file, 'utf-8');
+  const r = maintainWorkspace(file, { reown: reownFor(new Set(['a'])) });
+  assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0 });
+  assert.equal(fs.readFileSync(file, 'utf-8'), before);
+});
+
+test('reown merges into the same write as renew and minify', (t) => {
+  const { file } = taskDir(t);
+  fs.writeFileSync(file, JSON.stringify({
+    tasks: [{ id: 'c1363d8b', cron: '0 13 * * *', recurring: true }],
+  }));
+  // 生产的 isWanted（taskWanted）只看 cron/时间，不看 id 取值——minify
+  // 先于 reown 执行，id 此刻已被改小，按 cron 判定才是真实口径。
+  const r = maintainWorkspace(file, {
+    renew: true,
+    minify: true,
+    reown: { ...WARM, isWanted: (t) => t.cron === '0 13 * * *' },
+  });
+  assert.deepEqual(r, { renewed: 1, minified: 1, reowned: 1 });
+  const ta = readJson(file).tasks[0];
+  assert.equal(ta.permanent, true);
+  assert.equal(ta.id, '00000001'); // minify 后 id 变了
+  assert.equal(ta.createdBySessionId, WARM.sessionId);
+});
+
+test('reown ignores non-plain task entries', (t) => {
+  const { file } = taskDir(t);
+  let wantedCalls = 0;
+  const reown = {
+    ...WARM,
+    isWanted: () => { wantedCalls += 1; return true; },
+  };
+  fs.writeFileSync(file, JSON.stringify({ tasks: ['junk', null, 7] }));
+  const r = maintainWorkspace(file, { reown });
+  assert.equal(r.reowned, 0);
+  assert.equal(wantedCalls, 0, '非 plain 条目在 isWanted 之前就被挡掉');
 });

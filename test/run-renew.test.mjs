@@ -10,6 +10,7 @@ import {
   tmpPaths,
   readJson,
   writeJson,
+  scanResult,
 } from '../test-support/helpers.mjs';
 
 const FAR = '0 0 1 1 *'; // 1 月 1 日：9 月的 7 天窗口内不会触发
@@ -21,7 +22,7 @@ async function setup(t) {
   const root = path.join(tmp, 'root');
   fs.mkdirSync(root, { recursive: true });
   const cfgPath = path.join(tmp, 'config.json');
-  deps.scanSessions = () => [new Set(), null];
+  deps.scanSessions = () => scanResult();
   deps.acquireRunLock = () => 1; // 假锁柄无 lockPath，真 releaseLock 会直接返回
   deps.rotatePatrolLogs = () => {};
   deps.listScriptProcesses = () => [];

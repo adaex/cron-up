@@ -346,6 +346,7 @@ export async function cmdInstall(args) {
     }
     if (args.autoRenew !== undefined) overrides.autoRenew = args.autoRenew;
     if (args.autoMinId !== undefined) overrides.autoMinId = args.autoMinId;
+    if (args.stampOwner !== undefined) overrides.stampOwner = args.stampOwner;
     if (args.sessionRetain !== undefined) {
       if (args.sessionRetain !== 'window' && args.sessionRetain !== 'always') {
         deps.printErr(`--session-retain 只接受 window 或 always，当前为 ${JSON.stringify(args.sessionRetain)}`);
