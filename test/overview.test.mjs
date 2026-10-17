@@ -70,7 +70,7 @@ test('empty world renders cleanly', async (t) => {
 test('fixed patrol line: interval and lead, no behaviour tags', async (t) => {
   const out = await (await setup(t)).render();
   assert.ok(out.includes(`每 ${INTERVAL_SECONDS} 秒一轮`));
-  assert.ok(out.includes('提前 600 秒'));
+  assert.ok(out.includes('提前 360 秒'));
   for (const removed of ['任务归属预热', '自动续期', '会话常驻', 'id 自动改小']) {
     assert.ok(!out.includes(removed), `不应再出现 ${removed}`);
   }

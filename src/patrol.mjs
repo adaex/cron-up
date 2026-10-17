@@ -1,8 +1,10 @@
 // 一轮巡检：发现工作区 → 自动维护任务文件（续期/改 id/盖印）→ 保证每个
 // 「创建者会话已死且处于预热窗口」的任务都有一个只属于它的健康会话。
-// 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。状态机覆盖：认亲、
-// 卡死退休、失败冷却、执行完回收、resume 接管脱离、孤儿认领、任务消失回
-// 收、旧版目录级 state 迁移。
+// 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。本轮新拉起的会话
+// 在所有工作区决策完后轮内等待登记（至多 WARMUP_WAIT_MS），认亲同一轮
+// 补盖归属印；等不到的留给跨轮宽限，绝不当轮判死。状态机还覆盖：卡死
+// 退休、失败冷却、执行完回收、resume 接管脱离、孤儿认领、任务消失回收、
+// 旧版目录级 state 迁移。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -13,6 +15,8 @@ import {
   COOLDOWN_SECONDS,
   FAIL_TTL_SECONDS,
   WARMUP_GRACE_SECONDS,
+  WARMUP_WAIT_MS,
+  WARMUP_POLL_MS,
   SESSION_RECYCLE_IDLE_SECONDS,
   SESSION_RECYCLE_MARGIN_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
@@ -164,9 +168,10 @@ export function rotatePatrolLogs() {
 }
 
 // 该任务下次「需要会话在场」的时刻（ms）：现在已在窗口（落点尾窗、一次
-// 性错过待补）视为立刻需要；窗口外取 cron 裸落点（刻意不取抖动后投递时
-// 刻：落点更早，按落点算余量更小、回收更保守，是安全方向）。cron 无效
-// 返回 Infinity，永不回收。
+// 性错过待补）视为立刻需要；窗口外取 cron 裸落点（周期任务投递晚于落
+// 点，按落点算余量更小、回收更保守；一次性网格落点反而提前至多 90 秒投
+// 递，这段提前量由回收余量 SESSION_FIRE_MARGIN_SECONDS 罩住）。cron
+// 无效返回 Infinity，永不回收。
 function taskNeedMs(task, now) {
   const cron = parseCronOrNone(task?.cron);
   if (cron === null) return Infinity;
@@ -182,9 +187,12 @@ function entryClaimed(ent) {
 // 保证一个工作区里每个死主窗口任务都有专属预热，并完成本文件的续期/改
 // id/盖印维护。bucket 是 state[ws]（原地修改）。scriptProcsRef 是全轮共
 // 享的进程表快照容器（{value: 数组|null}），只在孤儿认领时拍一次。
+// 返回 { pending }：本轮新纳入跟踪、尚未认亲的活 script（新 spawn 与孤儿
+// 认领），cmdRun 据此轮内等待认亲并补盖印。
 export async function patrolWorkspace(
   ws, bucket, taskfile, now, leadMs, cur, details, scriptProcsRef, stats,
 ) {
+  const pending = [];
   const tasks = deps.readTasks(ws);
   const note = (kind, msg) => {
     bump(stats, kind);
@@ -200,7 +208,7 @@ export async function patrolWorkspace(
       note('warn', `任务文件读不出 ${ws}：格式损坏或不可读，本轮跳过该目录，`
         + `其中 ${TASK_REL} 里的定时任务都不会执行`);
     }
-    return;
+    return { pending: [] };
   }
 
   const stopEntry = async (ent, kind, msg) => {
@@ -219,7 +227,7 @@ export async function patrolWorkspace(
       }
       delete bucket[key];
     }
-    return;
+    return { pending: [] };
   }
 
   // 第零步：id 改键的崩溃窗口治愈。任务文件里旧键已不存在（上轮 minify
@@ -247,8 +255,9 @@ export async function patrolWorkspace(
 
   // 第一步：认亲。spawn 只知道 script pid，登记里是 claude 孙进程；沿轮
   // 初快照的祖先链找到我们这代的登记详情，回填 sessionId/claudePid/
-  // claudeProcStart。认到 = 最强健康证据，当场清零失败计数。认不到下轮
-  // 再认，不阻断任何决策。
+  // claudeProcStart。认到 = 最强健康证据，当场清零失败计数。本轮新 spawn
+  // 的不在快照里，认亲由 cmdRun 的轮内等待补做；其余条目认不到下轮再
+  // 认，不阻断任何决策。
   for (const ent of Object.values(bucket)) {
     if (!deps.trackedAlive(ent)) continue;
     const d = deps.claimWarm(details, ws, ent.pid);
@@ -358,8 +367,9 @@ export async function patrolWorkspace(
       ent.fails = 0;
     }
 
-    // 盖印：已认亲且任务归属还没盖到本代预热（活创建者已在 (a) 排
-    // 除）。当轮新 spawn 的会话没认亲，下轮才盖——lead 覆盖两轮巡检。
+    // 盖印（跨轮老条目）：已认亲且任务归属还没盖到本代预热（活创建者
+    // 已在 (a) 排除）。当轮新 spawn 的会话在第三步之后的轮内等待里认
+    // 亲，由 cmdRun 的 stampClaimed 补盖，不走这里。
     if (entryClaimed(ent)
         && (!t.createdBySessionId || t.createdBySessionId !== ent.sessionId)) {
       const target = {
@@ -431,6 +441,7 @@ export async function patrolWorkspace(
         };
         note('adopt', `接管 ${ws} 任务 ${key} pid=${procPid}：state 记录缺失，`
           + '但进程表里仍有本该任务的预热会话，重新纳入跟踪');
+        pending.push({ ws, key, pid: procPid });
         continue;
       }
     }
@@ -474,23 +485,25 @@ export async function patrolWorkspace(
     };
     note('spawn', `已启动 ${ws} 任务 ${key} pid=${spawned.pid}`
       + `（连续失败计数 ${fails}）`);
+    pending.push({ ws, key, pid: spawned.pid });
   }
 
   // 第三步：任务文件维护（续期 + 改 id + 盖印）合并为一次带乐观锁的原子
-  // 写。撞车（Claude Code 刚写了 lastFiredAt/删了任务）整轮放弃写与
-  // reap，下轮基于新文件重算——已 spawn 的条目留下轮处理，不受影响。
+  // 写。撞车（Claude Code 刚写了 lastFiredAt/删了任务）放弃本轮老条目维
+  // 护，但已 spawn 的会话仍返回给 cmdRun 等待认亲，盖印收尾会再写一次。
   let result;
   try {
     result = maintainWorkspace(taskfile, { reown: stamps });
   } catch (e) {
     if (e instanceof TaskFileChanged) {
       note('warn', `维护暂缓 ${ws}：任务文件刚被 Claude Code 改动，本轮不覆盖，`
-        + '下轮再来');
-      return;
+        + '稍后重试');
+      return { pending };
     }
     throw e;
   }
-  if (result === null) return; // 与 readTasks 不一致的极端竞态：保守不动
+  // 与 readTasks 不一致的极端竞态：保守不动，新 spawn 也全留跨轮路径。
+  if (result === null) return { pending: [] };
   if (result.renewed) {
     deps.log(`已续期 ${ws}：${result.renewed} 个周期任务标记为 permanent，`
       + '不再受 7 天过期限制');
@@ -505,11 +518,17 @@ export async function patrolWorkspace(
       + '预热会话，这些任务将只在对应会话触发');
   }
   // id 改小同轮把 state 条目跟着改键：不改的话下轮会把换 id 的任务误判
-  // 成「旧任务删除 + 新任务」，错杀刚拉起的会话再重拉一个。
+  // 成「旧任务删除 + 新任务」，错杀刚拉起的会话再重拉一个。pending 是本
+  // 轮 spawn 的返回快照，键也要跟着改，否则轮内等待按旧键找不到条目，新
+  // 任务的盖印被白白推到下轮。
   for (const { from, to } of result.idChanges) {
     if (bucket[from] && !bucket[to]) {
+      const movedPid = bucket[from].pid;
       bucket[to] = { ...bucket[from], taskId: to };
       delete bucket[from];
+      for (const p of pending) {
+        if (p.key === from && p.pid === movedPid) p.key = to;
+      }
     }
   }
 
@@ -542,6 +561,103 @@ export async function patrolWorkspace(
         + '对应任务已删除，结束预热会话');
     }
     delete bucket[key];
+  }
+  return { pending };
+}
+
+// 轮内等待本轮新 spawn/认领的会话完成登记，认到亲就回填 bucket（复刻
+// patrolWorkspace 第一步的回填与 fails 清零）。这是盖印加速，不是判死：
+// 等不到的活会话原样留下，判死只走跨轮 WARMUP_GRACE 路径。先扫后睡——
+// 进入时各工作区决策已串行花掉数秒，健康会话可能已登记。任一 pending
+// 认亲或死亡都把它移出集合，全部移出即提前结束；拍数帽与墙钟帽双出口。
+// 返回最新登记快照与按 ws 分组的认亲条目（供盖印收尾）。
+async function awaitWarmups(pending, state, initialDetails, stats) {
+  const claimed = [];
+  const died = [];
+  let details = initialDetails;
+  const deadline = Date.now() + WARMUP_WAIT_MS;
+  const recognize = () => {
+    const rest = [];
+    for (const p of pending) {
+      const ent = state[p.ws]?.[p.key];
+      if (!ent || ent.pid !== p.pid) continue;
+      if (!deps.trackedAlive(ent)) {
+        // 等待期内自然死亡：条目轮末会被 kept 丢弃，这里留个名字给 cmdRun
+        // 报「会话退出」，与跨轮被动死亡同等级的可观测性。
+        died.push({ ...p, ent });
+        continue;
+      }
+      const d = deps.claimWarm(details, p.ws, p.pid);
+      if (!d) {
+        rest.push(p);
+        continue;
+      }
+      ent.fails = 0;
+      if (d.sessionId && d.procStart) {
+        ent.claudePid = d.pid;
+        ent.sessionId = d.sessionId;
+        ent.claudeProcStart = d.procStart;
+      }
+      claimed.push(p);
+    }
+    pending = rest;
+  };
+  // initialDetails 拍于决策之前、spawn 尚未发生，认亲必然落空；进入先重
+  // 扫一拍再开始睡。之后睡一拍、扫一拍，至多 8 拍。
+  [, , details] = await deps.scanSessions();
+  recognize();
+  for (let polls = 0; pending.length > 0 && polls * WARMUP_POLL_MS < WARMUP_WAIT_MS;
+    polls += 1) {
+    if (Date.now() >= deadline) break;
+    await deps.sleep(WARMUP_POLL_MS);
+    [, , details] = await deps.scanSessions();
+    recognize();
+  }
+  return { details, claimed, died };
+}
+
+// 等待期认到亲的会话补盖归属印：按 ws 分组，用 bucket 条目上的 sig 构建
+// reown 映射；同 sig 被不同会话认亲（同毫秒连建的重复任务）一律都不盖，
+// 与 patrolWorkspace 的盖印冲突消解同规则。无认亲的 ws 不调用、不写盘；
+// 撞 mtime 乐观锁或极端竞态（result=null）跳过，下轮再来。
+function stampClaimed(claimedByWs, state, taskfiles, stats) {
+  for (const [ws, items] of claimedByWs) {
+    const stamps = new Map();
+    const conflicts = new Set();
+    for (const key of items) {
+      const ent = state[ws]?.[key];
+      if (!ent?.sessionId || !ent.claudeProcStart) continue;
+      const target = {
+        sessionId: ent.sessionId,
+        pid: ent.claudePid,
+        procStart: ent.claudeProcStart,
+      };
+      if (stamps.has(ent.sig)) {
+        if (stamps.get(ent.sig).sessionId !== ent.sessionId) {
+          conflicts.add(ent.sig);
+          stamps.delete(ent.sig);
+        }
+      } else if (!conflicts.has(ent.sig)) {
+        stamps.set(ent.sig, target);
+      }
+    }
+    if (stamps.size === 0) continue;
+    try {
+      const result = maintainWorkspace(taskfiles.get(ws), { reown: stamps });
+      if (result?.reowned) {
+        bump(stats, 'reown');
+        deps.log(`已过户 ${ws}：${result.reowned} 个窗口内任务的归属改到各自`
+          + '的预热会话，这些任务将只在对应会话触发');
+      }
+    } catch (e) {
+      if (e instanceof TaskFileChanged) {
+        bump(stats, 'warn');
+        deps.log(`盖印暂缓 ${ws}：任务文件刚被 Claude Code 改动，本轮不覆盖，`
+          + '下轮再来');
+        continue;
+      }
+      throw e;
+    }
   }
 }
 
@@ -624,8 +740,10 @@ export async function cmdRun(args) {
         + '请检查配置文件或用 cron-up install --roots 指定');
     }
 
-    // 登记每轮只读一次（含祖先链快照）：认亲与活创建者判定都靠它。
-    const [consumers, registryAlert, details] = await deps.scanSessions();
+    // 登记轮初读一次（含祖先链快照）：认亲与活创建者判定都靠它。有新
+    // spawn 时等待期会重扫，details 随之刷新到最新快照（轮末 kept 判定
+    // 与消费者计数都用刷新后的版本）。
+    let [consumers, registryAlert, details] = await deps.scanSessions();
     if (registryAlert) {
       bump(stats, 'warn');
       deps.log(`告警：${registryAlert}`);
@@ -668,20 +786,54 @@ export async function cmdRun(args) {
 
     let found = 0;
     const scriptProcsRef = { value: null };
+    const pendingAll = [];
+    const taskfiles = new Map();
     for (const [ws, taskfile] of deps.discover(cfg.roots)) {
       found += 1;
       if (!state[ws]) state[ws] = {};
+      taskfiles.set(ws, taskfile);
       // 一个工作区读不动/写不动不能中断整轮：discover 是生成器，抛了会
       // 跳过后面所有工作区。
       try {
-        await patrolWorkspace(
+        const { pending } = await patrolWorkspace(
           ws, state[ws], taskfile, now, leadMs, cur, details,
           scriptProcsRef, stats);
+        pendingAll.push(...pending);
       } catch (e) {
         bump(stats, 'error');
         deps.log(`错误 ${ws}：${e.constructor.name}：${e.message}`);
       }
       if (Object.keys(state[ws]).length === 0) delete state[ws];
+    }
+
+    // 本轮有新会话拉起才等待：绝大多数轮次 pending 为空，零额外 ps、零睡
+    // 眠。认亲后同一轮补盖归属印（否则要等下一轮，提前量就得兜两轮）。
+    // 等待只认亲、不判死；等不到的下轮按 WARMUP_GRACE 跨轮处理。
+    if (pendingAll.length > 0) {
+      let claimed;
+      let died = [];
+      try {
+        ({ details, claimed, died } = await awaitWarmups(
+          pendingAll, state, details, stats));
+        consumers = new Set(details.keys());
+        // 等待期内自然死亡的是本轮新 spawn 的会话，不在轮初 prevAlive 分
+        // 组里，单独补一条退出日志，否则启动即崩将完全静默。
+        for (const d of died) {
+          bump(stats, 'exit');
+          deps.log(exitLine(d.ws, d.key, d.ent));
+        }
+        const claimedByWs = new Map();
+        for (const p of claimed) {
+          if (!claimedByWs.has(p.ws)) claimedByWs.set(p.ws, []);
+          claimedByWs.get(p.ws).push(p.key);
+        }
+        stampClaimed(claimedByWs, state, taskfiles, stats);
+      } catch (e) {
+        // 等待或补盖失败不能丢轮末落盘：最坏只是盖印晚一轮，会话进程已
+        // 在场，目录调度锁仍兜底。
+        bump(stats, 'error');
+        deps.log(`等待预热登记出错：${e.constructor.name}：${e.message}`);
+      }
     }
 
     // 轮中死亡复核：轮初活、轮末没气、又不是本轮主动 stop 的。轮中刚被

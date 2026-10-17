@@ -11,9 +11,12 @@ export const DEFAULT_CONFIG = {
 
 // launchd 两轮巡检之间的秒数（plist 的 StartInterval）。
 export const INTERVAL_SECONDS = 300;
-// 提前多少秒为窗口内任务备好会话：覆盖两轮巡检（本轮发现、下轮盖印），任
-// 何任务最迟在执行前一轮被发现；会话登记本身只需约 10 秒。
-export const LEAD_SECONDS = 600;
+// 提前多少秒为窗口内任务备好会话。任务相对巡检网格的相位任意：最迟在落
+// 点前一轮（≤INTERVAL）被发现并 spawn，spawn 后当轮等待认亲并盖印（见
+// WARMUP_WAIT_MS），故提前量只需「一轮间隔 + 等待与重扫开销」。一次性
+// 任务在 :00/:30 网格最多提前 90 秒投递，其窗口前沿在 cron.mjs 的 wanted
+// 里再前推 CC_JITTER.oneShotMaxMs，不占这里的周期任务余量。
+export const LEAD_SECONDS = 360;
 // 工作区发现的最大递归深度（相对 roots）：深度 3 覆盖
 // <容器>/<仓>/<子目录>/<孙目录> 里的任务文件。
 export const MAX_SCAN_DEPTH = 3;
@@ -33,14 +36,23 @@ export const FAIL_TTL_SECONDS = 48 * 3600;
 export const PID_T_MAX = 2 ** 31 - 1;
 // 健康会话约 10 秒内完成登记。超时仍存活却没登记，是卡在无人应答的提问
 // 界面（目录信任、工具授权）；只看存活会把它当健康，只有这个时限兜得住。
+// 这是唯一的判死阈值，且只在跨轮判定（轮龄为整数个巡检间隔）时生效。
 export const WARMUP_GRACE_SECONDS = 180;
+// spawn 当轮在轮内等待会话登记的上限：它是「盖印加速」预算，不是判死阈
+// 值——等不到的会话原样留到下轮，按 WARMUP_GRACE_SECONDS 跨轮判死，失
+// 败计数不因等待而累积（慢启动环境两轮就被冷却的回退就是这么来的）。
+// 健康会话约 10 秒登记，24 秒是 8 拍重扫（另加进入时的先扫一拍）；拍数
+// 帽与墙钟帽双出口，高负载拖慢 setTimeout 也不会把一轮撑过间隔。
+export const WARMUP_WAIT_MS = 24_000;
+export const WARMUP_POLL_MS = 3_000;
 // window 回收判据一：界面静默超过此时长视为「本任务已执行完」。TUI 工作
 // 时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；取
 // WARMUP_GRACE 同值，结构上对齐「3 分钟定生死」的既有心智。
 export const SESSION_RECYCLE_IDLE_SECONDS = WARMUP_GRACE_SECONDS;
 // window 回收判据二：距该任务下次「需要会话在场」至少还有这么多秒。回收
-// 后要经「下轮重拉 → 新会话登记 → 再下轮盖印」两步，任务才重新铁定投到
-// 新预热：一个巡检间隔加登记抖动余量。更近的触发不回收，复用现有会话。
+// 后下轮（≤INTERVAL）发现并 spawn，进程即在场，盖印在该轮等待期内完成；
+// 一个巡检间隔之外的 120 秒余量罩一次性任务最多 90 秒的提前投递与唤醒
+// 抖动。更近的触发不回收，复用现有会话。
 export const SESSION_FIRE_MARGIN_SECONDS = 120;
 export const SESSION_RECYCLE_MARGIN_SECONDS =
   SESSION_FIRE_MARGIN_SECONDS + INTERVAL_SECONDS;

@@ -30,7 +30,7 @@ import {
 // 的用例用 cronAt(偏移) 造落点，远期任务用明确的远 cron。
 const T0 = Math.floor(Date.now() / 1000);
 const nowAt = (sec = T0) => new Date(sec * 1000);
-const LEAD_MS = 600_000;
+const LEAD_MS = 360_000;
 
 // 一台完整的进程/登记机器：
 //  - spawnSession 分配三代 pid（script、zsh），claim() 后登记里才出现孙
@@ -90,6 +90,15 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   deps.acquireRunLock = () => ({ lockPath: null });
   deps.rotatePatrolLogs = () => {};
   deps.log = () => {};
+  // 等待轮询默认不真睡：拍钩子里突变世界（认亲/死亡），复刻 registry 测
+  // 试的既有手法。拍号从 1 开始（第 N 拍 = 第 N 次 sleep 后的重扫）。
+  let polls = 0;
+  const pollHooks = [];
+  deps.sleep = async () => {
+    polls += 1;
+    for (const fn of pollHooks) fn(polls);
+  };
+  let scanCount = 0;
 
   function buildDetails() {
     const list = [];
@@ -125,7 +134,22 @@ async function setupMachine(t, { realDiscover = false } = {}) {
     if (list.length) details.set(WS, list);
     return details;
   }
-  deps.scanSessions = async () => scanFrom(buildDetails());
+  deps.scanSessions = async () => {
+    scanCount += 1;
+    return scanFrom(buildDetails());
+  };
+  // target 可以是 rec 或返回 rec 的函数（钩子注册往往早于 spawn）。
+  const asRec = (target) => (typeof target === 'function' ? target() : target);
+  const claimAt = (target, atPoll, sid) => {
+    pollHooks.push((p) => {
+      if (p === atPoll) claim(asRec(target), sid);
+    });
+  };
+  const killAt = (target, atPoll) => {
+    pollHooks.push((p) => {
+      if (p === atPoll) kill(asRec(target));
+    });
+  };
 
   const claim = (rec, sid = `sid-${rec.scriptPid}`) => {
     rec.claimed = true;
@@ -173,6 +197,9 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   const m = {
     tmp, deps, WS, taskfile, cfgPath, alive, spawns, byTask, hooks,
     claim, kill, resume, closeResume, addUser, touchLog, buildDetails,
+    claimAt, killAt,
+    polls: () => polls,
+    scans: () => scanCount,
     state: () => (fs.existsSync(deps.paths.statePath)
       ? readJson(deps.paths.statePath) : {}),
     scriptProcs,
@@ -202,19 +229,21 @@ const sidOf = (m, taskId) =>
 
 test('two same-time dead-owner tasks get two separate warm sessions and stamps', async (t) => {
   const m = await setupMachine(t);
-  const soon = cronAt(300, nowAt(T0)); // 5 分钟后同刻，在 10 分钟提前窗内
+  const soon = cronAt(300, nowAt(T0)); // 5 分钟后同刻，在 6 分钟提前窗内
   const a = makeTask({ id: '00000002', cron: soon, prompt: '甲日报' });
   const b = makeTask({ id: '00000004', cron: soon, prompt: '乙日报' });
   writeTaskFile(m.WS, [a, b]);
 
-  // 轮 1：各拉各的，两条日志、两个 script pid。
-  await m.patrol();
+  // 轮 1：各拉各的，两条日志、两个 script pid；两条都挂起等待认亲。
+  const r1 = await m.patrol();
   assert.equal(m.spawns.length, 2);
   assert.equal(m.spawnLog[0], '00000002');
   assert.equal(m.spawnLog[1], '00000004');
   assert.notEqual(m.spawns[0].scriptPid, m.spawns[1].scriptPid);
   assert.ok(m.spawnLog.every((id) =>
     isTaskSessionLogName(path.basename(sessionLogPath(m.WS, id)))));
+  assert.deepEqual(r1.pending.map((p) => p.key).sort(),
+    ['00000002', '00000004']);
   // 未认亲不盖印。
   assert.equal(sidOf(m, '00000002'), undefined);
   assert.equal(sidOf(m, '00000004'), undefined);
@@ -636,6 +665,116 @@ test('cmdRun: passive death between rounds is reported with task id', async (t) 
   await m.patrol();
   assert.ok(lines.some((l) => l.includes('会话退出') && l.includes('00000001')
     && l.includes(`pid=${pid}`)));
+});
+
+// ---- cmdRun 轮内等待认亲盖印 ----
+
+test('cmdRun: registration during in-round wait is claimed and stamped same round', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [makeTask({ id: '00000002', prompt: '甲日报' })]);
+  m.claimAt(() => m.byTask.get('00000002'), 1, 'sid-A');
+  assert.equal(await m.patrol(), true);
+  // 第 1 拍认到即收尾：一次 sleep；扫描 = 轮初 + 进入先扫 + 拍内重扫。
+  assert.equal(m.polls(), 1);
+  assert.equal(m.scans(), 3);
+  assert.equal(sidOf(m, '00000002'), 'sid-A');
+  assert.equal(fileTasks(m).find((x) => x.id === '00000002').createdByPid,
+    m.byTask.get('00000002').claudePid);
+  const ent = m.state()[m.WS]['00000002'];
+  assert.equal(ent.sessionId, 'sid-A');
+  assert.equal(ent.fails, 0);
+});
+
+test('cmdRun: unregistered warm session is waited out but not killed or counted', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [makeTask({ id: '00000002' })]);
+  assert.equal(await m.patrol(), true);
+  // 8 拍打满：扫描 = 轮初 + 进入先扫 + 8 次重扫；进程活着、零失败、未盖印。
+  assert.equal(m.polls(), 8);
+  assert.equal(m.scans(), 10);
+  const rec = m.byTask.get('00000002');
+  assert.ok(m.alive.has(rec.scriptPid));
+  assert.equal(m.spawns.length, 1);
+  assert.equal(sidOf(m, '00000002'), undefined);
+  const ent = m.state()[m.WS]['00000002'];
+  assert.equal(ent.pid, rec.scriptPid);
+  assert.equal(ent.fails, 0);
+  assert.equal(ent.sessionId, undefined);
+});
+
+test('cmdRun: pending session dying during wait ends the wait early', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const lines = [];
+  m.deps.log = (msg) => lines.push(msg);
+  writeTaskFile(m.WS, [makeTask({ id: '00000002' })]);
+  m.killAt(() => m.byTask.get('00000002'), 2);
+  assert.equal(await m.patrol(), true);
+  // 第 2 拍死亡被认出后集合清空，不再睡满 8 拍；不重拉、不计数。
+  assert.equal(m.polls(), 2);
+  assert.equal(m.spawns.length, 1);
+  assert.equal(m.state()[m.WS]?.['00000002'], undefined);
+  // 启动后二十几秒内自然死亡仍报「会话退出」，不静默。
+  assert.ok(lines.some((l) => l.includes('会话退出') && l.includes('00000002')));
+});
+
+test('cmdRun: two tasks claimed on different polls are both stamped same round', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [
+    makeTask({ id: '00000002', prompt: '甲' }),
+    makeTask({ id: '00000004', prompt: '乙' }),
+  ]);
+  m.claimAt(() => m.byTask.get('00000002'), 1, 'sid-A');
+  m.claimAt(() => m.byTask.get('00000004'), 3, 'sid-B');
+  assert.equal(await m.patrol(), true);
+  assert.equal(m.polls(), 3);
+  assert.equal(sidOf(m, '00000002'), 'sid-A');
+  assert.equal(sidOf(m, '00000004'), 'sid-B');
+});
+
+test('cmdRun: id minified in the same round still waits and stamps the warm session', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [
+    makeTask({ id: 'deadbeef', prompt: '大 id 日报' }),
+  ]);
+  m.claimAt(() => m.byTask.get('deadbeef'), 1, 'sid-A');
+  assert.equal(await m.patrol(), true);
+  // id 已改小为首个空闲序号，归属盖在新 id 上，只拉过一个会话。
+  assert.deepEqual(fileTasks(m).map((x) => x.id), ['00000001']);
+  assert.equal(sidOf(m, '00000001'), 'sid-A');
+  assert.equal(m.spawns.length, 1);
+  assert.equal(m.state()[m.WS]['00000001'].sessionId, 'sid-A');
+});
+
+test('cmdRun: no pending sessions means no extra scans or sleeps', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, []);
+  assert.equal(await m.patrol(), true);
+  assert.equal(m.polls(), 0);
+  assert.equal(m.scans(), 1);
+});
+
+test('cmdRun: stamp write lost to a concurrent task-file change is skipped', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const task = makeTask({ id: '00000002', prompt: '甲日报' });
+  writeTaskFile(m.WS, [task]);
+  m.claimAt(() => m.byTask.get('00000002'), 1, 'sid-A');
+  // 巡逻第三步是第 1 次 loadTaskDoc；盖印收尾是第 2 次——在它 stat 之后、
+  // rename 之前改写文件，逼乐观锁撞车。
+  const lines = [];
+  m.deps.log = (msg) => lines.push(msg);
+  // loadTaskDoc 三次：巡逻 readTasks、巡逻第三步维护、盖印收尾维护。
+  let loads = 0;
+  const origLoad = m.deps.loadTaskDoc;
+  m.deps.loadTaskDoc = (f) => {
+    loads += 1;
+    if (loads === 3) writeTaskFile(m.WS, [task]);
+    return origLoad(f);
+  };
+  assert.equal(await m.patrol(), true);
+  assert.ok(lines.some((l) => l.includes('盖印暂缓')));
+  // 认亲回填不依赖写盘：state 已认到，但任务文件没被盖。
+  assert.equal(sidOf(m, '00000002'), undefined);
+  assert.equal(m.state()[m.WS]['00000002'].sessionId, 'sid-A');
 });
 
 test('cmdRun skipped when the lock is held elsewhere', async (t) => {

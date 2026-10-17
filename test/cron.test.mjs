@@ -17,7 +17,7 @@ import { taskView } from '../src/display.mjs';
 import { DISPLAY_SEARCH_DAYS } from '../src/constants.mjs';
 
 const NOW = new Date(2026, 8, 20, 15, 47); // Sunday
-const LEAD_MS = 10 * 60_000;
+const LEAD_MS = 6 * 60_000;
 
 // 直接测 nextDelivery 的 fire：它是 taskView nxt/fire 的唯一来源，生产侧
 // 已无第二入口（原 predictedFire 薄封装已删）。
@@ -173,7 +173,7 @@ test('task view sees a year ahead', () => {
   const v = taskView({ cron: expr, recurring: true }, NOW);
   assert.equal(v.nxt.getTime(), future.getTime());
   // 巡检判定不受显示窗口影响：60 天外不算需要预热。
-  assert.equal(taskWanted({ cron: expr, recurring: true }, NOW, 10 * 60_000),
+  assert.equal(taskWanted({ cron: expr, recurring: true }, NOW, LEAD_MS),
     false);
 });
 
@@ -196,6 +196,28 @@ test('task view can answer the patrol question too', () => {
 test('within lead window', () => {
   const t = { cron: '50 15 20 9 *', createdAt: 1_789_000_000_000 };
   assert.equal(taskWanted(t, NOW, LEAD_MS), true);
+});
+
+test('one-shot window reaches 90s before the slot for early grid delivery', () => {
+  // 落点 7 分钟后：超出 6 分钟提前量，但一次性任务最多提前 90 秒投递，
+  // 最早投递时刻（330 秒后）已在窗内。非网格落点本不提前，保守同口径
+  // 只是多等 90 秒，无损。
+  const d = new Date(NOW.getTime() + 7 * 60_000);
+  const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
+    + `${d.getMonth() + 1} *`;
+  assert.equal(taskWanted({ cron: expr, recurring: false }, NOW, LEAD_MS),
+    true);
+  // 同距离的周期任务不前推：抖动在落点之后，由投递尾窗覆盖。
+  assert.equal(taskWanted({ cron: expr, recurring: true }, NOW, LEAD_MS),
+    false);
+});
+
+test('one-shot slot 8 minutes out is beyond even the early-delivery window', () => {
+  const d = new Date(NOW.getTime() + 8 * 60_000);
+  const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
+    + `${d.getMonth() + 1} *`;
+  assert.equal(taskWanted({ cron: expr, recurring: false }, NOW, LEAD_MS),
+    false);
 });
 
 test('recurring flag identifies one-shot', () => {
