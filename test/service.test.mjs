@@ -15,6 +15,8 @@ import {
   cmdUninstall,
 } from '../src/service.mjs';
 import { LABEL } from '../src/paths.mjs';
+import { INTERVAL_SECONDS, DEFAULT_CONFIG } from '../src/constants.mjs';
+import { normalizeRoots } from '../src/config.mjs';
 import { ExitError } from '../src/internals.mjs';
 import {
   mkTmp,
@@ -98,7 +100,7 @@ function installLaunchChain(t, pathDirs) {
   const deps = mockDeps(t);
   deps.paths = tmpPaths(mkTmp(t));
   const script = writeServiceScript({ pathDirs });
-  fs.writeFileSync(deps.paths.plistPath, renderPlist(300, script));
+  fs.writeFileSync(deps.paths.plistPath, renderPlist(script));
   return deps;
 }
 
@@ -110,7 +112,7 @@ test('service script execs cron-up via PATH', (t) => {
   const script = deps.paths.serviceScriptPath;
   assert.equal(fs.readFileSync(script, 'utf-8'),
     '#!/bin/bash\n'
-    + '# 由 cron-up install 生成；重跑 cron-up install --force 覆盖重生成\n'
+    + '# 由 cron-up install 生成；重跑 cron-up install 覆盖重生成\n'
     + 'export PATH="/Users/u/.local/share/fnm/aliases/default/bin":"$PATH"\n'
     + 'exec cron-up run\n');
   assert.equal(fs.statSync(script).mode & 0o777, 0o755);
@@ -126,7 +128,7 @@ test('launcherHealth resolves PATH-form script against stable bins', (t) => {
     const script = deps.paths.serviceScriptPath;
     fs.writeFileSync(script,
       `#!/bin/bash\nexport PATH="${bin}":"$PATH"\nexec cron-up run\n`);
-    fs.writeFileSync(deps.paths.plistPath, renderPlist(300, script));
+    fs.writeFileSync(deps.paths.plistPath, renderPlist(script));
   };
   // bin 里 cron-up 与 node 都在：健康。
   for (const name of ['cron-up', 'node']) {
@@ -150,13 +152,13 @@ test('renderPlist points ProgramArguments at the service script only', (t) => {
   assert.ok(xml.includes('<string>local.cron-up</string>'));
   assert.ok(xml.includes(`<string>${deps.paths.serviceScriptPath}</string>`));
   assert.ok(!xml.includes('/x/bin')); // node 路径只在脚本里
-  assert.ok(xml.includes('<integer>300</integer>'));
+  assert.ok(xml.includes(`<integer>${INTERVAL_SECONDS}</integer>`));
 });
 
 test('renderPlist XML-escapes ampersands in the script path', (t) => {
   const deps = mockDeps(t);
   deps.paths = tmpPaths(mkTmp(t));
-  const xml = renderPlist(300, '/x/a&b/cron-up-service');
+  const xml = renderPlist('/x/a&b/cron-up-service');
   assert.ok(xml.includes('/x/a&amp;b/cron-up-service'));
 });
 
@@ -196,13 +198,9 @@ async function setupInstall(t) {
   const lines = [];
   deps.print = (m) => lines.push(m);
   deps.printErr = (m) => lines.push(`ERR:${m}`);
-  const install = async (kw = {}) => cmdInstall({
-    roots: tmp,
-    interval: undefined,
-    lead: undefined,
-    force: true,
-    ...kw,
-  });
+  // install 现在只认 --roots：默认给 tmp，测试可显式覆盖（含 undefined
+  // 模拟不带参数，此时应继承现有配置或落默认值）。
+  const install = (args = {}) => cmdInstall({ roots: tmp, ...args });
   const cfg = () => readJson(deps.paths.configPath);
   return {
     tmp, deps, lines, launchCalls, install, cfg,
@@ -210,10 +208,10 @@ async function setupInstall(t) {
   };
 }
 
-test('install writes config, plist, bootstraps and runs first patrol', async (t) => {
+test('install writes roots-only config, plist, bootstraps and runs first patrol', async (t) => {
   const s = await setupInstall(t);
   await s.install();
-  assert.equal(s.cfg().intervalSeconds, 300);
+  assert.deepEqual(s.cfg(), { roots: [s.tmp] }, '配置只剩 roots');
   assert.ok(fs.existsSync(s.deps.paths.plistPath));
   // 启动脚本随 install 生成，一律 PATH 形态，plist 只指向它。
   assert.ok(fs.existsSync(s.deps.paths.serviceScriptPath));
@@ -238,25 +236,6 @@ test('first patrol message matches what actually happened', async (t) => {
   assert.ok(s2.lines.some((l) => l.includes('首轮巡检暂未执行')));
 });
 
-test('zero lead is an explicit choice', async (t) => {
-  const s = await setupInstall(t);
-  await s.install({ lead: 0 });
-  assert.equal(s.cfg().leadSeconds, 0);
-});
-
-test('session-retain flag validates and persists', async (t) => {
-  const s = await setupInstall(t);
-  await s.install({ sessionRetain: 'always' });
-  assert.equal(s.cfg().sessionRetain, 'always');
-  await assert.rejects(s.install({ sessionRetain: 'sometimes' }), (e) => {
-    assert.ok(e instanceof ExitError);
-    assert.equal(e.code, 1);
-    return true;
-  });
-  // 与其他值域校验同一条纪律：被拒的安装不落盘。
-  assert.equal(s.cfg().sessionRetain, 'always');
-});
-
 test('install rejects --config instead of silently ignoring it', async (t) => {
   const s = await setupInstall(t);
   await assert.rejects(s.install({ config: '/tmp/elsewhere.json' }), (e) => {
@@ -269,65 +248,62 @@ test('install rejects --config instead of silently ignoring it', async (t) => {
   assert.equal(fs.existsSync(s.deps.paths.configPath), false);
 });
 
-test('zero interval is rejected loudly and leaves config untouched', async (t) => {
-  const s = await setupInstall(t);
-  await s.install();
-  await assert.rejects(s.install({ interval: 0 }), (e) => {
-    assert.ok(e instanceof ExitError);
-    assert.equal(e.code, 1);
-    return true;
-  });
-  // 被拒的安装不能把非法值留在盘上：否则此后每轮巡检都会以退出码 2 失败。
-  assert.equal(s.cfg().intervalSeconds, 300);
-});
-
-test('negative lead is rejected loudly and leaves config untouched', async (t) => {
-  const s = await setupInstall(t);
-  await s.install();
-  await assert.rejects(s.install({ lead: -5 }), (e) => {
-    assert.ok(e instanceof ExitError);
-    assert.equal(e.code, 1);
-    return true;
-  });
-  assert.equal(s.cfg().leadSeconds, 600);
-});
-
-test('non-object legacy config is ignored on force', async (t) => {
-  const s = await setupInstall(t);
-  fs.writeFileSync(s.deps.paths.configPath, '123');
-  await s.install();
-  assert.equal(s.cfg().intervalSeconds, 300);
-  assert.deepEqual(s.cfg().roots, [s.tmp]);
-});
-
-test('corrupt config without force points to --force and force recovers', async (t) => {
-  const s = await setupInstall(t);
-  fs.writeFileSync(s.deps.paths.configPath, '{ not json');
-  await assert.rejects(s.install({ force: false }), (e) => {
-    assert.ok(e instanceof ExitError);
-    assert.equal(e.code, 2);
-    assert.ok(e.message.includes('--force'));
-    return true;
-  });
-  await s.install();
-  assert.equal(s.cfg().intervalSeconds, 300);
-});
-
-test('bool interval in config is rejected loudly', async (t) => {
-  // 配置字段类型错统一走 loadConfig 的 ExitError(2)，install 会附上
-  // --force 出口。（setupInstall 默认 force，这里显式走非 force 路径。）
-  const s = await setupInstall(t);
-  writeJson(s.deps.paths.configPath, {
-    roots: [s.tmp], maxDepth: 2, intervalSeconds: true, leadSeconds: 600,
-  });
-  await assert.rejects(s.install({ force: false }), (e) => e instanceof ExitError
-    && e.code === 2 && /--force/.test(e.message));
-});
-
 test('explicitly empty roots is rejected loudly', async (t) => {
   const s = await setupInstall(t);
   await assert.rejects(s.install({ roots: ',' }),
     (e) => e instanceof ExitError && e.code === 1);
+  assert.equal(fs.existsSync(s.deps.paths.configPath), false);
+});
+
+test('comma-separated roots are normalised and persisted', async (t) => {
+  const s = await setupInstall(t);
+  const a = path.join(s.tmp, 'a');
+  const b = path.join(s.tmp, 'b');
+  fs.mkdirSync(a);
+  fs.mkdirSync(b);
+  await s.install({ roots: `${a},${b}` });
+  assert.deepEqual(s.cfg().roots, [a, b]);
+});
+
+test('corrupt existing config does not block install: falls back with a notice', async (t) => {
+  const s = await setupInstall(t);
+  fs.writeFileSync(s.deps.paths.configPath, '{ not json');
+  await s.install({ roots: undefined }); // 不带 --roots：读旧配置失败，回默认
+  assert.deepEqual(s.cfg().roots, normalizeRoots(DEFAULT_CONFIG.roots));
+  assert.ok(s.lines.some((l) => l.includes('现有配置无法解读')));
+});
+
+test('rerun without --roots keeps existing roots', async (t) => {
+  const s = await setupInstall(t);
+  const custom = path.join(s.tmp, 'keep-me');
+  fs.mkdirSync(custom);
+  writeJson(s.deps.paths.configPath, { roots: [custom] });
+  await s.install({ roots: undefined });
+  assert.deepEqual(s.cfg().roots, [custom]);
+});
+
+test('explicit --roots overrides the existing config', async (t) => {
+  const s = await setupInstall(t);
+  writeJson(s.deps.paths.configPath, { roots: ['/old/place'] });
+  await s.install();
+  assert.deepEqual(s.cfg().roots, [s.tmp]);
+});
+
+test('obsolete config keys are purged on reinstall', async (t) => {
+  const s = await setupInstall(t);
+  writeJson(s.deps.paths.configPath, {
+    roots: [s.tmp],
+    autoRenew: false,
+    autoMinId: false,
+    sessionRetain: 'always',
+    stampOwner: false,
+    intervalSeconds: 999,
+    leadSeconds: 1,
+    maxDepth: 9,
+  });
+  await s.install({ roots: undefined });
+  assert.deepEqual(Object.keys(s.cfg()).sort(), ['roots']);
+  assert.deepEqual(s.cfg().roots, [s.tmp]);
 });
 
 test('default roots prints a safety notice', async (t) => {
@@ -337,65 +313,10 @@ test('default roots prints a safety notice', async (t) => {
   assert.ok(s.lines.some((l) => l.includes('--roots') && l.includes('clone')));
 });
 
-test('explicit roots prints no safety notice', async (t) => {
+test('non-default roots prints no safety notice', async (t) => {
   const s = await setupInstall(t);
   await s.install();
   assert.ok(!s.lines.some((l) => l.includes('今后 clone')));
-});
-
-test('omitted flags preserve existing values', async (t) => {
-  const s = await setupInstall(t);
-  await s.install({ lead: 45 });
-  await s.install({ interval: 120 });
-  assert.equal(s.cfg().leadSeconds, 45);
-  assert.equal(s.cfg().intervalSeconds, 120);
-});
-
-test('force drops only the mistyped legacy fields', async (t) => {
-  const s = await setupInstall(t);
-  await s.install({ roots: `${s.tmp}/ws` });
-  // 手改坏两个字段，force 重装：坏字段回默认并当面提示，好字段照旧继承
-  // （roots 不给命令行值，验证它来自继承而非 helper 默认）。
-  writeJson(s.deps.paths.configPath, {
-    ...s.cfg(), autoRenew: 'false', maxDepth: true,
-  });
-  await s.install({ roots: undefined });
-  assert.equal(s.cfg().autoRenew, true); // DEFAULT_CONFIG
-  assert.equal(s.cfg().maxDepth, 2);
-  assert.deepEqual(s.cfg().roots, [`${s.tmp}/ws`]);
-  assert.ok(s.lines.some((l) => l.includes('autoRenew') && l.includes('未继承')));
-  assert.ok(s.lines.some((l) => l.includes('maxDepth') && l.includes('未继承')));
-});
-
-test('auto-renew flags set the value; omitted preserves', async (t) => {
-  let s = await setupInstall(t);
-  await s.install({ autoRenew: true });
-  assert.equal(s.cfg().autoRenew, true);
-  await s.install({ autoRenew: false });
-  assert.equal(s.cfg().autoRenew, false);
-  await s.install();
-  assert.equal(s.cfg().autoRenew, false); // 省略则保留
-});
-
-test('auto-min-id flags set the value; omitted preserves', async (t) => {
-  let s = await setupInstall(t);
-  await s.install({ autoMinId: false });
-  assert.equal(s.cfg().autoMinId, false);
-  await s.install({ autoMinId: true });
-  assert.equal(s.cfg().autoMinId, true);
-  await s.install();
-  assert.equal(s.cfg().autoMinId, true); // 省略则保留
-});
-
-test('stamp-owner flags set the value; omitted preserves', async (t) => {
-  let s = await setupInstall(t);
-  await s.install({ stampOwner: true });
-  assert.equal(s.cfg().stampOwner, true);
-  await s.install({ stampOwner: false });
-  assert.equal(s.cfg().stampOwner, false);
-  await s.install({ stampOwner: true });
-  await s.install({ force: true });
-  assert.equal(s.cfg().stampOwner, true); // 省略则保留上值
 });
 
 test('bootstrap failure exits 1', async (t) => {
@@ -404,40 +325,6 @@ test('bootstrap failure exits 1', async (t) => {
     ? { status: 5, stderr: 'bootstrap failed' }
     : { status: 0, stderr: '' });
   await assert.rejects(s.install(), (e) => e instanceof ExitError && e.code === 1);
-});
-
-test('without --force existing config is kept', async (t) => {
-  const s = await setupInstall(t);
-  await s.install();
-  const lines2 = [];
-  s.deps.print = (m) => lines2.push(m);
-  await cmdInstall({ roots: '/other', force: false });
-  assert.ok(lines2.some((l) => l.includes('保留现有配置')));
-  assert.deepEqual(s.cfg().roots, [s.tmp]); // 没被 /other 覆盖
-  // 没给显式参数就不得冒「未生效」的警告（roots 在这个用例里给了，这里
-  // 换成不带的形态单独验证）。
-  const lines3 = [];
-  s.deps.print = (m) => lines3.push(m);
-  await cmdInstall({ force: false });
-  assert.ok(!lines3.some((l) => l.includes('未生效')));
-});
-
-test('without --force, ignored flags are named in output', async (t) => {
-  const s = await setupInstall(t);
-  await s.install();
-  const lines2 = [];
-  s.deps.print = (m) => lines2.push(m);
-  await cmdInstall({
-    roots: '/other', interval: 120, lead: 30, autoRenew: false,
-    autoMinId: false, force: false,
-  });
-  assert.ok(lines2.some((l) => l.includes('未生效')
-    && l.includes('--roots') && l.includes('--interval')
-    && l.includes('--lead') && l.includes('--auto-renew')
-    && l.includes('--auto-min-id')));
-  // 参数全部忽略，配置原样。
-  assert.deepEqual(s.cfg().roots, [s.tmp]);
-  assert.equal(s.cfg().intervalSeconds, 300);
 });
 
 // ---- uninstall ----
@@ -450,11 +337,11 @@ async function setupUninstall(t) {
   const stopped = [];
   deps.stopSession = async (ent) => { stopped.push(ent.pid); };
   deps.trackedAlive = (ent) => Boolean(ent.pid);
+  deps.procStartedAt = (pid) => `start-${pid}`;
   deps.listScriptProcesses = () => [];
   const lines = [];
   deps.print = (m) => lines.push(m);
-  const uninstall = (kw = {}) => cmdUninstall({
-    purge: false, keepSessions: false, ...kw });
+  const uninstall = (kw = {}) => cmdUninstall(kw);
   return { tmp, deps, stopped, lines, uninstall };
 }
 
@@ -469,33 +356,40 @@ test('uninstall rejects --config instead of silently ignoring it', async (t) => 
   assert.deepEqual(s.stopped, []);
 });
 
-test('sessions are stopped by default', async (t) => {
+test('nested-state task warmups are stopped by default', async (t) => {
   const s = await setupUninstall(t);
-  writeJson(s.deps.paths.statePath, { '/x': { pid: 11 }, '/y': { pid: 22 } });
+  writeJson(s.deps.paths.statePath, {
+    '/x': { '00000001': { pid: 11 }, '00000002': { pid: 12 } },
+    '/y': { '00000003': { pid: 22 } },
+  });
   await s.uninstall();
-  assert.deepEqual(s.stopped.sort(), [11, 22]);
-  assert.ok(s.lines.some((l) => l.includes('正在结束保活会话')));
+  assert.deepEqual(s.stopped.sort(), [11, 12, 22]);
+  assert.ok(s.lines.some((l) => l.includes('正在结束预热会话')));
 });
 
-test('keep-sessions leaves them running', async (t) => {
+test('legacy flat-state warmups are stopped too', async (t) => {
   const s = await setupUninstall(t);
-  writeJson(s.deps.paths.statePath, { '/x': { pid: 11 } });
-  await s.uninstall({ keepSessions: true });
-  assert.deepEqual(s.stopped, []);
+  writeJson(s.deps.paths.statePath, {
+    '/x': { pid: 33, startedAt: 1 },
+    '/y': { pid: 44, startedAt: 1 },
+  });
+  await s.uninstall();
+  assert.deepEqual(s.stopped.sort(), [33, 44]);
 });
 
-test('orphan sessions outside state are swept on uninstall', async (t) => {
+test('orphan script sessions outside state are swept on uninstall', async (t) => {
   const s = await setupUninstall(t);
   const logDir = s.deps.paths.sessionLogDir;
   s.deps.listScriptProcesses = () => [
-    [31, `/usr/bin/script -q ${logDir}/a.log /bin/zsh -lic x`],
+    // 新命名（任务级）与旧命名（目录级）的本工具孤儿都停。
+    [31, `/usr/bin/script -q ${logDir}/a_b--00000001.log /bin/zsh -lic x`],
+    [34, `/usr/bin/script -q ${logDir}/a_b.log /bin/zsh -lic x`],
     // 别人的 script 会话：日志不在本工具目录、形态不同，都不动。
     [32, '/usr/bin/script -q /other/place.log /bin/zsh -lic x'],
     [33, '/usr/bin/script -q /somewhere /bin/bash -ic x'],
   ];
-  s.deps.procStartedAt = (pid) => `start-${pid}`;
   await s.uninstall();
-  assert.deepEqual(s.stopped, [31]);
+  assert.deepEqual(s.stopped.sort(), [31, 34]);
   assert.ok(s.lines.some((l) => l.includes('state 已丢失')));
 });
 

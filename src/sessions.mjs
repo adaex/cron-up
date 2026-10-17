@@ -1,6 +1,7 @@
 // 预热会话的整个生命周期：存活探测、pid 身份指纹、拉起、停止、日志文件
 // 名、进程表兜底。被拉起的是 /usr/bin/script 包裹的 TUI，detached 独立进
-// 程组，与短命的巡检进程在进程层早就分开。
+// 程组，与短命的巡检进程在进程层早就分开。一个预热会话只服务一个任务
+// （归属靠任务文件盖印，不靠命令行），日志名因此带任务 id。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -43,12 +44,26 @@ export function trackedAlive(ent) {
 
 // 日志文件名折法：下划线转义必须在斜杠折叠之前——/a/b → a_b，
 // /a_b → a__b，两类路径才不会共用同一个日志文件（script(1) 启动即截断，
-// 撞名意味着两个工作区互相覆盖记录）。
-export function sessionLogPath(ws) {
-  const slug = ws.replace(/^\/+|\/+$/g, '')
+// 撞名意味着两个工作区互相覆盖记录）。logs 命令按工作区前缀找日志时也
+// 用同一个折法。
+export function slugSegment(s) {
+  return String(s).replace(/^\/+|\/+$/g, '')
     .replace(/_/g, '__')
     .replace(/\//g, '_');
-  return path.join(deps.paths.sessionLogDir, `${slug}.log`);
+}
+
+// 每个任务的预热会话有独立日志：<工作区slug>--<任务键>.log。-- 分隔，任
+// 务键是 8 位十六进制或 anon:<16 位十六进制>。
+export function sessionLogPath(ws, taskId) {
+  return path.join(deps.paths.sessionLogDir,
+    `${slugSegment(ws)}--${slugSegment(taskId)}.log`);
+}
+
+// 文件名是否为新命名（任务级）的预热日志。升级轮清扫旧版目录级命名的孤
+// 儿 script 进程时用它区分两代：任务键段的严格形状让旧命名（纯工作区
+// slug）几乎不可能误判为新命名。
+export function isTaskSessionLogName(name) {
+  return /--(?:[0-9a-f]{8}|anon:[0-9a-f]{16})\.log$/.test(name);
 }
 
 // POSIX shell 引用：安全字符白名单内原样返回，否则单引号包裹，内部单引
@@ -94,14 +109,14 @@ export function rotateOnce(file) {
   fs.renameSync(file, old);
 }
 
-// 拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
-export function spawnSession(ws) {
-  const logPath = sessionLogPath(ws);
+// 为一个任务拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
+export function spawnSession(ws, taskId) {
+  const logPath = sessionLogPath(ws, taskId);
+  // 会话日志目录 700（README 承诺）：每任务独立文件，目录只在此处创建。
   ensurePrivateDir(path.dirname(logPath));
-  // window 模式下「一代会话 = 一次执行」：script(1) 打开即截断，不轮转的
-  // 话上一代（上一次任务执行）的界面记录会随本次拉起被抹掉。无条件保留
-  // 一代（.1）——总量上界两代，活着的一代增长再快也只影响自身，不会经
-  // 轮转放大。
+  // 「一代会话 = 一次执行」：script(1) 打开即截断，不轮转的话上一代（上
+  // 一次执行）的界面记录会随本次拉起被抹掉。无条件保留一代（.1）——总
+  // 量上界两代，活着的一代增长再快也只影响自身，不会经轮转放大。
   try {
     if (fs.existsSync(logPath)) rotateOnce(logPath);
   } catch {
@@ -127,7 +142,7 @@ export function spawnSession(ws) {
   // 但错误原因要留进巡检日志——spawn 同步返回成功、子进程 exec 阶段才失败
   // （ENOENT/EAGAIN 等）时，上层只能看到会话随后死亡，没有任何原因可查。
   child.on('error', (e) => {
-    deps.log(`会话进程拉起异常 ${ws}：${e?.code ? `${e.code}：` : ''}`
+    deps.log(`会话进程拉起异常 ${ws} 任务 ${taskId}：${e?.code ? `${e.code}：` : ''}`
       + `${e?.message ?? e}`);
   });
   child.unref();
@@ -138,7 +153,9 @@ export function spawnSession(ws) {
 }
 
 // 按进程组结束我们拉起的会话。发信号前先核身份：state 条目可能比它命名
-// 的进程活得久，给回收 pid 发组信号会杀掉无关进程组。
+// 的进程活得久，给回收 pid 发组信号会杀掉无关进程组。detached（用户
+// resume 接管）时 trackedAlive 为 false：本函数直接返回，绝不碰用户的裸
+// claude。
 export async function stopSession(ent) {
   if (!deps.trackedAlive(ent)) return;
   const pid = ent.pid;
@@ -163,8 +180,8 @@ export async function stopSession(ent) {
 }
 
 // typescript 多少秒没被写。文件缺失读作「没有任何活动证据」：Infinity 大
-// 于任何静默阈值，天然不挡换代与回收（哨兵值曾绑定 SESSION_IDLE_SECONDS
-// + 1，阈值调低后会悄悄翻转语义）。
+// 于任何静默阈值，天然不挡回收（哨兵值曾绑定固定阈值 + 1，阈值调低后会
+// 悄悄翻转语义）。
 export function sessionLogIdleSeconds(logPath, cur) {
   try {
     return Math.max(0, cur - Math.floor(fs.statSync(logPath).mtimeMs / 1000));
@@ -174,7 +191,7 @@ export function sessionLogIdleSeconds(logPath, cur) {
 }
 
 // 进程表是 state.json 丢失时的兜底：被遗忘的预热会话卡在提问界面时不会出
-// 现在会话登记里，没这层交叉检查就会在同目录堆第二个 TUI。
+// 现在会话登记里，没这层交叉检查就会为同一任务堆第二个 TUI。
 export function listScriptProcesses() {
   const r = deps.execFile('/bin/ps', ['-axo', 'pid=,args='], { timeout: 5000 });
   const out = [];

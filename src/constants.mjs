@@ -1,41 +1,25 @@
 // 全部调参常量集中一处，改动时便于通盘核对。
 
+// 配置文件只有 roots 一个字段：巡检间隔、提前量、扫描深度、续期、改 id、
+// 任务归属盖印都是不可关闭的唯一行为（见 README），常量化在本文件。
 export const DEFAULT_CONFIG = {
-  // 默认只扫本人的三个任务制容器（两层深覆盖 <容器>/<仓>及其一级子目录），
-  // 不扫整个家目录——他人可写仓库里的周期任务会被自动续期永久化，默认范围
-  // 必须是用户完全掌控的领地（见 README 安全说明）。其他布局用 --roots 覆
-  // 盖；目录不存在则跳过。
+  // 默认只扫本人的三个任务制容器，不扫整个家目录——他人可写仓库里的周期
+  // 任务会被自动续期永久化，默认范围必须是用户完全掌控的领地（见 README
+  // 安全说明）。其他布局用 cron-up install --roots 覆盖；目录不存在则跳过。
   roots: ['~/space', '~/workspace', '~/tasks'],
-  maxDepth: 2,
-  intervalSeconds: 300,
-  leadSeconds: 600,
-  // 每轮巡检给周期任务补 permanent 标记，绕开 Claude Code 的 7 天周期任务
-  // 过期。loadConfig 会用默认值补缺键，所以安装或升级后的首轮会把旧任务
-  // 全部补标。配置里 autoRenew:false 可关（下轮生效），或安装时
-  // --no-auto-renew。
-  autoRenew: true,
-  // 每轮巡检把周期任务的 id 改写成小哈希值，把投递抖动压到
-  // AUTO_MIN_ID_TARGET_DELAY_MS 以内（每日任务约 1 分钟），观感近乎准点。
-  // 只改显式周期任务、只分配文件内空号、幂等。配置 autoMinId:false 可关，
-  // 或安装时 --no-auto-min-id。机制见 CC_JITTER 与 findings 主题
-  // claude-code-scheduled-task-jitter。
-  autoMinId: true,
-  // 会话保留策略：'window'（默认）——会话生命周期对齐「一次执行」：任务
-  // 触发过、执行完毕且距下次需要还有余量即回收，下次窗口重拉，任务之间
-  // 上下文不互相累积；'always'——旧常驻行为，执行间隔里也保留会话，仅受
-  // 7 天超龄换代约束。
-  sessionRetain: 'window',
-  // 任务归属改写：默认关，维持「同目录有会话就不双开」的旧行为。开启后，
-  // 即使用户本人的交互会话在场，也另拉独立预热会话，并把投递窗口内任务的
-  // createdBySessionId/createdByPid/createdByProcStart 三字段改写成预热会话
-  // ——任务按 Claude Code 自身的「创建者会话铁拿」规则投到预热会话，用户
-  // 会话主动不碰；预热死亡则自动滑回原生的死者接管规则。依赖 Claude Code
-  // 未公开的任务文件字段与进程父子关系，见 README「任务归属预热」。
-  stampOwner: false,
 };
 
+// launchd 两轮巡检之间的秒数（plist 的 StartInterval）。
+export const INTERVAL_SECONDS = 300;
+// 提前多少秒为窗口内任务备好会话：覆盖两轮巡检（本轮发现、下轮盖印），任
+// 何任务最迟在执行前一轮被发现；会话登记本身只需约 10 秒。
+export const LEAD_SECONDS = 600;
+// 工作区发现的最大递归深度（相对 roots）：深度 3 覆盖
+// <容器>/<仓>/<子目录>/<孙目录> 里的任务文件。
+export const MAX_SCAN_DEPTH = 3;
+
 // 预热会话连续三次启动后死亡，大概率是环境坏了（缺信任、env 不对），退避
-// 而不是每 5 分钟无限重拉。
+// 而不是每轮无限重拉。
 export const FAIL_LIMIT = 3;
 export const COOLDOWN_SECONDS = 1800;
 // 失败计数随死条目保留的时长。提前窗口通常只覆盖一两轮巡检（每小时任务
@@ -50,20 +34,16 @@ export const PID_T_MAX = 2 ** 31 - 1;
 // 健康会话约 10 秒内完成登记。超时仍存活却没登记，是卡在无人应答的提问
 // 界面（目录信任、工具授权）；只看存活会把它当健康，只有这个时限兜得住。
 export const WARMUP_GRACE_SECONDS = 180;
-// 预热会话是缓存不是宠物：「永久」任务让它无限常驻会把它钉死在启动当天的
-// claude 版本和不断增长的 typescript 上。超龄会话仅在日志静默一段时间后
-// 才退役——日志安静是没有任务在执行的证据，运行中的任务绝不会被切掉。
-export const SESSION_MAX_AGE_SECONDS = 7 * 86400;
-export const SESSION_IDLE_SECONDS = 3600;
-// window 模式回收判据一：界面静默超过此时长视为「本次执行已结束」。TUI
-// 工作时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；取
-// WARMUP_GRACE 同值，结构上对齐「3 分钟定生死」的既有心智（调一个跟着
-// 动）。
+// window 回收判据一：界面静默超过此时长视为「本任务已执行完」。TUI 工作
+// 时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；取
+// WARMUP_GRACE 同值，结构上对齐「3 分钟定生死」的既有心智。
 export const SESSION_RECYCLE_IDLE_SECONDS = WARMUP_GRACE_SECONDS;
-// window 模式回收判据二：距下次「需要会话在场」的时刻至少还有这么多秒。
-// 回收后同轮重拉的新会话约 10 秒完成登记，余量保的是登记抖动；更近的触
-// 发直接复用现有会话（时间紧邻的任务共享）。
+// window 回收判据二：距该任务下次「需要会话在场」至少还有这么多秒。回收
+// 后要经「下轮重拉 → 新会话登记 → 再下轮盖印」两步，任务才重新铁定投到
+// 新预热：一个巡检间隔加登记抖动余量。更近的触发不回收，复用现有会话。
 export const SESSION_FIRE_MARGIN_SECONDS = 120;
+export const SESSION_RECYCLE_MARGIN_SECONDS =
+  SESSION_FIRE_MARGIN_SECONDS + INTERVAL_SECONDS;
 // 巡检日志每轮两行心跳加零星事件，跑几年的机器也该有上限。launchd 每次按
 // 路径重开，轮初改名是安全的：本轮 fd 继续写改名后的 inode，下轮开新文件。
 export const PATROL_LOG_ROTATE_BYTES = 1024 * 1024;
@@ -82,7 +62,7 @@ export const PRUNE_DIRS = new Set([
 
 // Claude Code 会话投递定时任务时的抖动参数，两处使用：list/总览预测
 // 「预计实际触发时间」；巡检把「落点之后、延迟投递点之前」这段投递尾窗
-// 也算作需要会话在场，避免 window 模式在任务真正投递前回收会话。逆向自
+// 也算作需要会话在场，避免在任务真正投递前把预热回收。逆向自
 // Claude Code v2.1.285
 // （darwin-arm64 原生二进制，2026-09-30 安装）内部 createCronScheduler 的
 // gV 默认值：周期任务 fire = 落点 + min(hash(id)·recurringFrac·周期,

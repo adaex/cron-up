@@ -8,7 +8,8 @@ import {
   processShape,
   processParentMap,
   ancestorChain,
-  classifyWorkspace,
+  claimWarm,
+  sessionAliveNow,
   liveSessionIds,
   creatorSessionAlive,
 } from '../src/registry.mjs';
@@ -44,7 +45,7 @@ test('live claude consumers; dead and other kinds ignored', async (t) => {
   writeReg('a.json', 101, fs.realpathSync(tmp));
   writeReg('dead.json', 999, '/nowhere/dead');
   writeReg('other.json', 202, '/nowhere/x', 'some-other');
-  const [consumers, alert, details] = await scanSessions({ lineage: true });
+  const [consumers, alert, details] = await scanSessions();
   assert.deepEqual(consumers, new Set([fs.realpathSync(tmp)]));
   assert.equal(alert, null);
   const list = details.get(fs.realpathSync(tmp));
@@ -117,7 +118,7 @@ test('live non-claude process alerts', async (t) => {
 
 test('malformed pid entries are skipped', async (t) => {
   // 必须用真实存活判定跑——这几道关是 scanSessions 唯一的防线。损坏登记
-  // （如裸 Infinity 过不了 JSON.parse）一律按「读不进有效 pid 而跳过」。
+  // 一律按「读不进有效 pid 而跳过」。
   const { tmp, deps, parents, writeReg } = await setup(t);
   const me = process.pid;
   deps.alive = (p) => p === me;
@@ -276,12 +277,12 @@ test('ancestorChain walks to launchd, flags broken chains', () => {
   assert.deepEqual(ancestorChain(30, full),
     { ancestors: [20, 10, 1], chainComplete: true });
 
-  // 中间代在快照里缺失：链断在 20，不能宣称「10 不在祖先里」。
+  // 中间代在快照里缺失：链断在 20。
   const broken = new Map([[30, 20], [10, 1], [1, 0]]);
   assert.deepEqual(ancestorChain(30, broken),
     { ancestors: [20], chainComplete: false });
 
-  // 无快照：空链、断链（调用方按全歧义处理）。
+  // 无快照：空链、断链。
   assert.deepEqual(ancestorChain(30, null),
     { ancestors: [], chainComplete: false });
 
@@ -306,7 +307,7 @@ test('details group sessions by cwd with identity fields', async (t) => {
   // writeReg 默认把消费者挂 launchd 下，之后再改成生产三代链：
   // 30：script(10) → zsh(20) → claude(30)；40 保持 1 → claude(40)。
   parents.set(30, 20); parents.set(20, 10); parents.set(10, 1);
-  const [consumers, alert, details] = await scanSessions({ lineage: true });
+  const [consumers, alert, details] = await scanSessions();
   assert.equal(alert, null);
   assert.deepEqual(consumers, new Set([ws]));
   const byPid = new Map(details.get(ws).map((d) => [d.pid, d]));
@@ -318,121 +319,138 @@ test('details group sessions by cwd with identity fields', async (t) => {
   assert.deepEqual(byPid.get(40).ancestors, [1]);
 });
 
-test('broken lineage raises the fourth smoke alert', async (t) => {
+test('broken lineage is quiet: consumer kept with empty chain and no alert', async (t) => {
   const { tmp, deps, live, claude, parents, writeReg } = await setup(t);
   const ws = fs.realpathSync(tmp);
   live.add(30);
   claude.add(30);
   writeReg('warm.json', 30, ws);
-  // writeReg 默认补 pid→1，这里再挖掉：全量快照里没有 30，per-pid ps
-  // 也读不到 ppid——scanSessions 应计为退化并告警。
+  // 全量快照里没有 30，per-pid ps 也读不到 ppid：祖先链断。任务级模型
+  // 不再为此告警——认亲下轮再试，consumers 判定不受影响。
   parents.delete(30);
   deps.processShape = () => ({ isClaude: true, ppid: null });
-  const [consumers, alert, details] = await scanSessions({ lineage: true });
-  assert.deepEqual(consumers, new Set([ws])); // 消费者判定不受影响
-  assert.ok(alert);
-  assert.ok(alert.includes('父子关系'));
+  const [consumers, alert, details] = await scanSessions();
+  assert.deepEqual(consumers, new Set([ws]));
+  assert.equal(alert, null);
+  assert.deepEqual(details.get(ws)[0].ancestors, []);
   assert.equal(details.get(ws)[0].chainComplete, false);
 });
 
-test('lineage off: no details, no parent snapshot, no lineage alert', async (t) => {
-  const { tmp, deps, live, claude, parents, writeReg } = await setup(t);
+test('null parent map yields empty chains without alerting', async (t) => {
+  const { tmp, deps, live, claude, writeReg } = await setup(t);
   const ws = fs.realpathSync(tmp);
   live.add(30);
   claude.add(30);
   writeReg('warm.json', 30, ws);
-  parents.delete(30); // 即使链是断的
-  deps.processShape = () => ({ isClaude: true, ppid: null });
-  let snapShots = 0;
-  deps.processParentMap = () => { snapShots += 1; return new Map(); };
+  deps.processParentMap = () => null;
   const [consumers, alert, details] = await scanSessions();
   assert.deepEqual(consumers, new Set([ws]));
-  assert.equal(alert, null, '功能未开启时退化不告警');
-  assert.deepEqual(details, new Map());
-  assert.equal(snapShots, 0, '不拍全机父表');
+  assert.equal(alert, null);
+  assert.deepEqual(details.get(ws)[0].ancestors, []);
+  assert.equal(details.get(ws)[0].chainComplete, false);
 });
 
-// ---- classifyWorkspace：stampOwner 的认亲结论 ----
+// ---- claimWarm：script pid → 登记详情的认亲 ----
 
-function detail(over = {}) {
+function claimDetail(over = {}) {
   return {
     pid: 30, sessionId: 's', procStart: 'start',
     ancestors: [1], chainComplete: true, ...over,
   };
 }
 
-test('classifyWorkspace: own warm session recognised by ancestor pid', () => {
-  const details = new Map([['/w', [detail({ ancestors: [20, 10, 1] })]]]);
-  const v = classifyWorkspace(details, '/w', 10, false);
-  assert.equal(v.kind, 'own');
-  assert.equal(v.target.sessionId, 's');
-});
-
-test('classifyWorkspace: own but identity incomplete gives no target', () => {
-  const details = new Map([['/w', [detail({ sessionId: null })]]]);
-  const v = classifyWorkspace(details, '/w', 1, false);
-  assert.equal(v.kind, 'own');
-  assert.equal(v.target, null, '在场但本轮不能盖印');
-});
-
-test('classifyWorkspace: live creator is respected over a foreign user session', () => {
-  const foreign = new Map([['/w', [
-    detail({ pid: 30, sessionId: 'creator-sid', ancestors: [1] }),
-  ]]]);
-  // 活本代 pid 但链里没有它，且窗口任务的创建者会话还活着：creatorAlive
-  // 优先于 user/ambiguous，不另拉。
-  assert.equal(classifyWorkspace(foreign, '/w', 10, true).kind,
-    'creatorAlive');
-  // 同一个现场但创建者已死：才落回 user。
-  assert.equal(classifyWorkspace(foreign, '/w', 10, false).kind, 'user');
-  // 没有活本代（首轮）同理。
-  assert.equal(classifyWorkspace(foreign, '/w', null, true).kind,
-    'creatorAlive');
-  assert.equal(classifyWorkspace(foreign, '/w', null, false).kind, 'user');
-});
-
-test('classifyWorkspace: own takes precedence over live-creator flag', () => {
-  // 已盖印给本代预热的任务，其 owner 就是预热自己——两态同时成立，own
-  // 必须优先（target 还要继续供盖印判定）。
-  const details = new Map([['/w', [detail({ ancestors: [20, 10, 1] })]]]);
-  const v = classifyWorkspace(details, '/w', 10, true);
-  assert.equal(v.kind, 'own');
-  assert.ok(v.target);
-});
-
-test('classifyWorkspace: dead entry or foreign chain falls back to user/ambiguous', () => {
-  const foreign = new Map([['/w', [detail({ ancestors: [1] })]]]);
-  // 给了 ownPid 但链里没有它、创建者也不活：user。
-  assert.equal(classifyWorkspace(foreign, '/w', 10, false).kind, 'user');
-  // 没有活本代（死条目不传 pid）。
-  assert.equal(classifyWorkspace(foreign, '/w', null, false).kind, 'user');
-});
-
-test('classifyWorkspace: broken chain is ambiguous even with a live own pid', () => {
+test('claimWarm matches the registration whose ancestor chain contains the script pid', () => {
   const details = new Map([['/w', [
-    detail({ pid: 30, ancestors: [], chainComplete: false }),
+    claimDetail({ pid: 40, sessionId: 'other', ancestors: [1] }),
+    claimDetail({ pid: 30, sessionId: 'sess-warm',
+      ancestors: [20, 10, 1] }),
   ]]]);
-  assert.equal(classifyWorkspace(details, '/w', 10, false).kind, 'ambiguous');
-  // 认亲命中优先于歧义：自己的预热链完整时，别的断链会话不影响结论。
-  details.get('/w').push(detail({ pid: 31, ancestors: [20, 10, 1] }));
-  assert.equal(classifyWorkspace(details, '/w', 10, false).kind, 'own');
+  // script pid 是 10（链 [zsh 20, script 10, launchd 1]）。
+  const d = claimWarm(details, '/w', 10);
+  assert.equal(d.sessionId, 'sess-warm');
+  assert.equal(d.pid, 30);
 });
 
-test('classifyWorkspace: missing workspace is a plain user verdict', () => {
-  assert.deepEqual(classifyWorkspace(new Map(), '/w', null, false),
-    { kind: 'user', target: null });
-  assert.deepEqual(classifyWorkspace(new Map(), '/w', null, true),
-    { kind: 'creatorAlive', target: null });
+test('claimWarm returns null when no ancestor chain contains the pid', () => {
+  const details = new Map([['/w', [claimDetail({ ancestors: [1] })]]]);
+  assert.equal(claimWarm(details, '/w', 10), null);
 });
+
+test('claimWarm returns null for an unknown workspace', () => {
+  const details = new Map([['/w', [claimDetail({ ancestors: [20, 10, 1] })]]]);
+  assert.equal(claimWarm(details, '/elsewhere', 10), null);
+  assert.equal(claimWarm(new Map(), '/w', 10), null);
+});
+
+// ---- sessionAliveNow：轮末死亡复核的轻量存活检查 ----
+
+async function aliveSetup(t) {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  const live = new Set();
+  deps.alive = (pid) => live.has(pid);
+  return { tmp, deps, live };
+}
+
+test('sessionAliveNow: live registration matching sid and cwd', async (t) => {
+  const { tmp, deps, live } = await aliveSetup(t);
+  live.add(101);
+  writeJson(path.join(deps.paths.sessionDir, 'a.json'), {
+    kind: 'interactive', pid: 101, sessionId: 'sid-x',
+    cwd: fs.realpathSync(tmp),
+  });
+  assert.equal(sessionAliveNow('sid-x', fs.realpathSync(tmp)), true);
+  // 不给 ws：只看 sid 活不活。
+  assert.equal(sessionAliveNow('sid-x'), true);
+});
+
+test('sessionAliveNow: dead pid does not count', async (t) => {
+  const { tmp, deps } = await aliveSetup(t);
+  writeJson(path.join(deps.paths.sessionDir, 'a.json'), {
+    kind: 'interactive', pid: 999, sessionId: 'sid-x',
+    cwd: fs.realpathSync(tmp),
+  });
+  assert.equal(sessionAliveNow('sid-x', fs.realpathSync(tmp)), false);
+});
+
+test('sessionAliveNow: mismatched cwd does not count', async (t) => {
+  const { tmp, deps, live } = await aliveSetup(t);
+  live.add(101);
+  writeJson(path.join(deps.paths.sessionDir, 'a.json'), {
+    kind: 'interactive', pid: 101, sessionId: 'sid-x',
+    cwd: fs.realpathSync(tmp),
+  });
+  assert.equal(sessionAliveNow('sid-x', '/somewhere/else'), false);
+});
+
+test('sessionAliveNow: half-written json is skipped and bad sid is false', async (t) => {
+  const { deps, live } = await aliveSetup(t);
+  live.add(101);
+  fs.writeFileSync(path.join(deps.paths.sessionDir, 'bad.json'), '{ truncated');
+  writeJson(path.join(deps.paths.sessionDir, 'ok.json'), {
+    kind: 'interactive', pid: 101, sessionId: 'sid-ok', cwd: '/a',
+  });
+  assert.equal(sessionAliveNow('sid-missing'), false);
+  assert.equal(sessionAliveNow(123), false);
+});
+
+test('sessionAliveNow: missing session directory is false', async (t) => {
+  const { deps } = await aliveSetup(t);
+  deps.paths = { ...deps.paths, sessionDir: '/nonexistent/cron-up-sess-dir' };
+  assert.equal(sessionAliveNow('sid-x', '/a'), false);
+});
+
+// ---- 活会话集合与逐任务创建者谓词 ----
 
 test('liveSessionIds lists only string session ids of the workspace', () => {
   const details = new Map([
     ['/w', [
-      detail({ pid: 1, sessionId: 'a' }),
-      detail({ pid: 2, sessionId: null }),
-      detail({ pid: 3, sessionId: 'b' }),
+      claimDetail({ pid: 1, sessionId: 'a' }),
+      claimDetail({ pid: 2, sessionId: null }),
+      claimDetail({ pid: 3, sessionId: 'b' }),
     ]],
-    ['/other', [detail({ pid: 4, sessionId: 'c' })]],
+    ['/other', [claimDetail({ pid: 4, sessionId: 'c' })]],
   ]);
   assert.deepEqual([...liveSessionIds(details, '/w')].sort(), ['a', 'b']);
   assert.deepEqual([...liveSessionIds(details, '/nope')], []);

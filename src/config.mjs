@@ -62,48 +62,21 @@ export function parsePid(v) {
   return pid > 0 && pid <= PID_T_MAX ? pid : null;
 }
 
-// 配置字段的类型规则，loadConfig 与 install --force 继承旧配置共用。返回
-// [字段名, 人话错误][]：手改把字段写坏时绝不静默回退——回退的两个可能方向
-// （roots 坏 → 回扫整个家目录、autoRenew 坏 → 回开续期）都比停机更危险。
+// 配置只有 roots 一个字段：手改写坏它时绝不静默回退——回退成空数组是
+// 「形同空转」，回退成默认家目录扫描则会动到用户没打算纳入的仓库，两个
+// 方向都比停机更危险。
 export function configFieldErrors(cfg) {
-  const errs = [];
   if (!Array.isArray(cfg.roots)) {
-    errs.push(['roots', `roots 应是字符串数组，当前为 ${JSON.stringify(cfg.roots)}`]);
+    return [['roots', `roots 应是字符串数组，当前为 ${JSON.stringify(cfg.roots)}`]];
   }
-  if (!isInt(cfg.maxDepth) || cfg.maxDepth < 0) {
-    errs.push(['maxDepth', `maxDepth 应是非负整数，当前为 ${JSON.stringify(cfg.maxDepth)}`]);
-  }
-  if (!isInt(cfg.intervalSeconds) || cfg.intervalSeconds <= 0) {
-    errs.push(['intervalSeconds',
-      `intervalSeconds 应是正整数秒，当前为 ${JSON.stringify(cfg.intervalSeconds)}`]);
-  }
-  if (!isInt(cfg.leadSeconds) || cfg.leadSeconds < 0) {
-    errs.push(['leadSeconds',
-      `leadSeconds 应是非负整数秒，当前为 ${JSON.stringify(cfg.leadSeconds)}`]);
-  }
-  if (typeof cfg.autoRenew !== 'boolean') {
-    errs.push(['autoRenew',
-      `autoRenew 应是布尔值（true/false），当前为 ${JSON.stringify(cfg.autoRenew)}`]);
-  }
-  if (typeof cfg.autoMinId !== 'boolean') {
-    errs.push(['autoMinId',
-      `autoMinId 应是布尔值（true/false），当前为 ${JSON.stringify(cfg.autoMinId)}`]);
-  }
-  if (cfg.sessionRetain !== 'window' && cfg.sessionRetain !== 'always') {
-    errs.push(['sessionRetain',
-      `sessionRetain 应是 "window" 或 "always"，当前为 ${JSON.stringify(cfg.sessionRetain)}`]);
-  }
-  if (typeof cfg.stampOwner !== 'boolean') {
-    errs.push(['stampOwner',
-      `stampOwner 应是布尔值（true/false），当前为 ${JSON.stringify(cfg.stampOwner)}`]);
-  }
-  return errs;
+  return [];
 }
 
 // opts.missingOk：缺失文件把异常抛给调用方（总览页把「缺失」当页面内容的
-// 一部分）；opts.corruptOk：损坏 JSON/顶层非对象/字段类型错抛普通错误而非
-// exit（总览页把它们当页面内容展示）。launchd 的 run 入口两个都不要——它
-// 该死成一行原因而不是 traceback。
+// 一部分）；opts.corruptOk：损坏 JSON/顶层不是对象/roots 类型错抛普通错
+// 误而非 exit（总览页把它们当页面内容展示）。launchd 的 run 入口两个都不
+// 要——它该死成一行原因而不是 traceback。配置里的其余键（旧版本留下的
+// intervalSeconds 等）一律忽略：行为已全部常量化，install 重写时纯化。
 export function loadConfig(file, opts = {}) {
   const fail = (message) => {
     if (opts.corruptOk) throw new Error(message);
@@ -123,26 +96,67 @@ export function loadConfig(file, opts = {}) {
     throw new ExitError(2, `配置文件不是合法 JSON：${file}\n  ${e.message}`);
   }
   if (!isPlainObject(cfg)) {
-    // 合法 JSON 但顶层不是对象（123、["a"]）：与「不是合法 JSON」同等对待。
-    // 单行消息：总览页按宽度截断展示，断行会失去告警前缀。
     fail(`配置文件顶层应是 JSON 对象而不是${Array.isArray(cfg) ? '数组' : typeof cfg}：`
       + `${file}；运行 cron-up install 生成，或用 --config 指定路径`);
   }
   const merged = { ...DEFAULT_CONFIG, ...cfg };
   const errs = configFieldErrors(merged);
   if (errs.length > 0) {
-    // 单行消息（字段在前、修复指引在后）：总览页按宽度截断展示，截尾只
-    // 伤修复指引，不伤字段清单。
     fail(`配置字段类型不对：${errs.map(([, m]) => m).join('；')}`
-      + `；修复 ${file} 或重跑 cron-up install --force`);
+      + `；修复 ${file} 或重跑 cron-up install`);
   }
-  merged.roots = normalizeRoots(merged.roots);
-  return merged;
+  return { roots: normalizeRoots(merged.roots) };
 }
 
-// 自己的文件也可能被手改或截断：非对象读成「没有 state」，数值字段入口处
-// 整型化并卡范围——否则 kill 收到字符串会抛、负数 pid 会被当成进程组号
-// 误伤无辜进程组、超 pid_t 上界的整数直到 kill 才炸。
+// ---- state.json：两级嵌套 {ws: {taskId: entry}} ----
+//
+// entry 字段：pid/procStart（script 层指纹）、claudePid/sessionId/
+// claudeProcStart（认亲后回填）、startedAt、fails、cooldownUntil、
+// deadSince、log、notified。pid 为 null 的条目是「当场没拉起/冷却中」的
+// 合法形态；未认亲时 claude* 三字段缺省。
+
+// 旧版顶层标记字段：旧 state 是 {ws: entry}，新 state 是 {ws: {taskId:
+// entry}}。taskId 只可能是 8 位十六进制或 anon: 前缀，永不与这些名字冲
+// 突，因此「顶层值自身是否带 entry 标记」就是两代形状的区分判据。
+const LEGACY_MARKERS = ['pid', 'startedAt', 'cooldownUntil', 'fails'];
+
+function cleanEntry(raw, ws, taskId) {
+  if (!isPlainObject(raw)) return null;
+  const ent = { ...raw };
+  ent.pid = parsePid(ent.pid);
+  if (ent.claudePid !== undefined) {
+    const claudePid = parsePid(ent.claudePid);
+    if (claudePid === null) delete ent.claudePid;
+    else ent.claudePid = claudePid;
+  }
+  for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince']) {
+    if (ent[k] !== null && ent[k] !== undefined) {
+      try {
+        ent[k] = lenientInt(ent[k]);
+      } catch {
+        delete ent[k];
+      }
+    }
+  }
+  // 身份字符串：存在就必须是非空字符串，否则删掉（ws/taskId 随即用键补
+  // 回）。
+  for (const k of ['ws', 'taskId', 'sessionId', 'log', 'procStart',
+    'claudeProcStart']) {
+    if (ent[k] !== undefined
+        && (typeof ent[k] !== 'string' || ent[k] === '')) {
+      delete ent[k];
+    }
+  }
+  if (typeof ent.notified !== 'boolean') delete ent.notified;
+  ent.ws = ws;
+  ent.taskId = taskId;
+  return ent;
+}
+
+function looksLegacyEntry(v) {
+  return isPlainObject(v) && LEGACY_MARKERS.some((k) => k in v);
+}
+
 export function loadState() {
   let state;
   try {
@@ -152,20 +166,38 @@ export function loadState() {
   }
   if (!isPlainObject(state)) return {};
   const out = {};
-  for (const [ws, raw] of Object.entries(state)) {
-    if (!isPlainObject(raw)) continue;
-    const ent = { ...raw };
-    ent.pid = parsePid(ent.pid);
-    for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince']) {
-      if (ent[k] !== null && ent[k] !== undefined) {
-        try {
-          ent[k] = lenientInt(ent[k]);
-        } catch {
-          delete ent[k];
-        }
-      }
+  for (const [ws, bucket] of Object.entries(state)) {
+    // 旧版顶层 entry 不是桶：跳过（由 loadLegacyEntries 收口处理）。
+    if (!isPlainObject(bucket) || looksLegacyEntry(bucket)) continue;
+    const cleanBucket = {};
+    for (const [taskId, raw] of Object.entries(bucket)) {
+      const ent = cleanEntry(raw, ws, taskId);
+      if (ent) cleanBucket[taskId] = ent;
     }
-    out[ws] = ent;
+    if (Object.keys(cleanBucket).length > 0) out[ws] = cleanBucket;
+  }
+  return out;
+}
+
+// 旧版扁平 state（{ws: 目录级单 entry}）：升级轮用它停掉旧预热后整体丢
+// 弃，不迁移任务归属（新流程按任务重拉）。与 loadState 读同一个文件，
+// 两个读取器按标记字段互斥，互不污染。
+export function loadLegacyEntries() {
+  let state;
+  try {
+    state = JSON.parse(fs.readFileSync(deps.paths.statePath, 'utf-8'));
+  } catch {
+    return [];
+  }
+  if (!isPlainObject(state)) return [];
+  const out = [];
+  for (const [ws, raw] of Object.entries(state)) {
+    if (!looksLegacyEntry(raw)) continue;
+    const ent = cleanEntry(raw, ws, null);
+    if (ent) {
+      delete ent.taskId; // 旧 entry 没有任务身份
+      out.push(ent);
+    }
   }
   return out;
 }
@@ -237,14 +269,6 @@ export function validateConfig(cfg, announce = () => {}) {
   const warnings = [];
   if (!cfg.roots || cfg.roots.length === 0) {
     warnings.push('扫描目录 roots 为空：巡检不会发现任何工作区，cron-up 形同空转');
-  }
-  const interval = cfg.intervalSeconds;
-  const lead = cfg.leadSeconds;
-  if (isInt(interval) && isInt(lead) && interval > 0 && lead >= 0
-      && lead < interval) {
-    warnings.push(
-      `leadSeconds=${lead} 小于 intervalSeconds=${interval}：任务可能在`
-      + '两轮巡检之间到期而来不及提前启动会话，建议 lead ≥ interval');
   }
   for (const root of cfg.roots ?? []) {
     if (!isDir(root)) warnings.push(`扫描目录不存在，巡检不会覆盖它：${root}`);

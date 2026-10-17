@@ -8,6 +8,7 @@ import path from 'node:path';
 import '../src/index.mjs';
 import { deps } from '../src/internals.mjs';
 import { makePaths } from '../src/paths.mjs';
+import { TASK_REL } from '../src/paths.mjs';
 
 // 创建 realpath 后的临时目录（macOS /tmp 是 /private/tmp 的符号链接）。
 export function mkTmp(t) {
@@ -16,8 +17,7 @@ export function mkTmp(t) {
   return dir;
 }
 
-// 快照整个 deps 容器，测试结束后还原（t.after 注册清理）。paths 是带
-// getter 的对象，保存引用即可——测试通常整体替换 deps.paths。
+// 快照整个 deps 容器，测试结束后还原（t.after 注册清理）。
 export function mockDeps(t) {
   const snapshot = {};
   for (const k of Object.keys(deps)) snapshot[k] = deps[k];
@@ -28,14 +28,10 @@ export function mockDeps(t) {
   return deps;
 }
 
-// 把产物路径全部重定向到 tmp：默认给一份完整 paths，测试可再覆盖单项
-// （spread 在末尾覆盖同名键；派生键此时求值固化，测试都在构造期定下
-// 前缀，不依赖事后动态跟随）。
+// 把产物路径全部重定向到 tmp。
 export function tmpPaths(tmp, overrides = {}) {
   const p = {
     ...makePaths({
-      // home 默认保持真实 HOME（expandHome 依赖它），只有显式
-      // overrides.home 才重定向。
       home: os.homedir(),
       dataDir: path.join(tmp, 'app'),
       logDir: path.join(tmp, 'logs'),
@@ -44,7 +40,6 @@ export function tmpPaths(tmp, overrides = {}) {
     }),
     ...overrides,
   };
-  // 派生目录建出来，测试直接写 statePath/configPath 不会 ENOENT。
   fs.mkdirSync(p.dataDir, { recursive: true });
   fs.mkdirSync(p.logDir, { recursive: true });
   fs.mkdirSync(p.sessionDir, { recursive: true });
@@ -60,7 +55,51 @@ export function writeJson(file, data) {
   fs.writeFileSync(file, JSON.stringify(data));
 }
 
-// scanSessions 的三元组 mock：绝大多数用例不关心告警与详情。
-export function scanResult(consumers = new Set(), details = new Map()) {
-  return [consumers, null, details];
+// ---- 任务文件夹具 ----
+
+// 在临时工作区落盘任务文件，返回任务文件路径。
+export function writeTaskFile(ws, tasks) {
+  const file = path.join(ws, TASK_REL);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify({ tasks }, null, 2));
+  return file;
+}
+
+// 标准周期任务（默认每分钟匹配，恒在窗口内）。
+export function makeTask(over = {}) {
+  return {
+    id: over.id ?? '00000001',
+    cron: over.cron ?? '*/5 * * * *',
+    prompt: over.prompt ?? '做一件事',
+    createdAt: over.createdAt ?? Date.now() - 3600_000,
+    recurring: over.recurring ?? true,
+    permanent: true,
+    ...over,
+  };
+}
+
+// 「距现在 offsetSec 后」的一次性 cron 五字段。
+export function cronAt(offsetSec, base = new Date()) {
+  const d = new Date(base.getTime() + offsetSec * 1000);
+  return `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
+    + `${d.getMonth() + 1} *`;
+}
+
+// ---- 会话登记夹具 ----
+
+// 构造一条会话登记详情（scanSessions 第三元素的成员形状）。
+export function sessionDetail(over = {}) {
+  return {
+    pid: over.pid ?? 100,
+    sessionId: over.sessionId ?? 'sid-1',
+    procStart: over.procStart ?? 'Fri Oct 16 06:01:20 2026',
+    ancestors: over.ancestors ?? [1],
+    chainComplete: over.chainComplete ?? true,
+  };
+}
+
+// 给定 details 构造 scanSessions 的三元组（consumers 按 details 的键集
+// 合）；告警位置传 null。
+export function scanFrom(details = new Map()) {
+  return [new Set(details.keys()), null, details];
 }

@@ -1,11 +1,11 @@
-// 命令行解析与分发。node:util parseArgs 不支持子命令、否定布尔（--no-x）
-// 与自动帮助，这里手写一层：子命令前只允许隐藏的 --config（前后都可放），
-// 定位子命令后按各命令的选项表解析。
+// 命令行解析与分发。node:util parseArgs 不支持子命令与自动帮助，这里手
+// 写一层：子命令前只允许隐藏的 --config（前后都可放），定位子命令后按
+// 各命令的选项表解析。
 
 // 先引全量入口，保证所有业务模块都已向 deps 自注册，再引命令函数。
 import './index.mjs';
 import { deps, ExitError, isDecInt } from './internals.mjs';
-import { cmdRun, cmdRenew } from './patrol.mjs';
+import { cmdRun } from './patrol.mjs';
 import { cmdInstall, cmdUninstall } from './service.mjs';
 import { cmdList } from './list.mjs';
 import { cmdOverview } from './overview.mjs';
@@ -29,16 +29,12 @@ function usageExit(message) {
 function consumeOption(tok, tokens, i, spec, opts) {
   let name;
   let inlineValue;
-  let negate = false;
   if (tok.startsWith('--')) {
     const body = tok.slice(2);
     const eq = body.indexOf('=');
     if (eq >= 0) {
       name = body.slice(0, eq);
       inlineValue = body.slice(eq + 1);
-    } else if (body.startsWith('no-') && spec.options[body.slice(3)] === 'tri') {
-      name = body.slice(3);
-      negate = true;
     } else {
       name = body;
     }
@@ -52,18 +48,8 @@ function consumeOption(tok, tokens, i, spec, opts) {
     opts[thisCamel(name)] = true;
     return i + 1;
   }
-  if (kind === 'tri') {
-    if (inlineValue !== undefined) {
-      if (inlineValue !== 'true' && inlineValue !== 'false') {
-        usageExit(`--${name} 只接受 true 或 false`);
-      }
-      opts[thisCamel(name)] = inlineValue === 'true';
-    } else {
-      opts[thisCamel(name)] = !negate;
-    }
-    return i + 1;
-  }
-  // string / int 吃一个值（内联或下一 token）。
+  // string / int 吃一个值（内联或下一 token）。int 类型现已无选项使用，
+  // 保留解析能力给未来。
   let value;
   if (inlineValue !== undefined) value = inlineValue;
   else {
@@ -124,15 +110,14 @@ export function parseCli(argv) {
   return result;
 }
 
-const USAGE = `cron-up —— 为定时任务提前备好交互会话
+const USAGE = `cron-up —— 为定时任务提前备好交互会话（一任务一会话）
 
 用法：
-  cron-up                    查看总览（服务、配置、任务、会话）
-  cron-up install            安装配置与 LaunchAgent（--roots --interval --lead --session-retain --stamp-owner --force --no-auto-renew --no-auto-min-id --no-stamp-owner）
-  cron-up uninstall          卸载（--purge 连配置日志一起删，--keep-sessions 保留后台会话）
-  cron-up list               逐个列出定时任务的设定/预计实际触发时间
-  cron-up run                执行一轮巡检（launchd 入口）
-  cron-up renew              立即给所有周期任务补 permanent 并改小 id
+  cron-up                    查看总览（服务、配置、任务、预热会话）
+  cron-up install            安装配置与 LaunchAgent（可用 --roots 指定扫描目录）
+  cron-up uninstall          卸载并结束全部预热会话（--purge 连配置日志一起删）
+  cron-up list               逐个列出定时任务的设定/预计实际触发时间与预热状态
+  cron-up run                执行一轮巡检（launchd 入口，也可手动立即跑一轮）
   cron-up logs [目录片段]    查看巡检日志或后台会话记录（-f 跟踪）
 
 升级：npm i -g cron-up@latest`;
@@ -157,8 +142,6 @@ export async function main(argv = process.argv) {
       return cmdList(args);
     case 'run':
       return cmdRun(args);
-    case 'renew':
-      return cmdRenew(args);
     case 'logs':
       return cmdLogs({ ...args, workspace: parsed.positional[0] });
   }

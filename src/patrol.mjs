@@ -1,6 +1,8 @@
-// 一轮巡检：发现工作区 → 自动续期 → 保证该有会话的地方有一个健康会话。
-// 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。状态机覆盖：失败
-// 冷却、卡死退休、超龄换代、孤儿接管、空任务回收。
+// 一轮巡检：发现工作区 → 自动维护任务文件（续期/改 id/盖印）→ 保证每个
+// 「创建者会话已死且处于预热窗口」的任务都有一个只属于它的健康会话。
+// 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。状态机覆盖：认亲、
+// 卡死退休、失败冷却、执行完回收、resume 接管脱离、孤儿认领、任务消失回
+// 收、旧版目录级 state 迁移。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,16 +13,17 @@ import {
   COOLDOWN_SECONDS,
   FAIL_TTL_SECONDS,
   WARMUP_GRACE_SECONDS,
-  SESSION_MAX_AGE_SECONDS,
-  SESSION_IDLE_SECONDS,
   SESSION_RECYCLE_IDLE_SECONDS,
-  SESSION_FIRE_MARGIN_SECONDS,
+  SESSION_RECYCLE_MARGIN_SECONDS,
   PATROL_LOG_ROTATE_BYTES,
   HEARTBEAT_STALE_FACTOR,
+  INTERVAL_SECONDS,
+  LEAD_SECONDS,
 } from './constants.mjs';
 import {
   loadConfig,
   loadState,
+  loadLegacyEntries,
   saveState,
   loadHeartbeat,
   saveHeartbeat,
@@ -31,23 +34,24 @@ import {
   maintainWorkspace,
   TaskFileChanged,
   taskFileExists,
+  taskKey,
+  taskSig,
 } from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wanted } from './cron.mjs';
 import {
   sessionLogPath,
   sessionLogIdleSeconds,
   scriptProcLogPath,
+  isTaskSessionLogName,
   rotateOnce,
 } from './sessions.mjs';
 import { TASK_REL } from './paths.mjs';
 import { elapsedZh, pad2 } from './display.mjs';
 
-// 事件类型 → 轮末汇总里的中文标签。patrolWorkspace 与 cmdRun 往同一个
-// stats 计数器里记账，平静轮也会打出「本轮无动作」。
+// 事件类型 → 轮末汇总里的中文标签。平静轮也会打出「本轮无动作」。
 const EVENT_LABELS = [
   ['spawn', '启动'],
   ['recycle', '回收'],
-  ['ageout', '换代'],
   ['exit', '自行退出'],
   ['stuck', '卡死退休'],
   ['adopt', '接管'],
@@ -159,55 +163,34 @@ export function rotatePatrolLogs() {
   }
 }
 
-// 下次「需要会话在场」的时刻（ms）：各任务下次触发的最小值；有错过待补
-// 执行的一次性任务时视为立刻需要。窗口内无安排返回 Infinity。锚点刻意取
-// cron 裸落点而非 nextDelivery 的抖动后投递时刻：落点总不晚于投递时刻，
-// 按落点算余量更小、回收更保守，是安全方向；真正的重拉闸门是下面的
-// wanted(leadMs)，margin 只需保住新会话登记。若改用 fire，落点后、投递
-// 前的整段延迟窗内都不会回收，回收频率被悄悄改变。
-function needHorizonMs(tasks, now) {
-  let horizon = Infinity;
-  for (const t of tasks) {
-    const cron = parseCronOrNone(t?.cron);
-    if (cron === null) continue;
-    if (wanted(cron, t, now, 0)) return now.getTime();
-    const nxt = cron.nextAfter(now)?.getTime();
-    if (nxt !== undefined && nxt < horizon) horizon = nxt;
-  }
-  return horizon;
+// 该任务下次「需要会话在场」的时刻（ms）：现在已在窗口（落点尾窗、一次
+// 性错过待补）视为立刻需要；窗口外取 cron 裸落点（刻意不取抖动后投递时
+// 刻：落点更早，按落点算余量更小、回收更保守，是安全方向）。cron 无效
+// 返回 Infinity，永不回收。
+function taskNeedMs(task, now) {
+  const cron = parseCronOrNone(task?.cron);
+  if (cron === null) return Infinity;
+  if (wanted(cron, task, now, 0)) return now.getTime();
+  return cron.nextAfter(now)?.getTime() ?? Infinity;
 }
 
-// stampOwner 的活创建者判定，一处备齐 classifyWorkspace 需要的输入：
-// 返回本目录活会话 id 集合与「窗口内是否还有任务的创建者会话活着」。
-// 逐任务的 creatorSessionAlive 是本原（盖印逐个任务判定时复用同一谓词），
-// 聚合布尔只是它的派生。
-function liveCreatorWanted(tasks, details, ws, now, leadMs) {
-  const liveSids = deps.liveSessionIds(details, ws);
-  const creatorAlive = tasks.some((t) =>
-    taskWanted(t, now, leadMs) && deps.creatorSessionAlive(t, liveSids));
-  return { liveSids, creatorAlive };
+// 一个预热 entry 是否已认到登记里的活 claude 会话。
+function entryClaimed(ent) {
+  return Boolean(ent?.sessionId && ent.claudeProcStart);
 }
 
-// 保证一个工作区里有一个健康的消费者会话。原地修改 state。retain 来自
-// cfg.sessionRetain，直接调用（测试）默认 'always' 保持旧语义。scriptProcs
-// 是进程表快照或 null：null 时仅在需要认领孤儿（state 丢失的兜底分支）当
-// 下才拍快照，平静轮不付全量 ps 的代价。
-// stamp=null 表示 stampOwner 关（一切旧行为）；开启时为
-// {verdict, recycleMarginSec}：verdict 是 classifyWorkspace 对轮初消费者
-// 快照的认亲结论（own/creatorAlive/ambiguous/user，换代或回收导致快照变
-// 化时在 retire 内用新快照重算），recycleMarginSec 是 window 回收余量。
+// 保证一个工作区里每个死主窗口任务都有专属预热，并完成本文件的续期/改
+// id/盖印维护。bucket 是 state[ws]（原地修改）。scriptProcsRef 是全轮共
+// 享的进程表快照容器（{value: 数组|null}），只在孤儿认领时拍一次。
 export async function patrolWorkspace(
-  ws, state, now, leadMs, cur, consumers, scriptProcs = null,
-  retain = 'always', stats = null, stamp = null,
+  ws, bucket, taskfile, now, leadMs, cur, details, scriptProcsRef, stats,
 ) {
   const tasks = deps.readTasks(ws);
-  let ent = state[ws] ?? null;
-  // 边记日志边给轮末汇总记账：日志给人翻，stats 给轮首/轮末心跳行一个
-  // 紧凑全貌。stats 为 null（直接单测）时退化为纯日志。
   const note = (kind, msg) => {
     bump(stats, kind);
     deps.log(msg);
   };
+  const liveSids = deps.liveSessionIds(details, ws);
 
   if (tasks === null) {
     // 任务文件读不出：证据太弱，绝不动会话；但不能不吭声——文件还在却读
@@ -219,224 +202,374 @@ export async function patrolWorkspace(
     }
     return;
   }
-  if (tasks.length === 0) {
-    // 文件完好但任务清空：一次性任务触发后被删、周期任务过期、或用户手
-    // 删。我们拉起的会话没理由继续留着；用户自己开的会话不在 state 里，
-    // 永不触碰。
-    if (ent !== null) {
-      if (deps.trackedAlive(ent)) {
-        await deps.stopSession(ent);
-        note('recycle', `回收 ${ws} pid=${ent.pid}：任务已全部清空，结束保活会话`);
-      }
-      delete state[ws];
-    }
-    return;
-  }
 
-  // 结束本代会话的完整收尾：停掉 → 摘 state → 重扫消费者。换代与 window
-  // 回收是同一个动作，差别只在触发条件与文案；消费者快照拍于轮初，刚结束
-  // 的这代可能正是快照里的消费者，不重扫会让陈旧登记挡住下面的重拉。
-  let mineAlive = deps.trackedAlive(ent);
-  // verdict 是轮初快照的认亲结论；换代/回收杀掉本代后消费者集合变了，
-  // 必须按重扫结果重算而不是手改布尔——幸存下来的断链会话（进程组杀不
-  // 掉的用户会话）仍应是歧义态，否则会被误当普通用户会话、在它旁边双开。
-  let verdict = stamp?.verdict ?? null;
-  const retire = async (kind, msg) => {
+  const stopEntry = async (ent, kind, msg) => {
     await deps.stopSession(ent);
     note(kind, msg);
-    delete state[ws];
-    ent = null;
-    mineAlive = false;
-    if (stamp) {
-      const [nextConsumers, , nextDetails] = await deps.scanSessions({ lineage: true });
-      consumers = nextConsumers;
-      // ent 已没（ownPid 给 null）；creatorAlive 也必须按新快照重算——
-      // 重扫本身就承认换代这几秒现场会变，活创建者可能恰好开关会话。
-      verdict = deps.classifyWorkspace(nextDetails, ws, null,
-        liveCreatorWanted(tasks, nextDetails, ws, now, leadMs).creatorAlive);
-    } else {
-      consumers = (await deps.scanSessions())[0];
-    }
   };
 
-  // 换代：超龄且日志静默（无任务在执行的证据）的会话主动结束，需要时下
-  // 文自然重拉。换代是维护，不计失败。
-  if (ent !== null && mineAlive) {
-    const age = cur - (ent.startedAt ?? cur);
-    if (age > SESSION_MAX_AGE_SECONDS
-        && sessionLogIdleSeconds(
-          ent.log || sessionLogPath(ws), cur) > SESSION_IDLE_SECONDS) {
-      await retire('ageout', `换代 ${ws} pid=${ent.pid}：会话已连续运行 `
-        + `${Math.floor(age / 86400)} 天且近期无输出，结束后按需重拉`);
+  if (tasks.length === 0) {
+    // 文件完好但任务清空：一次性任务触发后被删、周期任务过期、或用户手
+    // 删。我们为这些任务拉起的会话没理由继续留着；detached（用户 resume
+    // 接管）的 stop 是 no-op，条目照删——sid 没了任务也没了，无需再管。
+    for (const [key, ent] of Object.entries(bucket)) {
+      if (deps.trackedAlive(ent)) {
+        await stopEntry(ent, 'recycle',
+          `回收 ${ws} 任务 ${key} pid=${ent.pid}：任务已全部清空，结束预热会话`);
+      }
+      delete bucket[key];
+    }
+    return;
+  }
+
+  // 第零步：id 改键的崩溃窗口治愈。任务文件里旧键已不存在（上轮 minify
+  // 改小了 id、state 却没来得及存盘），而内容签名唯一匹配某个当前任务、
+  // 目标键又无主：先把条目挪到新键，让下面的决策把它当作连续的一代——
+  // 否则会按「旧任务删除 + 新任务」错杀活会话再重拉一个。必须在逐任务
+  // 决策之前做，spawn 才不会抢先占掉目标键。
+  let sigToKeys = new Map();
+  let currentKeys = new Set();
+  for (const t of tasks) {
+    const k = taskKey(t);
+    currentKeys.add(k);
+    const list0 = sigToKeys.get(taskSig(t)) ?? [];
+    list0.push(k);
+    sigToKeys.set(taskSig(t), list0);
+  }
+  for (const [key, ent] of Object.entries({ ...bucket })) {
+    if (currentKeys.has(key) || !ent.sig) continue;
+    const candidates = sigToKeys.get(ent.sig) ?? [];
+    if (candidates.length === 1 && !bucket[candidates[0]]) {
+      bucket[candidates[0]] = { ...ent, taskId: candidates[0] };
+      delete bucket[key];
     }
   }
 
-  // window 模式回收：会话生命周期对齐「一次执行」而非「常驻」。三个条件
-  // 缺一不可：本代会话期间真的有任务触发过（lastFiredAt 晚于 startedAt
-  // ——区分「执行完的空闲」与「等待触发的空闲」，后者是预热缓存在干活，
-  // 回收它只会每轮空转重拉）；界面静默超时（TUI 执行期间持续渲染，静默
-  // 即不在干活）；距下次需要会话还有余量（回收后下轮巡检重拉的新会话来
-  // 得及登记，不会漏掉到点任务）。时间上重叠或紧邻的任务仍共享会话：任
-  // 务路由在 Claude Code 手里，同目录并发多会话无法指定归属，还有重复
-  // 执行的风险。回收不计失败——任务成功执行过是最强的健康证据，陈年计
-  // 数一并清零。
-  // 余量取值：默认只保登记抖动（约 2 分钟）；stampOwner 开启时必须再留
-  // 出一个巡检间隔——回收后要靠「下轮重拉→再下轮过户」两步把 owner 盖
-  // 到新会话，余量小于间隔就可能在过户完成前到点（cmdRun 传入
-  // SESSION_FIRE_MARGIN_SECONDS + intervalSeconds）。
-  const fireMarginSec = stamp
-    ? stamp.recycleMarginSec
-    : SESSION_FIRE_MARGIN_SECONDS;
-  if (ent !== null && mineAlive && retain === 'window'
-      && tasks.some((t) => typeof t?.lastFiredAt === 'number'
-        && t.lastFiredAt > (ent.startedAt ?? 0) * 1000)
-      && sessionLogIdleSeconds(ent.log || sessionLogPath(ws), cur)
-        > SESSION_RECYCLE_IDLE_SECONDS
-      && needHorizonMs(tasks, now) - now.getTime()
-        > fireMarginSec * 1000) {
-    // stampOwner 关时：用户自己的会话若在场，retire 的重扫依旧看见，不
-    // 会在同目录双开；开启时：旧代整组结束后重扫只可能剩用户会话，下面
-    // 的逻辑会按需另拉新预热。
-    await retire('recycle', `回收 ${ws} pid=${ent.pid}：本代任务已执行完毕且`
-      + '界面静默，结束会话，下次需要时重拉');
-  }
-
-  const wantedNow = tasks.some((t) => taskWanted(t, now, leadMs));
-  const warmAge = ent !== null ? cur - (ent.startedAt ?? cur) : 0;
-  // 我们跟踪的预热活着、超过登记宽限、且没被认成自己（own 不可能卡死）：
-  // 卡在提问界面的垃圾进程。两条善后路径共用这一个判定：
-  //  - 有别的会话可承接（consumerHolds）：只杀掉，不摘 state、不计数、不
-  //    重拉——是垃圾回收，不是一次启动失败；
-  //  - 没人承接：杀掉后继续走失败计数/冷却/重拉。
-  const warmStuck = ent !== null && mineAlive && wantedNow
-    && warmAge > WARMUP_GRACE_SECONDS
-    && (!stamp || verdict.kind !== 'own');
-  const killStuckWarm = async (held) => {
-    await deps.stopSession(ent);
-    note('stuck', `卡死 ${ws} pid=${ent.pid}：进程已存活 ${warmAge} 秒仍未登记`
-      + '会话，已终止'
-      + (held ? '；同目录已有会话可承接任务，不另拉预热' : '')
-      + `（排查：cron-up logs ${path.basename(ws)}）`);
-  };
-
-  // 在场的消费者足以让我们放手吗？功能关时任何消费者都算；开启时除 user
-  // 外的三态都算——认到自己的预热（own）、窗口任务的创建者会话还活着
-  // （creatorAlive：用户显式要求尊重，绝不另拉）、父链有歧义无法排除是
-  // 自己（ambiguous）。仅 user 不算：创建者已关闭/崩溃，下面继续走到
-  // wanted→卡死退休/冷却→spawn，在同目录另起独立预热承接（全程只 stop
-  // 自己的 ent，不碰用户会话）。
-  const consumerHolds = consumers.has(ws)
-    && (!stamp || verdict.kind !== 'user');
-
-  // 登记成功即健康证据，当场清零失败计数，不等「有任务想要会话」的轮
-  // 次——健康会话常驻时计数会一直挂着，一次无关死亡就能把陈年计数顶满冷
-  // 却，连一次新尝试都不给。只有真的认到自己（own）或歧义态才清零：
-  // creatorAlive 时在场的是活创建者、我们的预热可能正卡着没登记，不能替
-  // 它清零。
-  if (ent !== null && mineAlive && consumers.has(ws)
-      && (!stamp || verdict.kind === 'own' || verdict.kind === 'ambiguous')) {
+  // 第一步：认亲。spawn 只知道 script pid，登记里是 claude 孙进程；沿轮
+  // 初快照的祖先链找到我们这代的登记详情，回填 sessionId/claudePid/
+  // claudeProcStart。认到 = 最强健康证据，当场清零失败计数。认不到下轮
+  // 再认，不阻断任何决策。
+  for (const ent of Object.values(bucket)) {
+    if (!deps.trackedAlive(ent)) continue;
+    const d = deps.claimWarm(details, ws, ent.pid);
+    if (!d) continue;
     ent.fails = 0;
+    if (d.sessionId && d.procStart) {
+      ent.claudePid = d.pid;
+      ent.sessionId = d.sessionId;
+      ent.claudeProcStart = d.procStart;
+    }
   }
 
-  // 任务正在被消费。可能是我们的预热会话（已登记——上面的健康清零已覆
-  // 盖），也可能是用户的交互会话——后者默认放手：不在这里删死条目，失败
-  // 计数要跨任务窗口存活（用户会话在场不证明 launchd 拉起的环境健康），
-  // 由轮末 kept 过滤统一处理。creatorAlive/ambiguous 返回前顺手清掉卡死
-  // 的垃圾预热；平稳态在此提前返回，不必继续后面的流程。
-  if (consumerHolds) {
-    // 默认配置（stamp 关）沿用旧行为：用户会话在场时「掩护」卡死预热，
-    // 不在这里杀，交给 7 天换代——所以 holds 路径只在 stamp 开启时清垃圾。
-    if (stamp && warmStuck) await killStuckWarm(true);
-    return;
-  }
+  // 第二步：逐任务决策。stamps 收本轮要盖的归属印（sig → 预热身份），
+  // 第三步合并进同一次原子写。stampConflicts 记「同内容签名被多个预热
+  // 声称」的病态任务（同毫秒连建的重复任务）：一律不盖，交回调度锁原
+  // 生规则，避免错盖后没拿到任务的预热永不满足回收条件而空转泄漏。
+  const stamps = new Map();
+  const stampConflicts = new Set();
+  for (const t of tasks) {
+    const key = taskKey(t);
+    const sig = taskSig(t);
+    let ent = bucket[key] ?? null;
+    const logPath = sessionLogPath(ws, key);
+    const ownerIsOurs = entryClaimed(ent)
+      && typeof t.createdBySessionId === 'string'
+      && t.createdBySessionId === ent.sessionId;
 
-  if (!wantedNow) return;
+    // (a) 任务的创建者会话还开着：最高优先级，任务铁定投进它，我们不预
+    // 热、不盖印。ownerIsOurs 除外（归属本就是我们这代预热，sid 在活集
+    // 合里是理所当然）。若此前已为它拉过预热，结束多余的那条：未认亲超
+    // 宽限是卡垃圾，已认亲则是归属被外部改回活创建者，两者都不计失败。
+    if (!ownerIsOurs && deps.creatorSessionAlive(t, liveSids)) {
+      if (ent && deps.trackedAlive(ent)
+          && cur - (ent.startedAt ?? cur) > WARMUP_GRACE_SECONDS
+          && !entryClaimed(ent)) {
+        await stopEntry(ent, 'stuck', `卡死 ${ws} 任务 ${key} pid=${ent.pid}：`
+          + '进程已存活仍未登记会话，已终止；任务的创建者会话仍在场可承接，'
+          + '不另拉预热');
+        delete bucket[key];
+      } else if (ent && deps.trackedAlive(ent) && entryClaimed(ent)) {
+        await stopEntry(ent, 'recycle', `回收 ${ws} 任务 ${key} pid=${ent.pid}：`
+          + '任务创建者会话已在场，结束多余的预热会话');
+        delete bucket[key];
+      }
+      continue;
+    }
 
-  const cooling = isCooling(ent, cur);
+    // (b) 用户在终端 --resume 接管：script 层已死，但同一 sessionId 的
+    // 裸 claude 还活着。冻结条目：不重拉（双开）、不计数、不碰用户进
+    // 程；sid 消失后再按死主任务正常重拉。
+    if (ent && !deps.trackedAlive(ent)
+        && typeof ent.sessionId === 'string'
+        && liveSids.has(ent.sessionId)) {
+      if (!ent.notified) {
+        ent.notified = true;
+        deps.log(`接管脱离 ${ws} 任务 ${key}：预热会话已在终端被 --resume `
+          + '打开（sessionId 仍存活），停止管理它，不再另拉预热；该会话关闭'
+          + '后巡检会重新拉起');
+      }
+      continue;
+    }
 
-  // 活着但没有消费。健康只在真实启动所需的时间内成立；超时就是卡在无人
-  // 应答的提问界面，永不登记——退休它并推进失败计数。宽限内的年轻会话
-  // 直接返回；warmStuck 已含超宽限判定。
-  if (ent !== null && mineAlive) {
-    if (!warmStuck) return;
-    await killStuckWarm(false);
-  }
+    // (c) window 回收：不要求任务此刻在窗口内——恰恰是执行完、已离开窗
+    // 口的会话要被收掉。三条件缺一不可：本任务在本代执行过（lastFiredAt
+    // 晚于 startedAt——区分「执行完的空闲」与「等触发的空闲」，后者是预
+    // 热缓存在干活）、本任务日志静默超时、距本任务下次需要还有两步余量
+    // （下轮重拉、再下轮盖印；needMs 在窗口内返回 now，天然挡住「回收后
+    // 立刻又需要」）。
+    if (ent && deps.trackedAlive(ent) && entryClaimed(ent)
+        && typeof t.lastFiredAt === 'number'
+        && t.lastFiredAt > (ent.startedAt ?? 0) * 1000
+        && sessionLogIdleSeconds(ent.log || logPath, cur)
+          > SESSION_RECYCLE_IDLE_SECONDS
+        && taskNeedMs(t, now) - now.getTime()
+          > SESSION_RECYCLE_MARGIN_SECONDS * 1000) {
+      await stopEntry(ent, 'recycle',
+        `回收 ${ws} 任务 ${key} pid=${ent.pid}：本任务已执行完毕且界面静默，`
+        + '结束会话，下次窗口重新预热');
+      delete bucket[key];
+      continue;
+    }
 
-  if (cooling) return;
+    // 此后只服务「死主 + 在预热窗口内」的任务。
+    if (!taskWanted(t, now, leadMs)) continue;
 
-  // 没有消费者，我们跟踪的会话（若有）已死或刚作为卡死退休。
-  let fails;
-  if (ent && ent.cooldownUntil) {
-    // 冷却刚结束：给一次干净的缓刑拉起，而不是立刻再次顶满限制。
-    fails = 0;
-  } else {
-    // 只有真的拉起过（pid 非空）的条目死亡才算一次新失败；pid 为空的条目
-    // 是当场就没拉起的尝试，那次失败已在写入时计过，不再重复累计。
-    fails = (ent?.fails ?? 0) + (ent?.pid ? 1 : 0);
-  }
+    // (d) 卡死退休：script 活着、超登记宽限仍未认亲——停在信任/授权提
+    // 问界面的垃圾进程。杀掉后继续走失败计数/冷却/重拉。
+    if (ent && deps.trackedAlive(ent) && !entryClaimed(ent)
+        && cur - (ent.startedAt ?? cur) > WARMUP_GRACE_SECONDS) {
+      await stopEntry(ent, 'stuck', `卡死 ${ws} 任务 ${key} pid=${ent.pid}：`
+        + '进程已存活仍未登记会话，已终止'
+        + `（排查：cron-up logs ${path.basename(ws)}--${key}）`);
+    }
 
-  if (fails >= FAIL_LIMIT) {
-    state[ws] = {
-      pid: null,
-      fails,
-      cooldownUntil: cur + COOLDOWN_SECONDS,
-    };
-    note('cool', `冷却 ${ws}：仍有任务需要会话，但保活会话连续失败 ${fails} 次，`
-      + `暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
-    return;
-  }
+    // (e) resume 接管结束：sid 已从登记消失。整代身份作废（script 已
+    // 死、认亲信息失效），fails 清零（用户使用期间的退出不算我们的启动
+    // 失败），作为全新一条落入下面的重拉。
+    if (ent && !deps.trackedAlive(ent)
+        && typeof ent.sessionId === 'string'
+        && !liveSids.has(ent.sessionId)) {
+      ent.pid = null;
+      delete ent.procStart;
+      delete ent.claudePid;
+      delete ent.sessionId;
+      delete ent.claudeProcStart;
+      delete ent.notified;
+      ent.fails = 0;
+    }
 
-  if (ent === null) {
-    // state 里没有记录不等于没有会话：state.json 丢失（手删、purge 时保留
-    // 会话）后进程表里可能还躺着这个工作区的 script 会话，卡在提问界面就
-    // 不会出现在登记里，直接再拉就是同目录双开。认回孤儿，重新纳入正常
-    // 生命周期（卡死的 3 分钟后照退休处理）。
-    const logPath = sessionLogPath(ws);
-    for (const [procPid, procArgs] of scriptProcs ?? deps.listScriptProcesses()) {
-      // alive 复核：快照拍于本轮开头，可能含着刚被换代/回收杀掉的 pid——
-      // 把死人认回来会白记一次失败。
-      if (scriptProcLogPath(procArgs) === logPath && deps.alive(procPid)) {
-        state[ws] = {
+    // 盖印：已认亲且任务归属还没盖到本代预热（活创建者已在 (a) 排
+    // 除）。当轮新 spawn 的会话没认亲，下轮才盖——lead 覆盖两轮巡检。
+    if (entryClaimed(ent)
+        && (!t.createdBySessionId || t.createdBySessionId !== ent.sessionId)) {
+      const target = {
+        sessionId: ent.sessionId,
+        pid: ent.claudePid,
+        procStart: ent.claudeProcStart,
+      };
+      if (stamps.has(sig)) {
+        if (stamps.get(sig).sessionId !== ent.sessionId) {
+          stampConflicts.add(sig);
+          stamps.delete(sig);
+        }
+      } else if (!stampConflicts.has(sig)) {
+        stamps.set(sig, target);
+      }
+    }
+
+    // warm 未到回收 / spawning 宽限内：本轮无事。
+    if (ent && deps.trackedAlive(ent)) continue;
+
+    if (isCooling(ent, cur)) continue;
+
+    // 失败计数：冷却刚结束给一次干净缓刑；只有真拉起过（pid 非空）的条
+    // 目死亡才算一次新失败，当场没拉起的尝试已在写入时计过。
+    let fails;
+    if (ent?.cooldownUntil) {
+      fails = 0;
+    } else {
+      fails = (ent?.fails ?? 0) + (ent?.pid ? 1 : 0);
+    }
+
+    if (fails >= FAIL_LIMIT) {
+      bucket[key] = {
+        ...ent,
+        ws,
+        taskId: key,
+        sig,
+        pid: null,
+        fails,
+        cooldownUntil: cur + COOLDOWN_SECONDS,
+        log: ent?.log ?? logPath,
+      };
+      note('cool', `冷却 ${ws} 任务 ${key}：仍有任务需要会话，但预热连续失败 `
+        + `${fails} 次，暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
+      continue;
+    }
+
+    // 孤儿认领：state 丢了但进程表里还有为本任务拉起的 script（卡在提问
+    // 界面就不会出现在登记里）。按任务专属日志路径精确相认，alive 复核
+    // 防把快照里刚被杀的 pid 认回来。
+    if (ent === null) {
+      if (scriptProcsRef.value === null) {
+        scriptProcsRef.value = deps.listScriptProcesses();
+      }
+      const adopted = scriptProcsRef.value.find(
+        ([procPid, procArgs]) =>
+          scriptProcLogPath(procArgs) === logPath && deps.alive(procPid));
+      if (adopted) {
+        const [procPid] = adopted;
+        bucket[key] = {
+          ws,
+          taskId: key,
+          sig,
           pid: procPid,
           startedAt: cur,
           procStart: deps.procStartedAt(procPid),
           fails: 0,
           log: logPath,
         };
-        note('adopt', `接管 ${ws} pid=${procPid}：state 记录缺失，但进程表里仍有`
-          + '本工作区的保活会话，重新纳入跟踪');
-        return;
+        note('adopt', `接管 ${ws} 任务 ${key} pid=${procPid}：state 记录缺失，`
+          + '但进程表里仍有本该任务的预热会话，重新纳入跟踪');
+        continue;
       }
+    }
+
+    // spawn：成败只认有没有拿到 pid。当场失败立即计入；本轮就顶满失败上
+    // 限的，直接进冷却（不必再空跑一轮）。
+    const spawned = deps.spawnSession(ws, key);
+    if (spawned?.pid == null) {
+      const newFails = fails + 1;
+      if (newFails >= FAIL_LIMIT) {
+        bucket[key] = {
+          ws, taskId: key, sig, pid: null, fails: newFails,
+          cooldownUntil: cur + COOLDOWN_SECONDS, log: logPath,
+        };
+        note('cool', `冷却 ${ws} 任务 ${key}：仍有任务需要会话，但预热连续失败 `
+          + `${newFails} 次，暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
+        continue;
+      }
+      bucket[key] = {
+        ws,
+        taskId: key,
+        sig,
+        pid: null,
+        startedAt: cur,
+        fails: newFails,
+        log: logPath,
+      };
+      note('fail', `启动失败 ${ws} 任务 ${key}：会话进程没有拉起`
+        + `（连续失败计数 ${newFails}）`);
+      continue;
+    }
+    bucket[key] = {
+      ws,
+      taskId: key,
+      sig,
+      pid: spawned.pid,
+      startedAt: cur,
+      procStart: spawned.procStart,
+      fails,
+      log: logPath,
+    };
+    note('spawn', `已启动 ${ws} 任务 ${key} pid=${spawned.pid}`
+      + `（连续失败计数 ${fails}）`);
+  }
+
+  // 第三步：任务文件维护（续期 + 改 id + 盖印）合并为一次带乐观锁的原子
+  // 写。撞车（Claude Code 刚写了 lastFiredAt/删了任务）整轮放弃写与
+  // reap，下轮基于新文件重算——已 spawn 的条目留下轮处理，不受影响。
+  let result;
+  try {
+    result = maintainWorkspace(taskfile, { reown: stamps });
+  } catch (e) {
+    if (e instanceof TaskFileChanged) {
+      note('warn', `维护暂缓 ${ws}：任务文件刚被 Claude Code 改动，本轮不覆盖，`
+        + '下轮再来');
+      return;
+    }
+    throw e;
+  }
+  if (result === null) return; // 与 readTasks 不一致的极端竞态：保守不动
+  if (result.renewed) {
+    deps.log(`已续期 ${ws}：${result.renewed} 个周期任务标记为 permanent，`
+      + '不再受 7 天过期限制');
+  }
+  if (result.minified) {
+    deps.log(`已改小 id ${ws}：${result.minified} 个周期任务的 id 改为小哈希`
+      + '值，投递延迟降到约 1 分钟内');
+  }
+  if (result.reowned) {
+    bump(stats, 'reown');
+    deps.log(`已过户 ${ws}：${result.reowned} 个窗口内任务的归属改到各自的`
+      + '预热会话，这些任务将只在对应会话触发');
+  }
+  // id 改小同轮把 state 条目跟着改键：不改的话下轮会把换 id 的任务误判
+  // 成「旧任务删除 + 新任务」，错杀刚拉起的会话再重拉一个。
+  for (const { from, to } of result.idChanges) {
+    if (bucket[from] && !bucket[to]) {
+      bucket[to] = { ...bucket[from], taskId: to };
+      delete bucket[from];
     }
   }
 
-  // 成败只认一个事实——有没有拿到 pid：null、undefined、无 pid 的对象都算
-  // 没拉起，计数与日志同源，不会各说各话。
-  const spawned = deps.spawnSession(ws);
-  if (spawned?.pid == null) {
-    // 本次尝试已当场失败，立即计入（成功拉起则本次尚待观察，沿用 fails）。
-    const newFails = fails + 1;
-    state[ws] = {
-      pid: null,
-      startedAt: cur,
-      fails: newFails,
-      log: sessionLogPath(ws),
-    };
-    note('fail', `启动失败 ${ws}：会话进程没有拉起（连续失败计数 ${newFails}）`);
-    return;
+  // 第四步：任务消失的条目回收。第零步已做过签名治愈；这里重建当前键索
+  // 引——注意内存里的 tasks 是维护前的快照，minify 改的是重新读盘的
+  // doc，所以键必须经 idChanges 修正，否则刚改到新键的条目会被旧 id 视
+  // 图误当成「签名可治愈的旧键」再改回去。剩下对不上的键就是真的被删
+  // 了。冷却中的条目也删——任务没了，冷却没有意义。
+  const renamed = new Map(result.idChanges.map((c) => [c.from, c.to]));
+  sigToKeys = new Map();
+  currentKeys = new Set();
+  for (const t of tasks) {
+    const k = renamed.get(taskKey(t)) ?? taskKey(t);
+    currentKeys.add(k);
+    const list = sigToKeys.get(taskSig(t)) ?? [];
+    list.push(k);
+    sigToKeys.set(taskSig(t), list);
   }
-  state[ws] = {
-    pid: spawned.pid,
-    startedAt: cur,
-    procStart: spawned.procStart,
-    fails,
-    log: sessionLogPath(ws),
-  };
-  if (stamp && consumers.has(ws) && verdict?.kind === 'user') {
-    note('spawn', `已另启动预热会话 ${ws} pid=${spawned.pid}：你的交互会话仍在`
-      + `，窗口内任务将改由预热会话承接（连续失败计数 ${fails}）`);
-  } else {
-    note('spawn', `已启动 ${ws} pid=${spawned.pid}（连续失败计数 ${fails}）`);
+  for (const [key, ent] of Object.entries({ ...bucket })) {
+    if (currentKeys.has(key)) continue;
+    const candidates = ent.sig ? (sigToKeys.get(ent.sig) ?? []) : [];
+    if (candidates.length === 1 && !bucket[candidates[0]]) {
+      const to = candidates[0];
+      bucket[to] = { ...ent, taskId: to };
+      delete bucket[key];
+      continue;
+    }
+    if (deps.trackedAlive(ent)) {
+      await stopEntry(ent, 'recycle', `回收 ${ws} 任务 ${key} pid=${ent.pid}：`
+        + '对应任务已删除，结束预热会话');
+    }
+    delete bucket[key];
+  }
+}
+
+// 升级轮：旧版目录级 state 的预热逐个结束（不迁移归属，新流程按任务重
+// 拉）；state.json 已丢的旧孤儿 script（日志是旧命名，不含任务键段）从
+// 进程表兜底清扫。只在 loadLegacyEntries 非空（确在跨版本）时执行。
+async function retireLegacy(legacy, stats) {
+  for (const ent of legacy) {
+    if (deps.trackedAlive(ent)) {
+      await deps.stopSession(ent);
+      bump(stats, 'recycle');
+      deps.log(`旧版迁移 ${ent.ws} pid=${ent.pid}：结束目录级预热会话，`
+        + '升级后按任务重新预热');
+    }
+  }
+  const handled = new Set(legacy.filter((e) => e.pid).map((e) => e.pid));
+  for (const [pid, procArgs] of deps.listScriptProcesses()) {
+    if (handled.has(pid)) continue;
+    const file = scriptProcLogPath(procArgs);
+    if (file === null) continue;
+    if (path.dirname(file) !== deps.paths.sessionLogDir) continue;
+    if (isTaskSessionLogName(path.basename(file))) continue; // 新一代命名
+    const ent = { pid, procStart: deps.procStartedAt(pid) };
+    if (!deps.trackedAlive(ent)) continue;
+    await deps.stopSession(ent);
+    bump(stats, 'recycle');
+    deps.log(`旧版迁移 pid=${pid}：结束目录级预热孤儿会话（日志 ${file}），`
+      + '升级后按任务重新预热');
   }
 }
 
@@ -448,10 +581,9 @@ export async function cmdRun(args) {
     return false;
   }
   // 包一层 stopSession 记下本轮主动结束的 pid：轮末凭它区分「我们回收的」
-  // 与「会话自行退出/被外部杀掉的」，后者以前是无声丢失。同样包一层
-  // procStartedAt：同一 pid 的 lstart 一轮内不会变，而轮初分区、各工作区
-  // 的 trackedAlive、轮末复核与 kept 过滤都会查指纹，缓存后每个 pid 只
-  // spawn 一次 ps。finally 一并还原。
+  // 与「会话自行退出/被外部杀掉的」。同样包一层 procStartedAt：同一 pid
+  // 的 lstart 一轮内不会变，缓存后每个 pid 只 spawn 一次 ps。finally 还
+  // 原。
   const prevStopSession = deps.stopSession;
   const stoppedPids = new Set();
   deps.stopSession = async (ent) => {
@@ -470,174 +602,126 @@ export async function cmdRun(args) {
     deps.rotatePatrolLogs();
     const cfg = loadConfig(args?.config ?? deps.paths.configPath);
     const now = new Date();
-    const leadMs = cfg.leadSeconds * 1000;
+    const leadMs = LEAD_SECONDS * 1000;
     const state = loadState();
+    const legacy = loadLegacyEntries();
     const cur = Math.floor(Date.now() / 1000);
 
     // 轮首心跳：没有这两行，launchd 拉不起巡检（启动脚本失效、node 缺失）
     // 时日志会一片寂静，无法和「平安无事」区分。上轮心跳过老说明中间漏
     // 轮——休眠期间错过的 StartInterval，launchd 醒来只补跑一轮。
     const hb = loadHeartbeat();
-    if (heartbeatStale(hb, cfg.intervalSeconds, cur)) {
+    if (heartbeatStale(hb, INTERVAL_SECONDS, cur)) {
       bump(stats, 'warn');
       deps.log(`距上次巡检已 ${elapsedZh(cur - hb.ranAt)}，超过 `
-        + `${HEARTBEAT_STALE_FACTOR} 个轮次间隔（${cfg.intervalSeconds} 秒），`
+        + `${HEARTBEAT_STALE_FACTOR} 个轮次间隔（${INTERVAL_SECONDS} 秒），`
         + '期间 launchd 可能漏轮（常见于电脑休眠）');
     }
-    deps.log(`巡检开始：${cfg.sessionRetain} 模式，扫描根目录 `
-      + `${cfg.roots.length} 个`);
+    deps.log(`巡检开始：扫描根目录 ${cfg.roots.length} 个`);
     if (cfg.roots.length === 0) {
       bump(stats, 'warn');
       deps.log('警告：扫描目录 roots 为空，巡检不会发现任何工作区；'
-        + '请检查配置文件或用 install --roots 指定');
+        + '请检查配置文件或用 cron-up install --roots 指定');
     }
 
-    // 轮初拍一份「上轮末仍相信活着」的会话快照（entry 复制，本轮原地改写
-    // 不影响），一遍分成「轮初已没气」与「轮初还活着」两组。不能只收此刻
-    // kill -0 成功的——两轮之间崩溃正是最典型的被动死亡，本轮开始时它早
-    // 已没气；带 deadSince 的是上轮已报过死亡的旧条目，跳过以免每轮重复报。
-    const prevDead = [];
-    const prevAlive = [];
-    for (const [ws, ent] of Object.entries(state)) {
-      if (!ent.pid || ent.deadSince) continue;
-      const copy = [ws, { ...ent }];
-      (deps.trackedAlive(copy[1]) ? prevAlive : prevDead).push(copy);
-    }
-    const exitLine = (ws, old) => `会话退出 ${ws} pid=${old.pid}：非巡检主动结束`
-      + `（已存活 ${elapsedZh(cur - (old.startedAt ?? cur))}），可能自行退出或`
-      + '被外部终止；若反复出现请用 cron-up logs '
-      + `${path.basename(ws)} 排查启动过程`;
-
-    // 登记每轮只读一次：否则每个工作区都要 readdir + ps 一遍，自检也归
-    // 属这里。进程表快照不在这里拍：只有孤儿认领分支需要，按需现拍（见
-    // patrolWorkspace 的 scriptProcs 形参）。
-    // lineage 只在 stampOwner 开启时拍：祖先链要一次全机 ps，关闭时
-    // scanSessions 不付这个代价（见 registry 的 scanSessions 注释）。
-    const [consumers, registryAlert, details] =
-      await deps.scanSessions({ lineage: cfg.stampOwner });
+    // 登记每轮只读一次（含祖先链快照）：认亲与活创建者判定都靠它。
+    const [consumers, registryAlert, details] = await deps.scanSessions();
     if (registryAlert) {
       bump(stats, 'warn');
       deps.log(`告警：${registryAlert}`);
     }
 
-    // stampOwner 的结论依赖任务内容（活创建者判定要看窗口任务的
-    // createdBySessionId），所以在下面 discover 循环里、读到任务后逐工
-    // 作区现算；这里只留全轮常量。
-    const recycleMarginSec = SESSION_FIRE_MARGIN_SECONDS
-      + cfg.intervalSeconds;
+    // 旧版收尾必须先于一切 spawn 决策（state 轮末被新形状整体覆盖）。
+    if (legacy.length > 0) await retireLegacy(legacy, stats);
 
-    // 轮间死亡在进入工作区循环前先报：随后该工作区若需要会话会打印重拉，
-    // 日志时间线就是「退出 → 重拉」，而不是反过来。
-    for (const [ws, old] of prevDead) {
+    // 轮初把上轮末仍相信活着的条目分成三组：活、resume 脱离（script 已
+    // 死但 sid 还在，不报退出）、真死（立即报）。带 deadSince 的旧报条
+    // 目跳过。不能只收此刻 kill -0 成功的——两轮之间崩溃正是最典型的被
+    // 动死亡。
+    const prevDead = [];
+    const prevAlive = [];
+    const sidInDetails = (ws, sid) =>
+      (details.get(ws) ?? []).some((d) => d.sessionId === sid);
+    for (const [ws, bucket] of Object.entries(state)) {
+      for (const [taskId, ent] of Object.entries(bucket)) {
+        if (!ent.pid || ent.deadSince) continue;
+        const copy = { ...ent };
+        if (deps.trackedAlive(copy)) {
+          prevAlive.push([ws, taskId, copy]);
+        } else if (typeof ent.sessionId === 'string'
+          && sidInDetails(ws, ent.sessionId)) {
+          // detached：静默。
+        } else {
+          prevDead.push([ws, taskId, copy]);
+        }
+      }
+    }
+    const exitLine = (ws, taskId, old) => `会话退出 ${ws} 任务 ${taskId} `
+      + `pid=${old.pid}：非巡检主动结束（已存活 `
+      + `${elapsedZh(cur - (old.startedAt ?? cur))}），可能自行退出或被外部`
+      + '终止；若反复出现请用 cron-up logs '
+      + `${path.basename(ws)}--${taskId} 排查启动过程`;
+    for (const [ws, taskId, old] of prevDead) {
       bump(stats, 'exit');
-      deps.log(exitLine(ws, old));
+      deps.log(exitLine(ws, taskId, old));
     }
 
     let found = 0;
-    for (const [ws, taskfile] of deps.discover(cfg.roots, cfg.maxDepth)) {
+    const scriptProcsRef = { value: null };
+    for (const [ws, taskfile] of deps.discover(cfg.roots)) {
       found += 1;
-      // 一个工作区读不动不能中断整轮：discover 是生成器，这里抛了会跳过
-      // 后面所有工作区。续期/改 id/过户与保活各自独立守卫——维护失败绝不
-      // 压制该工作区的会话保活。三者合并为同一次原子写（见
-      // maintainWorkspace）。
-      //
-      // stampOwner 的判定在这里现算（依赖任务内容）：窗口内是否还有任务
-      // 的创建者会话活着——活创建者拥有否决权，不另拉、不盖印。
-      let stampArg = null;
-      let liveSids = null;
-      if (cfg.stampOwner) {
-        const wsTasks = deps.readTasks(ws) ?? []; // readTasks 已滤掉非对象
-        const creator = liveCreatorWanted(wsTasks, details, ws, now, leadMs);
-        liveSids = creator.liveSids;
-        const entNow = state[ws] ?? null;
-        const ownPid = entNow && deps.trackedAlive(entNow) ? entNow.pid : null;
-        stampArg = {
-          verdict: deps.classifyWorkspace(details, ws, ownPid,
-            creator.creatorAlive),
-          recycleMarginSec,
-        };
-      }
-      const target = stampArg?.verdict?.target ?? null;
-      // 盖印谓词只盖「窗口内且创建者已不活」的任务：活创建者的任务永远
-      // 不碰（即便本目录另有我们的预热在承接别的死主任务）；已盖给本代
-      // 预热的任务因 owner 就在活会话集合里而自然跳过，幂等不靠另写比较。
-      if (cfg.autoRenew || cfg.autoMinId || target) {
-        try {
-          const { renewed, minified, reowned } = maintainWorkspace(taskfile, {
-            renew: cfg.autoRenew,
-            minify: cfg.autoMinId,
-            // target 多出的祖先链字段 tasks 层不读，展开即可，不必手抄
-            // 三个盖印字段。
-            reown: target
-              ? {
-                  ...target,
-                  isWanted: (t) => taskWanted(t, now, leadMs)
-                    && !deps.creatorSessionAlive(t, liveSids),
-                }
-              : null,
-          }) ?? {};
-          if (renewed) {
-            deps.log(`已续期 ${ws}：${renewed} 个周期任务标记为 permanent，`
-              + '不再受 7 天过期限制');
-          }
-          if (minified) {
-            deps.log(`已改小 id ${ws}：${minified} 个周期任务的 id 改为小哈希`
-              + '值，投递延迟降到约 1 分钟内；下次预热拉起的新会话起生效，'
-              + '已在运行的会话要等其结束重拉（window 模式执行完即回收、'
-              + 'always 模式换代）后才读到新 id');
-          }
-          if (reowned) {
-            bump(stats, 'reown');
-            deps.log(`已过户 ${ws}：${reowned} 个窗口内任务的归属改到预热会话`
-              + ` pid=${target.pid}，这些任务将只在该会话触发`);
-          }
-        } catch (e) {
-          bump(stats, e instanceof TaskFileChanged ? 'warn' : 'error');
-          if (e instanceof TaskFileChanged) {
-            deps.log(`维护暂缓 ${ws}：任务文件刚被 Claude Code 改动，`
-              + '本轮不覆盖，下轮再来');
-          } else {
-            deps.log(`维护错误 ${ws}：${e.constructor.name}：${e.message}`);
-          }
-        }
-      }
+      if (!state[ws]) state[ws] = {};
+      // 一个工作区读不动/写不动不能中断整轮：discover 是生成器，抛了会
+      // 跳过后面所有工作区。
       try {
         await patrolWorkspace(
-          ws, state, now, leadMs, cur, consumers, null,
-          cfg.sessionRetain, stats, stampArg);
+          ws, state[ws], taskfile, now, leadMs, cur, details,
+          scriptProcsRef, stats);
       } catch (e) {
         bump(stats, 'error');
         deps.log(`错误 ${ws}：${e.constructor.name}：${e.message}`);
       }
+      if (Object.keys(state[ws]).length === 0) delete state[ws];
     }
 
-    // 轮中死亡：轮初还活着、轮末复核没气、又不是本轮主动 stop 的。指纹复
-    // 核由 trackedAlive 完成（带 procStart 指纹，pid 回收不会误报）。主动
-    // 回收/换代/卡死有各自的日志，这里只补轮中自行消亡那一类；轮间死亡刚
-    // 才已在循环前报过。报过的死条目随后由 kept 过滤打上 deadSince，后续
-    // 轮次不会重复报。
-    for (const [ws, old] of prevAlive) {
+    // 轮中死亡复核：轮初活、轮末没气、又不是本轮主动 stop 的。轮中刚被
+    // --resume 接管（sid 换 pid 存活）的不报。
+    for (const [ws, taskId, old] of prevAlive) {
       if (stoppedPids.has(old.pid)) continue;
       if (deps.trackedAlive(old)) continue;
+      if (typeof old.sessionId === 'string'
+          && deps.sessionAliveNow(old.sessionId, ws)) continue;
       bump(stats, 'exit');
-      deps.log(exitLine(ws, old));
+      deps.log(exitLine(ws, taskId, old));
     }
 
-    // 丢掉已死且不处冷却的条目；保留冷却、活会话，以及带失败计数的死条
-    // 目——计数跨任务窗口累积才能数满 FAIL_LIMIT（提前窗口常常只覆盖一两
-    // 轮巡检），首次发现死亡时打 deadSince，超过 FAIL_TTL 后连同计数一起
-    // 老化丢弃。
-    const kept = Object.fromEntries(
-      Object.entries(state).filter(([, ent]) => {
-        if (deps.trackedAlive(ent)) return true;
-        if (isCooling(ent, cur)) return true;
+    // kept 过滤（嵌套）：活会话、resume 脱离（sid 仍在登记）、冷却中、
+    // 带失败计数的死条目（计数跨任务窗口累积，48 小时 TTL 老化）保留；
+    // 其余丢掉。首次发现死亡打 deadSince。
+    const kept = {};
+    for (const [ws, bucket] of Object.entries(state)) {
+      const out = {};
+      for (const [taskId, ent] of Object.entries(bucket)) {
+        if (deps.trackedAlive(ent)) {
+          out[taskId] = ent;
+          continue;
+        }
+        if (typeof ent.sessionId === 'string'
+            && sidInDetails(ws, ent.sessionId)) {
+          out[taskId] = ent;
+          continue;
+        }
+        if (isCooling(ent, cur)) {
+          out[taskId] = ent;
+          continue;
+        }
         if ((ent.fails ?? 0) > 0) {
           ent.deadSince ??= cur;
-          return cur - ent.deadSince < FAIL_TTL_SECONDS;
+          if (cur - ent.deadSince < FAIL_TTL_SECONDS) out[taskId] = ent;
         }
-        return false;
-      }),
-    );
+      }
+      if (Object.keys(out).length > 0) kept[ws] = out;
+    }
     saveState(kept);
 
     // 轮末汇总：一行交代这轮看见了什么、动了什么、花了多久，随后更新心跳。
@@ -653,8 +737,7 @@ export async function cmdRun(args) {
     saveHeartbeat({
       ranAt: cur,
       version: packageVersion(),
-      intervalSeconds: cfg.intervalSeconds,
-      sessionRetain: cfg.sessionRetain,
+      intervalSeconds: INTERVAL_SECONDS,
       durationMs,
       events: stats,
     });
@@ -662,73 +745,6 @@ export async function cmdRun(args) {
   } finally {
     deps.stopSession = prevStopSession;
     deps.procStartedAt = prevProcStartedAt;
-    releaseLock(lock);
-  }
-}
-
-// 立即给所有周期任务补 permanent 并把 id 改小。忽略 cfg.autoRenew /
-// cfg.autoMinId——手动跑命令本身就是显式指令（想只续期不改 id 的场景极
-// 少，真需要可临时关掉配置后跑巡检）。与巡检共用同一把锁。
-export async function cmdRenew(args) {
-  const lock = deps.acquireRunLock();
-  if (lock === null) {
-    deps.print('已有一轮巡检（或另一次 renew）在进行，请稍后重试');
-    return;
-  }
-  try {
-    const cfg = loadConfig(args?.config ?? deps.paths.configPath);
-    let files = 0;
-    let tagged = 0;
-    let minified = 0;
-    let unchanged = 0;
-    const skipped = [];
-    for (const [ws, taskfile] of deps.discover(cfg.roots, cfg.maxDepth)) {
-      files += 1;
-      let r;
-      try {
-        r = maintainWorkspace(taskfile, { renew: true, minify: true });
-      } catch (e) {
-        if (e instanceof TaskFileChanged) {
-          deps.print(`暂缓 ${ws}：任务文件刚被 Claude Code 改动，本次未写入，`
-            + '可再跑一次');
-          skipped.push(ws);
-          continue;
-        }
-        deps.print(`跳过 ${ws}：（${e.constructor.name}：${e.message}）`);
-        skipped.push(ws);
-        continue;
-      }
-      if (r === null) {
-        deps.print(`跳过 ${ws}：任务文件读不出或格式损坏`);
-        skipped.push(ws);
-        continue;
-      }
-      if (r.renewed || r.minified) {
-        if (r.renewed) {
-          tagged += r.renewed;
-          deps.print(`已续期 ${ws}：${r.renewed} 个周期任务标记为 permanent`);
-        }
-        if (r.minified) {
-          minified += r.minified;
-          deps.print(`已改小 id ${ws}：${r.minified} 个周期任务投递延迟降到约`
-            + ' 1 分钟内（下次预热的新会话起生效）');
-        }
-      } else {
-        unchanged += 1;
-        deps.print(`已是最新 ${ws}：周期任务均已 permanent 且 id 已足够小，`
-          + '无需改动');
-      }
-    }
-    deps.print('');
-    let line = `扫描 ${files} 个任务文件：本次续期 ${tagged} 个、改小 id `
-      + `${minified} 个任务，${unchanged} 个文件无需改动`;
-    if (skipped.length) line += `，${skipped.length} 个跳过`;
-    deps.print(line);
-    if (tagged) {
-      deps.print('这些周期任务此后不再受 7 天过期限制；为它们保活的后台会话'
-        + '会长期常驻。');
-    }
-  } finally {
     releaseLock(lock);
   }
 }

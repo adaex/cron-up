@@ -1,8 +1,10 @@
-// `cron-up list`：逐工作区列出任务的下次触发、节奏、类型与摘要，标注
-// 该目录当前有没有交互会话。
+// `cron-up list`：逐工作区列出任务的下次触发、节奏、类型、摘要与该任务
+// 的预热状态。
 
 import { deps } from './internals.mjs';
-import { loadConfig } from './config.mjs';
+import { LEAD_SECONDS } from './constants.mjs';
+import { loadConfig, loadState, isCooling } from './config.mjs';
+import { taskKey } from './tasks.mjs';
 import {
   clip,
   pad,
@@ -25,16 +27,34 @@ function statusText(v) {
   return fmtFireRange(v.nxt, v.fire);
 }
 
+// 单个任务的预热状态标签。创建者会话还开着时返回空串——任务原生投进创
+// 建者，无需预热；其余按 entry 的派生阶段给短标签。
+function warmTag(t, v, ent, liveSids, ws, cur) {
+  if (deps.creatorSessionAlive(t, liveSids)) return '';
+  if (ent) {
+    if (isCooling(ent, cur)) return '冷却中';
+    if (deps.trackedAlive(ent)) {
+      return ent.sessionId ? `预热中 ${ent.pid}` : `启动中 ${ent.pid}`;
+    }
+    if (typeof ent.sessionId === 'string'
+        && (liveSids.has(ent.sessionId))) return '终端接管';
+    if ((ent.fails ?? 0) > 0) return `失败${ent.fails}次`;
+  }
+  return v.wanted ? '待预热' : '';
+}
+
 export async function cmdList(args) {
   const cfg = loadConfig(args?.config ?? deps.paths.configPath);
   const now = new Date();
+  const cur = Math.floor(now.getTime() / 1000);
   const cols = deps.terminalWidth();
   const blocks = [];
   let total = 0;
   let filesSeen = 0;
   let unreadable = 0;
-  const [consumers] = await deps.scanSessions();
-  for (const [ws] of deps.discover(cfg.roots, cfg.maxDepth)) {
+  const [, , details] = await deps.scanSessions();
+  const state = loadState();
+  for (const [ws] of deps.discover(cfg.roots)) {
     filesSeen += 1;
     const tasks = deps.readTasks(ws);
     if (tasks === null) {
@@ -43,12 +63,21 @@ export async function cmdList(args) {
       continue;
     }
     if (tasks.length === 0) continue;
-    const views = tasks.map((t) => taskView(t, now));
+    const liveSids = deps.liveSessionIds(details, ws);
+    const views = tasks.map((t) => {
+      // 带提前量：「待预热」标签与巡检的预热窗口同一口径。
+      const v = taskView(t, now, LEAD_SECONDS * 1000);
+      return {
+        v,
+        t,
+        tag: warmTag(t, v, state[ws]?.[taskKey(t)], liveSids, ws, cur),
+      };
+    });
     // 错过待补执行排最前，然后按下次时间升序，一年内无安排的垫底，无效
     // 的最后。
-    views.sort((a, b) => rank(a) - rank(b)
-      || ((a.nxt?.getTime() ?? Infinity) - (b.nxt?.getTime() ?? Infinity)));
-    blocks.push([ws, consumers.has(ws), views]);
+    views.sort((a, b) => rank(a.v) - rank(b.v)
+      || ((a.v.nxt?.getTime() ?? Infinity) - (b.v.nxt?.getTime() ?? Infinity)));
+    blocks.push([ws, views]);
     total += tasks.length;
   }
 
@@ -68,23 +97,17 @@ export async function cmdList(args) {
   blocks.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   deps.print(`共 ${blocks.length} 个工作区、${total} 个定时任务`);
 
-  // 列宽从全部实际文案动态算（跨天箭头最长 "09-25 08:30 → 09-26 09:00"），
-  // 改文案不会静默错位；cadence 是截断列，取固定上限。
+  // 列宽从全部实际文案动态算；cadence 是截断列，取固定上限。
   const statusW = Math.max(11,
-    ...blocks.flatMap(([, , views]) => views.map((v) => dispWidth(statusText(v)))));
+    ...blocks.flatMap(([, views]) => views.map(({ v }) => dispWidth(statusText(v)))));
   const kindW = Math.max(...['一次性', '周期', '周期·永久'].map(dispWidth)) + 1;
   const cadW = 16;
-  // 固定列（不含摘要段）："  " status "  " kind "  " cadence。摘要段再占
-  // "  " + summaryW。空间紧张时摘要先让位；为 0 则整段省略——状态箭头在
-  // 60 列下限下本身就可能占 25 列（跨天），不能再用 12 列摘要下限把行撑爆。
+  // 固定列："  " status "  " kind "  " cadence "  " summary ["  " tag]。
   const fixedW = 2 + statusW + 2 + kindW + 2 + cadW;
-  const summaryW = Math.max(0, cols - fixedW - 2);
-  for (const [ws, consumer, views] of blocks) {
+  for (const [ws, views] of blocks) {
     deps.print('');
-    const label = consumer ? '交互会话：有' : '交互会话：无';
-    const pathW = cols - dispWidth(label) - 1;
-    deps.print(`${pad(clip(ws, pathW), pathW)} ${label}`);
-    for (const v of views) {
+    deps.print(clip(ws, cols));
+    for (const { v, tag } of views) {
       let kind;
       let cadence;
       let summary;
@@ -97,11 +120,15 @@ export async function cmdList(args) {
         cadence = v.cadence;
         summary = v.summary;
       }
+      // 给预热标签预留宽度（含括号与间隔）；极窄屏摘要可以截到 0。
+      const tagPart = tag ? ` [${tag}]` : '';
+      const summaryW = Math.max(0,
+        cols - fixedW - 2 - dispWidth(tagPart));
       let line = '  ' + pad(statusText(v), statusW) + '  '
         + pad(kind, kindW) + '  '
         + pad(clip(cadence, cadW), cadW);
-      // 极窄屏摘要列算到 0：整段省略（含前导间隔），保证行宽不超终端。
       if (summaryW > 0) line += '  ' + clip(summary, summaryW);
+      line += tagPart;
       deps.print(line);
     }
   }
