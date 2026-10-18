@@ -247,7 +247,7 @@ test('two same-time dead-owner tasks get two separate warm sessions and stamps',
   assert.notEqual(m.spawns[0].scriptPid, m.spawns[1].scriptPid);
   assert.ok(m.spawnLog.every((id) =>
     isTaskSessionLogName(path.basename(sessionLogPath(m.WS, id)))));
-  assert.deepEqual(r1.pending.map((p) => p.key).sort(),
+  assert.deepEqual(r1.map((p) => p.key).sort(),
     ['00000002', '00000004']);
   // 未认亲不盖印。
   assert.equal(sidOf(m, '00000002'), undefined);

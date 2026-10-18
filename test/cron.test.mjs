@@ -9,7 +9,8 @@ import {
   parseCronOrNone,
   taskIsOneshot,
   taskWanted,
-  wanted,
+  wantedNow,
+  wantedWithin,
   taskIdHash,
   nextDelivery,
 } from '../src/cron.mjs';
@@ -198,35 +199,28 @@ test('within lead window', () => {
   assert.equal(taskWanted(t, NOW, LEAD_MS), true);
 });
 
-test('one-shot window reaches 90s before the slot for early grid delivery', () => {
-  // 落点 7 分钟后：超出 6 分钟提前量，但一次性任务最多提前 90 秒投递，
-  // 最早投递时刻（330 秒后）已在窗内。非网格落点本不提前，保守同口径
-  // 只是多等 90 秒，无损。
-  const d = new Date(NOW.getTime() + 7 * 60_000);
-  const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
-    + `${d.getMonth() + 1} *`;
-  assert.equal(taskWanted({ cron: expr, recurring: false }, NOW, LEAD_MS),
-    true);
-  // 同距离的周期任务不前推：抖动在落点之后，由投递尾窗覆盖。
-  assert.equal(taskWanted({ cron: expr, recurring: true }, NOW, LEAD_MS),
-    false);
-});
+// 前瞻窗口（wantedWithin）边界：一次性任务在 :00/:30 网格最多提前 90 秒
+// 投递，窗口前沿罩到最早投递时刻；周期任务抖动在落点之后不前推。
+for (const [mins, recurring, want, label] of [
+  [7, false, true, '一次性：330 秒后的最早投递点在 360 秒窗内'],
+  [7, true, false, '同距离周期任务不前推'],
+  [8, false, false, '480 秒后连最早投递点都在 450 秒窗外'],
+]) {
+  test(`lead window edge: ${label}`, () => {
+    const d = new Date(NOW.getTime() + mins * 60_000);
+    const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
+      + `${d.getMonth() + 1} *`;
+    assert.equal(taskWanted({ cron: expr, recurring }, NOW, LEAD_MS), want);
+  });
+}
 
-test('one-shot early-delivery lead does not apply with leadMs=0 (missed contract)', () => {
-  // lead=0 是「此刻是否已需要」：落点前 60 秒的未来任务不能被前推 90 秒
-  // 的窗口判成 wanted——display 的 missed 与 taskNeedMs 都依赖这个契约。
+test('wantedNow has no lookahead: a future slot is not yet needed', () => {
+  // 落点前 60 秒的未来任务：此刻口径只认错过∪尾窗，不前瞻——display 的
+  // missed 判定与回收余量都依赖它。
   const d = new Date(NOW.getTime() + 60_000);
   const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
     + `${d.getMonth() + 1} *`;
-  assert.equal(taskWanted({ cron: expr, recurring: false }, NOW, 0), false);
-});
-
-test('one-shot slot 8 minutes out is beyond even the early-delivery window', () => {
-  const d = new Date(NOW.getTime() + 8 * 60_000);
-  const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
-    + `${d.getMonth() + 1} *`;
-  assert.equal(taskWanted({ cron: expr, recurring: false }, NOW, LEAD_MS),
-    false);
+  assert.equal(wantedNow(new Cron(expr), { recurring: false }, NOW), false);
 });
 
 test('recurring flag identifies one-shot', () => {
@@ -322,10 +316,11 @@ test('ancient unmatchable one-shot stays cheap', () => {
   assert.ok(performance.now() - started < 200);
 });
 
-// wanted 直测（taskView 复用它）
-test('wanted is exported for the display view', () => {
+// 两个口径都供展示视图复用（taskView 各取所需）。
+test('wantedNow/wantedWithin are exported for the display view', () => {
   const soon = new Cron('*/5 * * * *');
-  assert.equal(typeof wanted(soon, { recurring: true }, NOW, LEAD_MS),
+  assert.equal(typeof wantedNow(soon, { recurring: true }, NOW), 'boolean');
+  assert.equal(typeof wantedWithin(soon, { recurring: true }, NOW, LEAD_MS),
     'boolean');
 });
 
@@ -448,10 +443,10 @@ test('wanted tail window is bounded by the actual delay, not the 30m cap', () =>
   // 内，距落点 14 分）与 15:46（尾窗外，距落点 16 分）夹住。
   const cron = '30 15 * * *';
   const at = (h, m) => new Date(2026, 8, 20, h, m, 0);
-  assert.equal(wanted(new Cron(cron),
-    { id: '058e0149', recurring: true }, at(15, 44), 0), true);
-  assert.equal(wanted(new Cron(cron),
-    { id: '058e0149', recurring: true }, at(15, 46), 0), false);
+  assert.equal(wantedNow(new Cron(cron),
+    { id: '058e0149', recurring: true }, at(15, 44)), true);
+  assert.equal(wantedNow(new Cron(cron),
+    { id: '058e0149', recurring: true }, at(15, 46)), false);
 });
 
 test('nextDelivery answers the pending tail delivery, not the next slot', () => {

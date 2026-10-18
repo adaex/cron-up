@@ -196,22 +196,10 @@ function createdAtDate(task) {
   return Number.isFinite(d.getTime()) ? d : null;
 }
 
-// 在已解析的 cron 上判定：这个任务现在是否需要一个已预热的会话。
-function wanted(cron, task, now, leadMs) {
-  const nxt = cron.nextAfter(now);
-  if (nxt) {
-    // 前瞻窗口（leadMs>0）里，一次性任务在 :00/:30 网格落点最多提前
-    // oneShotMaxMs 投递（见 nextDelivery 的 Wsn 复刻）：窗口前沿要罩到
-    // 最早投递时刻，否则约一成相位带在提前量内没有任何巡检点。非网格
-    // 落点本不提前，保守同口径只是多等 90 秒，无损。leadMs=0 是「此刻
-    // 是否已需要」契约（display 的 missed 判定、taskNeedMs 都依赖它），
-    // 不前推——未来任务不能在落点前 90 秒就被当成已错过。周期任务的抖
-    // 动在落点之后，由下面的投递尾窗覆盖，窗口不提前。
-    const lookahead = leadMs > 0 && taskIsOneshot(task)
-      ? leadMs + CC_JITTER.oneShotMaxMs
-      : leadMs;
-    if (nxt.getTime() <= now.getTime() + lookahead) return true;
-  }
+// 此刻是否已需要会话：一次性任务错过待补，或周期任务处在落点之后、抖动
+// 投递之前的尾窗。不带任何前瞻——display 的「已错过」判定与回收余量都
+// 按这个口径，未来落点子句不属于这里。
+function wantedNow(cron, task, now) {
   // 首次触发已过却仍在文件里：一次性任务意味着没有 REPL 运行时被错过
   // （重启/睡眠）。原生机制会在会话启动时补执行一次再删除它。
   if (taskIsOneshot(task)) {
@@ -235,15 +223,33 @@ function wanted(cron, task, now, leadMs) {
   return recurringTailWindow(cron, task.id, now) !== null;
 }
 
+// leadMs 前瞻窗口内（含此刻）是否需要会话。leadMs 必须为正的前瞻量；
+// 传 0 时等价 wantedNow（「此刻」没有窗口，网格提前量也不成立），问此
+// 刻口径请直接用 wantedNow。一次性任务在 :00/:30 网格落点最多提前
+// oneShotMaxMs 投递（见 nextDelivery 的 Wsn 复刻）：前瞻窗口的前沿罩到
+// 最早投递时刻，否则约一成相位带在提前量内没有任何巡检点；非网格落点
+// 本不提前，保守同口径只是多等 90 秒，无损。周期任务的抖动在落点之
+// 后，未来子句不前推，尾窗交给 wantedNow。
+function wantedWithin(cron, task, now, leadMs) {
+  if (leadMs > 0) {
+    const nxt = cron.nextAfter(now);
+    const lookahead = taskIsOneshot(task)
+      ? leadMs + CC_JITTER.oneShotMaxMs
+      : leadMs;
+    if (nxt && nxt.getTime() <= now.getTime() + lookahead) return true;
+  }
+  return wantedNow(cron, task, now);
+}
+
 // 任务是否需要已预热的会话。任务字段全是别的程序写的，畸形条目读作「不
 // 需要」，绝不能让一个坏条目中断整轮巡检。
 export function taskWanted(task, now, leadMs) {
   const cron = parseCronOrNone(task?.cron);
-  return cron !== null && wanted(cron, task, now, leadMs);
+  return cron !== null && wantedWithin(cron, task, now, leadMs);
 }
 
-// wanted 供展示视图复用（同一个已解析 cron 顺带回答巡检问题）。
-export { wanted };
+// 两个口径供展示视图复用（同一个已解析 cron 顺带回答巡检问题）。
+export { wantedNow, wantedWithin };
 
 // ---- Claude Code 投递抖动（预计实际触发时间）----
 // 复刻 v2.1.285 内部的 M()：任务 id 前 8 位十六进制除以 2^32，得 [0,1) 的

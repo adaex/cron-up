@@ -3,7 +3,8 @@
 import {
   parseCronOrNone,
   taskIsOneshot,
-  wanted,
+  wantedNow,
+  wantedWithin,
   nextDelivery,
 } from './cron.mjs';
 
@@ -71,7 +72,7 @@ function taskSummary(task) {
 
 // 把一个任务整理成展示数据。字段来自别的程序写的文件，畸形也不抛。
 // 传 leadMs 时顺带在同一个已解析 cron 上回答「现在是否需要预热会话」
-// （wanted），总览页就不必为同一任务再解析一遍 cron。
+// （wantedWithin），总览页就不必为同一任务再解析一遍 cron。
 export function taskView(task, now, leadMs) {
   const expr = task?.cron;
   const cron = parseCronOrNone(expr);
@@ -90,8 +91,8 @@ export function taskView(task, now, leadMs) {
   }
   const oneshot = taskIsOneshot(task);
   // nxt 按定义不晚于展示语境里的下一次投递，「已错过」完全由补执行判定
-  // 回答：lead 传 0（不带前瞻），与巡检的补执行判定同一口径。
-  const missed = oneshot && wanted(cron, task, now, 0);
+  // 回答：只问此刻、不带前瞻，与巡检的错过/尾窗判定同一口径。
+  const missed = oneshot && wantedNow(cron, task, now);
   // 落点与投递由 nextDelivery 同源算出：尾窗内的周期任务即将到来的是上
   // 一落点的这次延迟投递，箭头才画得出「09:00 → 09:30」，而不是从明天
   // 的落点拐回来（2 月 29 日任务尾窗内 nextAfter 甚至找不到下一落点）。
@@ -108,7 +109,7 @@ export function taskView(task, now, leadMs) {
     summary: taskSummary(task),
     // wanted 恒为 null 或布尔：没传 leadMs（不问）与 cron 无效（问不了）
     // 都是 null，键的形状不随参数变化。
-    wanted: leadMs !== undefined ? wanted(cron, task, now, leadMs) : null,
+    wanted: leadMs !== undefined ? wantedWithin(cron, task, now, leadMs) : null,
     // 计入 Claude Code 投递抖动后的预计实际触发时刻；已错过的一次性任务
     // 没有未来触发，为 null；尾窗内的周期任务是即将到来的这次延迟投递。
     // 与 nxt 同为 Date 或 null。
