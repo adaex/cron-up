@@ -212,6 +212,15 @@ test('one-shot window reaches 90s before the slot for early grid delivery', () =
     false);
 });
 
+test('one-shot early-delivery lead does not apply with leadMs=0 (missed contract)', () => {
+  // lead=0 是「此刻是否已需要」：落点前 60 秒的未来任务不能被前推 90 秒
+  // 的窗口判成 wanted——display 的 missed 与 taskNeedMs 都依赖这个契约。
+  const d = new Date(NOW.getTime() + 60_000);
+  const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
+    + `${d.getMonth() + 1} *`;
+  assert.equal(taskWanted({ cron: expr, recurring: false }, NOW, 0), false);
+});
+
 test('one-shot slot 8 minutes out is beyond even the early-delivery window', () => {
   const d = new Date(NOW.getTime() + 8 * 60_000);
   const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `

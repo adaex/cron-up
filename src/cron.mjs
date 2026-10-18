@@ -200,15 +200,17 @@ function createdAtDate(task) {
 function wanted(cron, task, now, leadMs) {
   const nxt = cron.nextAfter(now);
   if (nxt) {
-    // 一次性任务在 :00/:30 网格落点最多提前 oneShotMaxMs 投递（见
-    // nextDelivery 的 Wsn 复刻）：窗口前沿要罩到最早投递时刻，否则约一成
-    // 相位带在提前量内没有任何巡检点。非网格落点本不提前，保守同口径只
-    // 是多等 90 秒，无损。周期任务的抖动在落点之后，由下面的投递尾窗覆
-    // 盖，窗口不提前。
-    const earliest = taskIsOneshot(task)
-      ? nxt.getTime() - CC_JITTER.oneShotMaxMs
-      : nxt.getTime();
-    if (earliest <= now.getTime() + leadMs) return true;
+    // 前瞻窗口（leadMs>0）里，一次性任务在 :00/:30 网格落点最多提前
+    // oneShotMaxMs 投递（见 nextDelivery 的 Wsn 复刻）：窗口前沿要罩到
+    // 最早投递时刻，否则约一成相位带在提前量内没有任何巡检点。非网格
+    // 落点本不提前，保守同口径只是多等 90 秒，无损。leadMs=0 是「此刻
+    // 是否已需要」契约（display 的 missed 判定、taskNeedMs 都依赖它），
+    // 不前推——未来任务不能在落点前 90 秒就被当成已错过。周期任务的抖
+    // 动在落点之后，由下面的投递尾窗覆盖，窗口不提前。
+    const lookahead = leadMs > 0 && taskIsOneshot(task)
+      ? leadMs + CC_JITTER.oneShotMaxMs
+      : leadMs;
+    if (nxt.getTime() <= now.getTime() + lookahead) return true;
   }
   // 首次触发已过却仍在文件里：一次性任务意味着没有 REPL 运行时被错过
   // （重启/睡眠）。原生机制会在会话启动时补执行一次再删除它。

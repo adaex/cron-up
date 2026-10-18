@@ -323,9 +323,9 @@ export async function patrolWorkspace(
     // (c) window 回收：不要求任务此刻在窗口内——恰恰是执行完、已离开窗
     // 口的会话要被收掉。三条件缺一不可：本任务在本代执行过（lastFiredAt
     // 晚于 startedAt——区分「执行完的空闲」与「等触发的空闲」，后者是预
-    // 热缓存在干活）、本任务日志静默超时、距本任务下次需要还有两步余量
-    // （下轮重拉、再下轮盖印；needMs 在窗口内返回 now，天然挡住「回收后
-    // 立刻又需要」）。
+    // 热缓存在干活）、本任务日志静默超时、距本任务下次需要还有一个巡检
+    // 间隔加余量（下轮发现并 spawn、当轮等待认亲盖印；needMs 在窗口内
+    // 返回 now，天然挡住「回收后立刻又需要」）。
     if (ent && deps.trackedAlive(ent) && entryClaimed(ent)
         && typeof t.lastFiredAt === 'number'
         && t.lastFiredAt > (ent.startedAt ?? 0) * 1000
@@ -571,7 +571,7 @@ export async function patrolWorkspace(
 // 进入时各工作区决策已串行花掉数秒，健康会话可能已登记。任一 pending
 // 认亲或死亡都把它移出集合，全部移出即提前结束；拍数帽与墙钟帽双出口。
 // 返回最新登记快照与按 ws 分组的认亲条目（供盖印收尾）。
-async function awaitWarmups(pending, state, initialDetails, stats) {
+async function awaitWarmups(pending, state, initialDetails, cur, stats) {
   const claimed = [];
   const died = [];
   let details = initialDetails;
@@ -582,9 +582,21 @@ async function awaitWarmups(pending, state, initialDetails, stats) {
       const ent = state[p.ws]?.[p.key];
       if (!ent || ent.pid !== p.pid) continue;
       if (!deps.trackedAlive(ent)) {
-        // 等待期内自然死亡：条目轮末会被 kept 丢弃，这里留个名字给 cmdRun
-        // 报「会话退出」，与跨轮被动死亡同等级的可观测性。
-        died.push({ ...p, ent });
+        // 等待期内自然死亡（启动即崩的典型窗口）：真拉起过却死掉，计一
+        // 次失败并把 pid 置空，条目靠 fails 走 48 小时 TTL 保留、下轮重
+        // 拉——形状与 spawn 当场失败一致，下轮不再重复 +1。若只打日志
+        // 丢弃，fails 永远从零起，坏掉的环境每轮重拉却永不冷却。满三次
+        // 当轮进冷却。died 另存 pid 供退出日志（ent.pid 即将置空）。
+        ent.fails = (ent.fails ?? 0) + 1;
+        ent.pid = null;
+        delete ent.procStart;
+        if (ent.fails >= FAIL_LIMIT) {
+          ent.cooldownUntil = cur + COOLDOWN_SECONDS;
+          bump(stats, 'cool');
+          deps.log(`冷却 ${p.ws} 任务 ${p.key}：仍有任务需要会话，但预热连续失败 `
+            + `${ent.fails} 次，暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
+        }
+        died.push({ ...p, ent, diedPid: p.pid });
         continue;
       }
       const d = deps.claimWarm(details, p.ws, p.pid);
@@ -814,13 +826,13 @@ export async function cmdRun(args) {
       let died = [];
       try {
         ({ details, claimed, died } = await awaitWarmups(
-          pendingAll, state, details, stats));
+          pendingAll, state, details, cur, stats));
         consumers = new Set(details.keys());
         // 等待期内自然死亡的是本轮新 spawn 的会话，不在轮初 prevAlive 分
         // 组里，单独补一条退出日志，否则启动即崩将完全静默。
         for (const d of died) {
           bump(stats, 'exit');
-          deps.log(exitLine(d.ws, d.key, d.ent));
+          deps.log(exitLine(d.ws, d.key, { ...d.ent, pid: d.diedPid }));
         }
         const claimedByWs = new Map();
         for (const p of claimed) {

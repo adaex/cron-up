@@ -207,7 +207,12 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   };
 
   if (realDiscover) {
-    m.patrol = () => cmdRun({ config: cfgPath });
+    // 拍号/扫描计数按轮归零：跨轮用例的「第 N 拍」钩子是相对每轮的语义。
+    m.patrol = () => {
+      polls = 0;
+      scanCount = 0;
+      return cmdRun({ config: cfgPath });
+    };
   } else {
     const bucket = {};
     m.bucket = bucket;
@@ -702,19 +707,44 @@ test('cmdRun: unregistered warm session is waited out but not killed or counted'
   assert.equal(ent.sessionId, undefined);
 });
 
-test('cmdRun: pending session dying during wait ends the wait early', async (t) => {
+test('cmdRun: pending session dying during wait counts a failure and is kept', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   const lines = [];
   m.deps.log = (msg) => lines.push(msg);
   writeTaskFile(m.WS, [makeTask({ id: '00000002' })]);
   m.killAt(() => m.byTask.get('00000002'), 2);
   assert.equal(await m.patrol(), true);
-  // 第 2 拍死亡被认出后集合清空，不再睡满 8 拍；不重拉、不计数。
+  // 第 2 拍死亡被认出后集合清空，不再睡满 8 拍；当轮不重拉。
   assert.equal(m.polls(), 2);
   assert.equal(m.spawns.length, 1);
-  assert.equal(m.state()[m.WS]?.['00000002'], undefined);
+  // 真拉起过却死掉要计一次失败：条目 pid 置空、fails=1、随 TTL 保留，
+  // 下轮重拉。若丢弃，启动即崩的环境会每轮全新计数、永不冷却。
+  const ent = m.state()[m.WS]['00000002'];
+  assert.equal(ent.pid, null);
+  assert.equal(ent.fails, 1);
+  assert.equal(typeof ent.deadSince, 'number');
   // 启动后二十几秒内自然死亡仍报「会话退出」，不静默。
   assert.ok(lines.some((l) => l.includes('会话退出') && l.includes('00000002')));
+});
+
+test('cmdRun: warm sessions dying in the wait window reach cooldown in three rounds', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const lines = [];
+  m.deps.log = (msg) => lines.push(msg);
+  writeTaskFile(m.WS, [makeTask({ id: '00000002' })]);
+  // 连续三轮：每轮拉起的会话都在等待期第 1 拍死亡。
+  for (let round = 1; round <= 3; round += 1) {
+    m.killAt(() => m.spawns[m.spawns.length - 1], 1);
+    await m.patrol();
+  }
+  const ent = m.state()[m.WS]['00000002'];
+  assert.equal(ent.fails, FAIL_LIMIT);
+  assert.ok(ent.cooldownUntil > Math.floor(Date.now() / 1000));
+  assert.ok(lines.some((l) => l.includes('冷却') && l.includes('00000002')));
+  // 冷却期内不再拉起新会话。
+  const spawnsBefore = m.spawns.length;
+  await m.patrol();
+  assert.equal(m.spawns.length, spawnsBefore);
 });
 
 test('cmdRun: two tasks claimed on different polls are both stamped same round', async (t) => {

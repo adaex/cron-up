@@ -51,6 +51,22 @@ test('taskView aligns the slot to the pending tail delivery', () => {
   assert.equal(v.fire.getTime(), new Date(2026, 8, 20, 16, 0, 0).getTime());
 });
 
+test('future one-shot within 90s of a grid slot is not shown as missed', () => {
+  // 回归：一次性网格落点最多提前 90 秒投递只属于巡检的前瞻窗口
+  // （leadMs>0）；lead=0 的 missed 判定不能把落点前 60 秒的未来任务
+  // 显示成「已错过」（否则时间列消失、总览「最近」漏掉它）。
+  const now = new Date(2026, 8, 20, 15, 59);
+  const v = taskView({
+    id: 'c1363d8b', cron: '0 16 20 9 *', recurring: false,
+    createdAt: now.getTime() - 60_000,
+  }, now, 6 * 60_000);
+  assert.equal(v.missed, false);
+  assert.ok(v.nxt instanceof Date);
+  assert.ok(v.fire instanceof Date);
+  // 巡检口径仍把它算作窗口内（360 秒提前量 + 90 秒网格提前）。
+  assert.equal(v.wanted, true);
+});
+
 test('missed one-shot has no next slot', () => {
   // 已错过的一次性任务：nxt 必须为 null，否则「一年内无」的判断和总览
   // 「最近」（fire ?? nxt）会把它当成明年同刻的安排。
