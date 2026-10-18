@@ -184,7 +184,7 @@ npm link                    # 本机把开发版链接成全局 cron-up
 - **发布方式**：先把 package.json 的 version 改成新版本并合入 main，再打同名 `v<version>` tag（如 `v26.9.21`）；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致（不符直接失败）、并 publish。tag 失败的 launchd 入口旧 tag 重跑即可，序号不消耗。发布失败的 tag 重跑 release 工作流即可，序号不消耗。
 - npm 经 GitHub OIDC 验证「确为 `adaex/cron-up` 仓库 `v` 触发的运行」后放行，仓库里没有 NPM_TOKEN，token 泄漏这条路不存在。
 - **发版收尾**（每次发版必做）：按上述方式升级后，跑一次无参数的 `cron-up`，确认首行是刚发的版本号、服务已加载且上次退出码 0、「需要留意」为空。
-- **npm 传播延迟**：publish 成功约两分钟才完成处理，本机缓存各自滞后，装到旧版且毫无提示——等两分钟后用显式版本号安装，装完以总览首行版本号为准。
+- **npm 传播延迟**：publish 成功后到 registry 可查通常两分钟、偶发七八分钟（带 provenance 要等透明日志与后端入库），本机元数据缓存还会再滞后，直接 `npm i -g cron-up` 可能装回旧版且毫无提示——用显式版本号加 `--prefer-online` 安装（`npm i -g cron-up@<新版本> --prefer-online`），装完以总览首行版本号为准。
 - **trusted publishing**：npm 包设置页里已登记 GitHub 仓库（repository `adaex/cron-up`，workflow `release.yml`），一次性配置，没了见 Trusted Publisher 文档。
 
 ## License
