@@ -46,7 +46,7 @@ test('--config= inline form', () => {
   assert.equal(parseCli(['--config=/x/c.json', 'run']).config, '/x/c.json');
 });
 
-test('--help prints usage with the five surviving commands', async (t) => {
+test('--help prints commands and maintenance next steps', async (t) => {
   const deps = mockDeps(t);
   const lines = [];
   deps.print = (m) => lines.push(m);
@@ -57,6 +57,8 @@ test('--help prints usage with the five surviving commands', async (t) => {
     assert.ok(usage.includes(`cron-up ${name}`), name);
   }
   assert.ok(!usage.includes('renew'));
+  assert.match(usage, /npm i -g cron-up@latest --prefer-online\n\s+cron-up install/);
+  assert.match(usage, /cron-up uninstall --purge\n\s+npm uninstall -g cron-up/);
 });
 
 test('-h is the same as --help', () => {

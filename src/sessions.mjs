@@ -119,11 +119,11 @@ function canSignalProcessGroup(pid) {
 // 为一个任务拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
 export function spawnSession(ws, taskId) {
   const logPath = sessionLogPath(ws, taskId);
-  // 会话日志目录 700（README 承诺）：每任务独立文件，目录只在此处创建。
+  // 会话日志目录 700（README 权限约定）：每任务独立文件，目录只在此处创建。
   ensurePrivateDir(path.dirname(logPath));
-  // 「一代会话 = 一次执行」：script(1) 打开即截断，不轮转的话上一代（上
-  // 一次执行）的界面记录会随本次拉起被抹掉。无条件保留一代（.1）——总
-  // 量上界两代，活着的一代增长再快也只影响自身，不会经轮转放大。
+  // script(1) 启动即截断：每次新拉起前无条件保留上一代（.1），避免上次
+  // 启动以来的界面记录被抹掉。总量上界两代，活着的一代增长再快也只影响
+  // 自身，不会经轮转放大。
   try {
     if (fs.existsSync(logPath)) rotateOnce(logPath);
   } catch {

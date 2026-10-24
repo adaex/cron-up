@@ -77,7 +77,7 @@ function overviewTasks(cfg, cols, details, state) {
         bad += 1;
         continue;
       }
-      // 「最近」按计入抖动后的预计实际触发排，而非 cron 落点。
+      // 「最近」按计入抖动后的预计投递时间排，而非 cron 落点。
       const fire = v.fire ?? v.nxt;
       if (fire && (!soonest || fire.getTime() < soonest[0].getTime())) {
         soonest = [fire, ws, v.summary, v.nxt];
@@ -189,18 +189,18 @@ function overviewSessions(cols, state, details, suppressCooling, discovered) {
 }
 
 const COMMANDS = [
-  ['list', '逐个列出任务的内容摘要、设定/预计触发时间与预热状态'],
+  ['list', '逐个列出任务的内容摘要、设定/预计投递时间与预热状态'],
   ['logs [目录片段] [-f]', '查看巡检日志或后台会话记录'],
   ['run', '立即手动巡检一轮'],
-  ['install --roots ~/a,~/b', '更新扫描目录并重新安装（不带参数保留现有配置）'],
+  ['install --roots ~/a,~/b', '更新扫描目录并重新安装（不带参数沿用有效配置）'],
 ];
 
 export async function cmdOverview(args) {
   const cols = deps.terminalWidth();
   const v = packageVersion();
   deps.print(v === null
-    ? 'cron-up —— 为定时任务提前备好交互会话'
-    : `cron-up ${v} —— 为定时任务提前备好交互会话（一任务一会话）`);
+    ? 'cron-up —— 为 Claude Code 定时任务按需预热交互会话'
+    : `cron-up ${v} —— 为 Claude Code 定时任务按需预热交互会话（一任务一会话）`);
 
   const cfgPath = args?.config ?? deps.paths.configPath;
   let cfg = null;
@@ -232,8 +232,8 @@ export async function cmdOverview(args) {
   } else if (cfg === null) {
     deps.print('配置：缺失，运行 cron-up install 生成');
   } else {
-    deps.print(`巡检：每 ${INTERVAL_SECONDS} 秒一轮，提前 ${LEAD_SECONDS} `
-      + '秒为每个窗口内任务启动专属预热会话');
+    deps.print(`巡检：每 ${INTERVAL_SECONDS} 秒一轮，周期任务提前 ${LEAD_SECONDS} `
+      + '秒进入预热窗口');
     if (info && info.interval !== null && info.interval !== undefined
         && info.interval !== INTERVAL_SECONDS) {
       alerts.push(`launchd 实际间隔 ${info.interval} 秒与当前版本的 `

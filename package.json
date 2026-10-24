@@ -1,14 +1,16 @@
 {
   "name": "cron-up",
   "version": "26.10.33",
-  "description": "为命令行 AI agent 的 cron 定时任务提前预热并保活交互式会话",
+  "description": "为 Claude Code 定时任务在触发前按需预热交互会话",
   "type": "module",
   "bin": {
     "cron-up": "bin/cron-up.mjs"
   },
   "files": [
     "bin",
-    "src"
+    "src",
+    "docs",
+    "CONTRIBUTING.md"
   ],
   "scripts": {
     "test": "node --test"

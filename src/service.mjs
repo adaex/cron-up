@@ -360,11 +360,12 @@ export async function cmdInstall(args) {
   validateConfig(cfg, (m) => deps.print(m));
   if (JSON.stringify(cfg.roots)
       === JSON.stringify(normalizeRoots(DEFAULT_CONFIG.roots))) {
-    // 与 README 安全说明同一句话，在配置落定的这一刻当面再说一遍。
+    // 与 README「安全与自动修改」同一口径，在配置落定时再提示一次。
     deps.print(`提示：未指定 --roots，默认扫描 ${DEFAULT_CONFIG.roots.join('、')}`
       + '（不存在的目录跳过）；今后 clone 进这些容器的仓库也会进入巡检，'
-      + '其中的周期任务会被自动续期永久化。目录布局不同或需收窄时用 '
-      + '--roots 指定（见 README 安全说明）');
+      + '其中的周期任务会被自动续期永久化，任务、CLAUDE.md 与项目配置都会'
+      + '影响无人值守会话。目录布局不同或需收窄时用 --roots 指定'
+      + '（见 README「安全与自动修改」）');
   }
 
   const launcher = deps.resolveLauncher();
@@ -515,7 +516,7 @@ export async function cmdUninstall(args) {
       // npm 管的文件不能手删：命令行本身交给 npm 卸载。
       deps.print('命令行本身请运行 npm uninstall -g cron-up 卸载');
     } else {
-      deps.print('配置与日志已保留（--purge 可删除全部产物）');
+      deps.print('配置与日志已保留（--purge 可删除 cron-up 自有配置与日志）');
     }
   } finally {
     deps.releaseRunLock(lock);

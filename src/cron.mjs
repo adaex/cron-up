@@ -260,7 +260,7 @@ export function taskWanted(task, now, leadMs) {
 // 两个口径供展示视图复用（同一个已解析 cron 顺带回答巡检问题）。
 export { wantedNow, wantedWithin };
 
-// ---- Claude Code 投递抖动（预计实际触发时间）----
+// ---- Claude Code 投递抖动（预计投递时间）----
 // 复刻 v2.1.285 内部的 M()：任务 id 前 8 位十六进制除以 2^32，得 [0,1) 的
 // 固定哈希——同一任务每次触发的抖动完全相同，不是随机数。id 缺失或前 8
 // 位都不是十六进制时 parseInt 得 NaN，上游回退 0；任务文件由别的程序书
@@ -271,7 +271,7 @@ export function taskIdHash(taskId) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// 任务在展示语境里的「落点 → 预计实际投递」对：一次性任务是落点加网格
+// 任务在展示语境里的「设定时间 → 预计投递」对：一次性任务是落点加网格
 // 提前量；周期任务在投递尾窗内属于上一落点（即将到来的这次延迟投递，
 // 不是 nextAfter 给出的下个落点——后者严格在未来，会把展示拐到明天），
 // 否则是下一落点 + 按 id 的抖动。先于窗口检查尾窗：2 月 29 日这类长周期
@@ -326,7 +326,7 @@ function recurringDelayMs(cron, slot, taskId, withinDays) {
 
 // 周期任务的「投递尾窗」判定：上一落点已过、按 id 算的延迟投递时刻未
 // 到。返回 [落点, 投递时刻 ms]；不在尾窗、找不到上一或下一落点返回
-// null。wanted（保活判定）与 nextDelivery（展示）共用这一口径，两边不会
+// null。wanted（会话需求判定）与 nextDelivery（展示）共用这一口径，两边不会
 // 各说各话；窗口取 TAIL_WINDOW_DAYS，理由见 constants。
 function recurringTailWindow(cron, taskId, now) {
   const prev = cron.prevAtOrBefore(now, TAIL_WINDOW_DAYS);

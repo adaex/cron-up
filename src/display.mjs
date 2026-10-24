@@ -110,7 +110,7 @@ export function taskView(task, now, leadMs) {
     // wanted 恒为 null 或布尔：没传 leadMs（不问）与 cron 无效（问不了）
     // 都是 null，键的形状不随参数变化。
     wanted: leadMs !== undefined ? wantedWithin(cron, task, now, leadMs) : null,
-    // 计入 Claude Code 投递抖动后的预计实际触发时刻；已错过的一次性任务
+    // 计入 Claude Code 投递抖动后的预计投递时刻；已错过的一次性任务
     // 没有未来触发，为 null；尾窗内的周期任务是即将到来的这次延迟投递。
     // 与 nxt 同为 Date 或 null。
     fire: missed ? null : fire,
@@ -135,7 +135,7 @@ export function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
-// 「设定落点 → 预计实际触发」文案。抖动四舍五入到秒（调度器秒级轮询）：
+// 「设定时间 → 预计投递」文案。抖动四舍五入到秒（调度器秒级轮询）：
 // 同日省略第二个日期；预计值带非零秒时显示 HH:MM:SS（如 05:15:37）；落
 // 在同一分钟（无抖动）则只显示落点，不画无意义的箭头。
 export function fmtFireRange(nxt, fire) {

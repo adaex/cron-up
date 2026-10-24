@@ -5,7 +5,7 @@
 export const DEFAULT_CONFIG = {
   // 默认只扫本人的三个任务制容器，不扫整个家目录——他人可写仓库里的周期
   // 任务会被自动续期永久化，默认范围必须是用户完全掌控的领地（见 README
-  // 安全说明）。其他布局用 cron-up install --roots 覆盖；目录不存在则跳过。
+  // 「安全与自动修改」）。其他布局用 cron-up install --roots 覆盖；目录不存在则跳过。
   roots: ['~/space', '~/workspace', '~/tasks'],
 };
 
@@ -45,9 +45,8 @@ export const WARMUP_GRACE_SECONDS = 180;
 // 帽与墙钟帽双出口，高负载拖慢 setTimeout 也不会把一轮撑过间隔。
 export const WARMUP_WAIT_MS = 24_000;
 export const WARMUP_POLL_MS = 3_000;
-// window 回收判据一：界面静默超过此时长视为「本任务已执行完」。TUI 工作
-// 时持续渲染（毫秒级刷新 typescript），静默 3 分钟不可能是在执行；取
-// WARMUP_GRACE 同值，结构上对齐「3 分钟定生死」的既有心智。
+// window 回收判据一：界面静默超过此时长，作为本代触发后空闲的启发式，
+// 不是任务完成状态的证明。取 WARMUP_GRACE 同值，结构上对齐既有心智。
 export const SESSION_RECYCLE_IDLE_SECONDS = WARMUP_GRACE_SECONDS;
 // window 回收判据二：距该任务下次「需要会话在场」至少还有这么多秒。回收
 // 后下轮（≤INTERVAL）发现并 spawn，进程即在场，盖印在该轮等待期内完成；
@@ -73,7 +72,7 @@ export const PRUNE_DIRS = new Set([
 ]);
 
 // Claude Code 会话投递定时任务时的抖动参数，两处使用：list/总览预测
-// 「预计实际触发时间」；巡检把「落点之后、延迟投递点之前」这段投递尾窗
+// 「预计投递时间」；巡检把「落点之后、延迟投递点之前」这段投递尾窗
 // 也算作需要会话在场，避免在任务真正投递前把预热回收。逆向自
 // Claude Code v2.1.285
 // （darwin-arm64 原生二进制，2026-09-30 安装）内部 createCronScheduler 的
@@ -81,8 +80,7 @@ export const PRUNE_DIRS = new Set([
 // recurringCapMs)；一次性任务在 :00/:30 网格点提前 0~oneShotMaxMs。
 // 这些值没有稳定性承诺——版本升级可能改，运行时还可能被远程配置键
 // tengu_kairos_cron_config（60 秒刷新，校验失败回退默认）覆盖。预测与
-// 实际系统性对不上时，按 findings 主题
-// claude-code-scheduled-task-jitter 的排查步骤复核新版本。
+// 实际系统性对不上时，按 docs/internals.md 的版本证据与复核步骤核对新版本。
 export const CC_JITTER = {
   recurringFrac: 0.5,
   recurringCapMs: 30 * 60 * 1000,

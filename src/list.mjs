@@ -19,7 +19,7 @@ function rank(v) {
   return v.nxt ? 1 : 2;
 }
 
-// 状态列文案：有效任务是「设定落点 → 预计实际触发」（无抖动时只有落点）。
+// 状态列文案：有效任务是「设定时间 → 预计投递」（无抖动时只有设定时间）。
 function statusText(v) {
   if (!v.valid) return 'cron 无效';
   if (v.missed) return '已错过';
