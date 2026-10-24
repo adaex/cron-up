@@ -180,10 +180,10 @@ npm link                    # 本机把开发版链接成全局 cron-up
 
 ## 发布
 
-- **版本号**：按「年.月.序号」——两位年份、两位月份、累计发布序号（0.x 时代的发布总数，含 0.x，序号永不重置、不随月份归零，始终等于含本次在内的历史发布总次数）。下一序号不用手数：发布前 `git fetch --prune --tags` 后数 v* tag 总数加一，`prune-tags` 让删错的 tag 不计数。
-- **发布方式**：先把 package.json 的 version 改成新版本并合入 main，再打同名 `v<version>` tag（如 `v26.9.21`）；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致（不符直接失败）、并 publish。tag 失败的 launchd 入口旧 tag 重跑即可，序号不消耗。发布失败的 tag 重跑 release 工作流即可，序号不消耗。
+- **版本号**：按「年.月.序号」——两位年份、两位月份、累计发布序号（0.x 时代的发布总数，含 0.x，序号永不重置、不随月份归零，始终等于含本次在内的历史发布总次数）。下一序号不用手数：发布前 `git fetch --prune --prune-tags --tags` 后数 v* tag 总数加一，`prune-tags` 让删错的 tag 不计数。
+- **发布方式**：先把 package.json 的 version 改成新版本并合入 main，再创建同名签名注解 tag 并推送：`git tag -s v<version> <发布提交> -m "发布 <version>"`、`git push origin v<version>`；GitHub Actions 会跑通测试（Node 22/24）、校验 package.json 版本与 tag 一致（不符直接失败）、并 publish。tag 失败的 launchd 入口旧 tag 重跑即可，序号不消耗。发布失败的 tag 重跑 release 工作流即可，序号不消耗。
 - npm 经 GitHub OIDC 验证「确为 `adaex/cron-up` 仓库 `v` 触发的运行」后放行，仓库里没有 NPM_TOKEN，token 泄漏这条路不存在。
-- **发版收尾**（每次发版必做）：按上述方式升级后，跑一次无参数的 `cron-up`，确认首行是刚发的版本号、服务已加载且上次退出码 0、「需要留意」为空。
+- **发版收尾**（每次发版必做）：逐台升级已有安装，在每台机器用显式新版本号加 `--prefer-online` 安装后重跑一次 `cron-up install`，再跑无参数的 `cron-up`，确认首行是刚发的版本号、服务已加载且上次退出码 0、「需要留意」为空。未安装的机器不借升级新装；连不上的机器明确记为未完成，不能以 npm 发布成功代替逐机核实。
 - **npm 传播延迟**：publish 成功后到 registry 可查通常两分钟、偶发七八分钟（带 provenance 要等透明日志与后端入库），本机元数据缓存还会再滞后，直接 `npm i -g cron-up` 可能装回旧版且毫无提示——用显式版本号加 `--prefer-online` 安装（`npm i -g cron-up@<新版本> --prefer-online`），装完以总览首行版本号为准。
 - **trusted publishing**：npm 包设置页里已登记 GitHub 仓库（repository `adaex/cron-up`，workflow `release.yml`），一次性配置，没了见 Trusted Publisher 文档。
 
