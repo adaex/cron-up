@@ -12,11 +12,13 @@ import { isDecInt } from './internals.mjs';
 const MS_DAY = 86400_000;
 const MS_MINUTE = 60_000;
 
-// 严格十进制整数（isDecInt 的谓词见 internals）：parseInt("5x") 会静默返回
-// 5，必须自己卡。
+// 严格十进制安全整数（isDecInt 的谓词见 internals）：parseInt("5x") 会
+// 静默返回 5；达到 2^53 后 v+=1 不再改变数值，区间循环会永久挂住。
 function strictInt(s) {
   if (!isDecInt(s)) throw new Error(`不是整数：${s}`);
-  return parseInt(s, 10);
+  const n = parseInt(s, 10);
+  if (!Number.isSafeInteger(n)) throw new Error(`整数超出安全范围：${s}`);
+  return n;
 }
 
 // 解析一个 cron 字段为它命名的合法值域集合。
@@ -53,9 +55,16 @@ export function parseCronField(expr, lo, hi) {
       start = end = strictInt(rng);
       if (slash >= 0) end = hi; // vixie："5/10" 表示 5,15,25,… 直到 hi
     }
-    for (let v = start; v <= end; v += step) {
-      if (v >= lo && v <= hi) values.add(v);
-    }
+    if (start > end || end < lo || start > hi) continue;
+    // 只迭代合法值域内的至多 hi-lo+1 个值。起点低于 lo 时用步进算出
+    // 首个候选，不能直接钳到 lo，否则 0-20/3 在 lo=1 时会从 3,6,…
+    // 变成 1,4,…；终点直接钳到 hi，超大区间不会拖死整轮巡检。
+    const first = start < lo
+      ? start + Math.ceil((lo - start) / step) * step
+      : start;
+    if (!Number.isSafeInteger(first)) continue;
+    const last = Math.min(end, hi);
+    for (let v = first; v <= last; v += step) values.add(v);
   }
   return values;
 }

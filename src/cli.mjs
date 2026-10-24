@@ -4,22 +4,13 @@
 
 // 先引全量入口，保证所有业务模块都已向 deps 自注册，再引命令函数。
 import './index.mjs';
-import { deps, ExitError, isDecInt } from './internals.mjs';
+import { deps, ExitError } from './internals.mjs';
 import { cmdRun } from './patrol.mjs';
 import { cmdInstall, cmdUninstall } from './service.mjs';
 import { cmdList } from './list.mjs';
 import { cmdOverview } from './overview.mjs';
 import { cmdLogs } from './logs.mjs';
 import { SPECS, thisCamel } from './args.mjs';
-
-// 严格十进制整数命令行值（谓词 isDecInt 见 internals）：
-// Number("0x10")、parseInt("5x") 都会静默给出错误结果，必须显式拒绝。
-function cliInt(s) {
-  if (!isDecInt(s)) {
-    throw new ExitError(2, `需要整数却得到：${s}`);
-  }
-  return parseInt(s, 10);
-}
 
 function usageExit(message) {
   throw new ExitError(2, message);
@@ -41,22 +32,23 @@ function consumeOption(tok, tokens, i, spec, opts) {
   } else {
     name = tok.slice(1); // -f
   }
-  if (name === 'f' && spec.options.f === 'bool') name = 'follow';
+  if (name === 'f' && Object.hasOwn(spec.options, 'f')
+      && spec.options.f === 'bool') name = 'follow';
+  if (!Object.hasOwn(spec.options, name)) usageExit(`未知选项：${tok}`);
   const kind = spec.options[name];
-  if (!kind) usageExit(`未知选项：${tok}`);
   if (kind === 'bool') {
+    if (inlineValue !== undefined) usageExit(`布尔选项 --${name} 不接受值`);
     opts[thisCamel(name)] = true;
     return i + 1;
   }
-  // string / int 吃一个值（内联或下一 token）。int 类型现已无选项使用，
-  // 保留解析能力给未来。
+  // string 吃一个值（内联或下一 token）。
   let value;
   if (inlineValue !== undefined) value = inlineValue;
   else {
     value = tokens[i + 1];
     if (value === undefined) usageExit(`选项 --${name} 缺少值`);
   }
-  opts[thisCamel(name)] = kind === 'int' ? cliInt(value) : value;
+  opts[thisCamel(name)] = value;
   return inlineValue !== undefined ? i + 1 : i + 2;
 }
 
@@ -86,7 +78,7 @@ export function parseCli(argv) {
       continue;
     }
     if (!tok.startsWith('-') && command === null) {
-      if (!(tok in SPECS)) usageExit(`未知子命令：${tok}`);
+      if (!Object.hasOwn(SPECS, tok)) usageExit(`未知子命令：${tok}`);
       command = tok;
       i += 1;
       continue;
@@ -144,5 +136,7 @@ export async function main(argv = process.argv) {
       return cmdRun(args);
     case 'logs':
       return cmdLogs({ ...args, workspace: parsed.positional[0] });
+    default:
+      return usageExit(`未知子命令：${parsed.command}`);
   }
 }

@@ -1,4 +1,4 @@
-// 一轮巡检：发现工作区 → 自动维护任务文件（续期/改 id/盖印）→ 保证每个
+// 一轮巡检：发现工作区 → 自动维护任务文件（续期/盖印）→ 保证每个
 // 「创建者会话已死且处于预热窗口」的任务都有一个只属于它的健康会话。
 // 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。本轮新拉起的会话
 // 在所有工作区决策完后轮内等待登记（至多 WARMUP_WAIT_MS），认亲同一轮
@@ -8,8 +8,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { randomUUID } from 'node:crypto';
 
-import { deps, packageVersion } from './internals.mjs';
+import { deps, packageVersion, isPlainObject } from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
@@ -33,13 +34,13 @@ import {
   saveHeartbeat,
   heartbeatStale,
   isCooling,
+  parsePid,
 } from './config.mjs';
 import {
   maintainWorkspace,
   TaskFileChanged,
   taskFileExists,
-  taskKey,
-  taskSig,
+  groupTasksByKey,
 } from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wantedNow } from './cron.mjs';
 import {
@@ -79,10 +80,11 @@ export function log(msg) {
 }
 
 // ---- 巡检互斥锁 ----
-// flock 的替代：O_EXCL 创建 + 持锁 pid。内核不会在持有者死亡时自动释放
-// 这种锁，所以抢锁失败要读 pid 判活，死锁/半成品文件按 stale 清理后有
-// 限重试。对 300 秒一轮的单机 launchd，残余的 pid 复用窗口最坏只跳过一
-// 轮，可接受。
+// flock 的替代：O_EXCL 创建 + 完整 JSON 锁记录。token 防止释放/清理时误删
+// 已被别人替换的文件，pid + 进程启动指纹区分 pid 复用。创建后写记录有极短
+// 空窗，所以无效/空文件要等初始化宽限过后才能按 stale 清理。
+
+const RUN_LOCK_INIT_GRACE_MS = 10_000;
 
 function tryCreateLock(lockPath) {
   try {
@@ -93,59 +95,137 @@ function tryCreateLock(lockPath) {
   }
 }
 
-function readLockPid(lockPath) {
-  let text;
+// 文本与 stat 一起作为删除前的比对快照：除了内容，inode/mtime 也能识别
+// 「删掉旧锁后又恰好建了同样内容的新锁」。
+function readLockSnapshot(lockPath) {
   try {
-    text = fs.readFileSync(lockPath, 'utf-8').trim();
+    return {
+      text: fs.readFileSync(lockPath, 'utf-8'),
+      stat: fs.statSync(lockPath, { bigint: true }),
+    };
   } catch {
     return null;
   }
-  return /^\d+$/.test(text) ? parseInt(text, 10) : null;
+}
+
+function parseLockRecord(snapshot) {
+  let record;
+  try {
+    record = JSON.parse(snapshot.text);
+  } catch {
+    return null;
+  }
+  if (!isPlainObject(record)
+      || !Number.isSafeInteger(record.pid) || record.pid <= 0
+      || typeof record.token !== 'string' || record.token === '') {
+    return null;
+  }
+  return record;
+}
+
+function sameLockSnapshot(a, b) {
+  return a.text === b.text
+    && a.stat.ino === b.stat.ino
+    && a.stat.mtimeNs === b.stat.mtimeNs
+    && a.stat.size === b.stat.size;
+}
+
+// 只能删除读取时看到的那个文件。比对失败说明别人释放/重建过，宁可本轮不
+// 抢锁，也绝不能把新持有者的锁 unlink 掉。
+function removeLockSnapshot(lockPath, snapshot) {
+  const latest = readLockSnapshot(lockPath);
+  if (latest === null || !sameLockSnapshot(snapshot, latest)) return false;
+  try {
+    fs.unlinkSync(lockPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function staleLock(snapshot) {
+  const record = parseLockRecord(snapshot);
+  if (record === null) {
+    // 旧版锁只有十进制 pid。升级交错时它可能仍属于活巡检；没有指纹可核，
+    // 因此活着就保守保留，明确死亡才允许清理。
+    const legacyPid = parsePid(snapshot.text);
+    if (legacyPid !== null) {
+      try {
+        return !deps.alive(legacyPid);
+      } catch {
+        return false;
+      }
+    }
+    // 包含 O_EXCL 成功后、JSON 写完前的空文件。mtime 新于宽限的一律保留。
+    return Date.now() - Number(snapshot.stat.mtimeMs) >= RUN_LOCK_INIT_GRACE_MS;
+  }
+  let living;
+  try {
+    living = deps.alive(record.pid);
+  } catch {
+    return false; // 活判读不出时保守保留。
+  }
+  if (!living) return true;
+  // 活 pid 但缺记录指纹，或当前指纹读不出：都无法排除锁主仍在，不能删。
+  if (typeof record.procStart !== 'string' || record.procStart === '') return false;
+  let currentStart;
+  try {
+    currentStart = deps.procStartedAt(record.pid);
+  } catch {
+    return false;
+  }
+  if (!currentStart) return false;
+  return currentStart !== record.procStart;
 }
 
 export function acquireRunLock() {
   fs.mkdirSync(deps.paths.dataDir, { recursive: true });
   const lockPath = path.join(deps.paths.dataDir, 'run.lock');
+  let procStart;
+  try {
+    procStart = deps.procStartedAt(process.pid);
+  } catch (e) {
+    throw new Error('读取当前进程启动指纹失败，不能安全创建巡检锁：'
+      + `${e?.message ?? e}`);
+  }
+  // 无指纹锁一旦被崩溃留下，pid 复用时永远无法安全清理；宁可本轮响亮
+  // 失败，也不制造这种永久自锁。
+  if (!procStart) {
+    throw new Error('未读到当前进程启动指纹，不能安全创建巡检锁；'
+      + '请检查 /bin/ps 后重试');
+  }
+  const token = randomUUID();
+  const text = `${JSON.stringify({
+    pid: process.pid,
+    procStart,
+    token,
+  })}\n`;
   for (let attempt = 0; attempt < 3; attempt++) {
     const fd = tryCreateLock(lockPath);
     if (fd !== null) {
       try {
-        fs.writeFileSync(fd, `${process.pid}\n`);
+        fs.writeFileSync(fd, text);
         fs.fsyncSync(fd);
       } finally {
         fs.closeSync(fd);
       }
-      return { lockPath };
+      return { lockPath, token };
     }
-    const holder = readLockPid(lockPath);
-    if (holder !== null) {
-      let live = false;
-      try {
-        process.kill(holder, 0);
-        live = true;
-      } catch (e) {
-        // EPERM：进程存在但不是我们的——当作活锁，不删别人的锁。
-        live = e.code === 'EPERM';
-      }
-      if (live) return null;
-    }
-    // 持有者已死 / 空文件 / pid 损坏：当作 stale 清掉重试。
-    try {
-      fs.unlinkSync(lockPath);
-    } catch {
-      return null; // 别人抢先重建了锁
-    }
+    const snapshot = readLockSnapshot(lockPath);
+    if (snapshot === null) continue; // 持有者恰好释放，直接重试创建。
+    if (!staleLock(snapshot)) return null;
+    if (!removeLockSnapshot(lockPath, snapshot)) return null;
   }
   return null;
 }
 
-function releaseLock(handle) {
-  if (!handle?.lockPath) return;
-  try {
-    fs.unlinkSync(handle.lockPath);
-  } catch {
-    // 锁文件已不在即达成目的。
-  }
+export function releaseRunLock(handle) {
+  if (!handle?.lockPath || typeof handle.token !== 'string') return;
+  const snapshot = readLockSnapshot(handle.lockPath);
+  if (snapshot === null) return;
+  const record = parseLockRecord(snapshot);
+  if (record?.token !== handle.token) return;
+  removeLockSnapshot(handle.lockPath, snapshot);
 }
 
 // ---- 日志轮转 ----
@@ -206,20 +286,6 @@ const reownTarget = (ent) => ({
   procStart: ent.claudeProcStart,
 });
 
-// 同 sig 的归属仲裁：先到先入；同 sig 被不同会话认亲（同毫秒连建的重复
-// 任务）则双双撤出、都不盖。
-function mergeStamp(stamps, conflicts, sig, target) {
-  const prev = stamps.get(sig);
-  if (prev) {
-    if (prev.sessionId !== target.sessionId) {
-      conflicts.add(sig);
-      stamps.delete(sig);
-    }
-  } else if (!conflicts.has(sig)) {
-    stamps.set(sig, target);
-  }
-}
-
 // 过户后的统一计数与日志（巡逻第三步与等待期补盖共用）。
 function noteReowned(ws, count, stats) {
   bump(stats, 'reown');
@@ -236,9 +302,9 @@ function enterCooldown(ent, ws, key, fails, cur, stats) {
     + `${fails} 次，暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
 }
 
-// 保证一个工作区里每个死主窗口任务都有专属预热，并完成本文件的续期/改
-// id/盖印维护。bucket 是 state[ws]（原地修改）。scriptProcsRef 是全轮共
-// 享的进程表快照容器（{value: 数组|null}），只在孤儿认领时拍一次。
+// 保证一个工作区里每个死主窗口任务都有专属预热，并完成本文件的续期/盖印
+// 维护。bucket 是 state[ws]（原地修改）。scriptProcsRef 是全轮共享的进程表
+// 快照容器（{value: 数组|null}），只在孤儿认领时拍一次。
 // 返回 pending：本轮新纳入跟踪、尚未认亲的活 script（新 spawn 与孤儿认
 // 领）的 {ws,key,pid} 列表，cmdRun 据此轮内等待认亲并补盖印。
 export async function patrolWorkspace(
@@ -263,9 +329,17 @@ export async function patrolWorkspace(
     return [];
   }
 
-  const stopEntry = async (ent, kind, msg) => {
-    await deps.stopSession(ent);
+  // false 是 stopSession 的「活进程未能安全停止」：不能记回收、删 state
+  // 或继续重拉。生产与测试桩都返回严格布尔值。
+  const stopEntry = async (ent, key, kind, msg) => {
+    const stopped = await deps.stopSession(ent);
+    if (!stopped) {
+      note('warn', `无法安全停止 ${ws} 任务 ${key} pid=${ent.pid}：`
+        + '记录的进程仍存活；保留跟踪，本轮不删除条目也不另拉会话');
+      return false;
+    }
     note(kind, msg);
+    return true;
   };
 
   if (tasks.length === 0) {
@@ -274,35 +348,23 @@ export async function patrolWorkspace(
     // 接管）的 stop 是 no-op，条目照删——sid 没了任务也没了，无需再管。
     for (const [key, ent] of Object.entries(bucket)) {
       if (deps.trackedAlive(ent)) {
-        await stopEntry(ent, 'recycle',
+        const stopped = await stopEntry(ent, key, 'recycle',
           `回收 ${ws} 任务 ${key} pid=${ent.pid}：任务已全部清空，结束预热会话`);
+        if (!stopped) continue;
       }
       delete bucket[key];
     }
     return [];
   }
 
-  // 第零步：id 改键的崩溃窗口治愈。任务文件里旧键已不存在（上轮 minify
-  // 改小了 id、state 却没来得及存盘），而内容签名唯一匹配某个当前任务、
-  // 目标键又无主：先把条目挪到新键，让下面的决策把它当作连续的一代——
-  // 否则会按「旧任务删除 + 新任务」错杀活会话再重拉一个。必须在逐任务
-  // 决策之前做，spawn 才不会抢先占掉目标键。
-  let sigToKeys = new Map();
-  let currentKeys = new Set();
-  for (const t of tasks) {
-    const k = taskKey(t);
-    currentKeys.add(k);
-    const list0 = sigToKeys.get(taskSig(t)) ?? [];
-    list0.push(k);
-    sigToKeys.set(taskSig(t), list0);
-  }
-  for (const [key, ent] of Object.entries({ ...bucket })) {
-    if (currentKeys.has(key) || !ent.sig) continue;
-    const candidates = sigToKeys.get(ent.sig) ?? [];
-    if (candidates.length === 1 && !bucket[candidates[0]]) {
-      bucket[candidates[0]] = { ...ent, taskId: candidates[0] };
-      delete bucket[key];
-    }
+  // 与任务文件层共用一份按键分组视图。重复键对应多条任务时，state 与
+  // 会话都无法唯一对应到条目：跳过这些组并告警，maintainWorkspace 也只
+  // 处理单元素组。组的键集合同时就是后面的 currentKeys。
+  const taskGroups = groupTasksByKey(tasks);
+  for (const [key, group] of taskGroups) {
+    if (group.length < 2) continue;
+    note('warn', `任务键重复 ${ws}：${key} 对应 ${group.length} 条任务，`
+      + '无法区分各自会话，本轮跳过这些条目的预热与盖印');
   }
 
   // 第一步：认亲。认到 = 最强健康证据，当场回填身份、清零失败计数。本
@@ -312,15 +374,13 @@ export async function patrolWorkspace(
     if (deps.trackedAlive(ent)) claimEntry(ent, details, ws);
   }
 
-  // 第二步：逐任务决策。stamps 收本轮要盖的归属印（sig → 预热身份），
-  // 第三步合并进同一次原子写。stampConflicts 记「同内容签名被多个预热
-  // 声称」的病态任务（同毫秒连建的重复任务）：一律不盖，交回调度锁原
-  // 生规则，避免错盖后没拿到任务的预热永不满足回收条件而空转泄漏。
+  // 第二步：逐任务决策。stamps 收本轮要盖的归属印（taskKey → 预热身份），
+  // 第三步合并进同一次原子写。内容相同但 id 不同的任务各有自己的键；重复
+  // 键组直接跳过，不在循环内另建一套重复键索引。
   const stamps = new Map();
-  const stampConflicts = new Set();
-  for (const t of tasks) {
-    const key = taskKey(t);
-    const sig = taskSig(t);
+  for (const [key, group] of taskGroups) {
+    if (group.length !== 1) continue;
+    const t = group[0];
     let ent = bucket[key] ?? null;
     const logPath = sessionLogPath(ws, key);
     const ownerIsOurs = entryClaimed(ent)
@@ -335,14 +395,16 @@ export async function patrolWorkspace(
       if (ent && deps.trackedAlive(ent)
           && cur - (ent.startedAt ?? cur) > WARMUP_GRACE_SECONDS
           && !entryClaimed(ent)) {
-        await stopEntry(ent, 'stuck', `卡死 ${ws} 任务 ${key} pid=${ent.pid}：`
+        const stopped = await stopEntry(ent, key, 'stuck',
+          `卡死 ${ws} 任务 ${key} pid=${ent.pid}：`
           + '进程已存活仍未登记会话，已终止；任务的创建者会话仍在场可承接，'
           + '不另拉预热');
-        delete bucket[key];
+        if (stopped) delete bucket[key];
       } else if (ent && deps.trackedAlive(ent) && entryClaimed(ent)) {
-        await stopEntry(ent, 'recycle', `回收 ${ws} 任务 ${key} pid=${ent.pid}：`
+        const stopped = await stopEntry(ent, key, 'recycle',
+          `回收 ${ws} 任务 ${key} pid=${ent.pid}：`
           + '任务创建者会话已在场，结束多余的预热会话');
-        delete bucket[key];
+        if (stopped) delete bucket[key];
       }
       continue;
     }
@@ -375,10 +437,10 @@ export async function patrolWorkspace(
           > SESSION_RECYCLE_IDLE_SECONDS
         && taskNeedMs(t, now) - now.getTime()
           > SESSION_RECYCLE_MARGIN_SECONDS * 1000) {
-      await stopEntry(ent, 'recycle',
+      const stopped = await stopEntry(ent, key, 'recycle',
         `回收 ${ws} 任务 ${key} pid=${ent.pid}：本任务已执行完毕且界面静默，`
         + '结束会话，下次窗口重新预热');
-      delete bucket[key];
+      if (stopped) delete bucket[key];
       continue;
     }
 
@@ -389,9 +451,11 @@ export async function patrolWorkspace(
     // 问界面的垃圾进程。杀掉后继续走失败计数/冷却/重拉。
     if (ent && deps.trackedAlive(ent) && !entryClaimed(ent)
         && cur - (ent.startedAt ?? cur) > WARMUP_GRACE_SECONDS) {
-      await stopEntry(ent, 'stuck', `卡死 ${ws} 任务 ${key} pid=${ent.pid}：`
+      const stopped = await stopEntry(ent, key, 'stuck',
+        `卡死 ${ws} 任务 ${key} pid=${ent.pid}：`
         + '进程已存活仍未登记会话，已终止'
         + `（排查：cron-up logs ${path.basename(ws)}--${key}）`);
+      if (!stopped) continue;
     }
 
     // (e) resume 接管结束：sid 已从登记消失。整代身份作废（script 已
@@ -414,7 +478,7 @@ export async function patrolWorkspace(
     // 亲，由 cmdRun 的 stampClaimed 补盖，不走这里。
     if (entryClaimed(ent)
         && (!t.createdBySessionId || t.createdBySessionId !== ent.sessionId)) {
-      mergeStamp(stamps, stampConflicts, sig, reownTarget(ent));
+      stamps.set(key, reownTarget(ent));
     }
 
     // warm 未到回收 / spawning 宽限内：本轮无事。
@@ -436,7 +500,6 @@ export async function patrolWorkspace(
         ...ent,
         ws,
         taskId: key,
-        sig,
         pid: null,
         fails,
         log: ent?.log ?? logPath,
@@ -460,7 +523,6 @@ export async function patrolWorkspace(
         bucket[key] = {
           ws,
           taskId: key,
-          sig,
           pid: procPid,
           startedAt: cur,
           procStart: deps.procStartedAt(procPid),
@@ -481,7 +543,7 @@ export async function patrolWorkspace(
       const newFails = fails + 1;
       if (newFails >= FAIL_LIMIT) {
         bucket[key] = {
-          ws, taskId: key, sig, pid: null, fails: newFails, log: logPath,
+          ws, taskId: key, pid: null, fails: newFails, log: logPath,
         };
         enterCooldown(bucket[key], ws, key, newFails, cur, stats);
         continue;
@@ -489,7 +551,6 @@ export async function patrolWorkspace(
       bucket[key] = {
         ws,
         taskId: key,
-        sig,
         pid: null,
         startedAt: cur,
         fails: newFails,
@@ -502,7 +563,6 @@ export async function patrolWorkspace(
     bucket[key] = {
       ws,
       taskId: key,
-      sig,
       pid: spawned.pid,
       startedAt: cur,
       procStart: spawned.procStart,
@@ -514,9 +574,9 @@ export async function patrolWorkspace(
     pending.push({ ws, key, pid: spawned.pid });
   }
 
-  // 第三步：任务文件维护（续期 + 改 id + 盖印）合并为一次带乐观锁的原子
-  // 写。撞车（Claude Code 刚写了 lastFiredAt/删了任务）放弃本轮老条目维
-  // 护，但已 spawn 的会话仍返回给 cmdRun 等待认亲，盖印收尾会再写一次。
+  // 第三步：任务文件维护（续期 + 盖印）合并为一次带 mtime 乐观检测的原子写。
+  // 撞车（Claude Code 刚写了 lastFiredAt/删了任务）放弃本轮老条目维护，但已
+  // spawn 的会话仍返回给 cmdRun 等待认亲，盖印收尾会再写一次。
   let result;
   try {
     result = maintainWorkspace(taskfile, { reown: stamps });
@@ -534,53 +594,17 @@ export async function patrolWorkspace(
     deps.log(`已续期 ${ws}：${result.renewed} 个周期任务标记为 permanent，`
       + '不再受 7 天过期限制');
   }
-  if (result.minified) {
-    deps.log(`已改小 id ${ws}：${result.minified} 个周期任务的 id 改为小哈希`
-      + '值，投递延迟降到约 1 分钟内');
-  }
   if (result.reowned) noteReowned(ws, result.reowned, stats);
-  // id 改小同轮把 state 条目跟着改键：不改的话下轮会把换 id 的任务误判
-  // 成「旧任务删除 + 新任务」，错杀刚拉起的会话再重拉一个。pending 是本
-  // 轮 spawn 的返回快照，键也要跟着改，否则轮内等待按旧键找不到条目，新
-  // 任务的盖印被白白推到下轮。
-  for (const { from, to } of result.idChanges) {
-    if (bucket[from] && !bucket[to]) {
-      const movedPid = bucket[from].pid;
-      bucket[to] = { ...bucket[from], taskId: to };
-      delete bucket[from];
-      for (const p of pending) {
-        if (p.key === from && p.pid === movedPid) p.key = to;
-      }
-    }
-  }
 
-  // 第四步：任务消失的条目回收。第零步已做过签名治愈；这里重建当前键索
-  // 引——注意内存里的 tasks 是维护前的快照，minify 改的是重新读盘的
-  // doc，所以键必须经 idChanges 修正，否则刚改到新键的条目会被旧 id 视
-  // 图误当成「签名可治愈的旧键」再改回去。剩下对不上的键就是真的被删
-  // 了。冷却中的条目也删——任务没了，冷却没有意义。
-  const renamed = new Map(result.idChanges.map((c) => [c.from, c.to]));
-  sigToKeys = new Map();
-  currentKeys = new Set();
-  for (const t of tasks) {
-    const k = renamed.get(taskKey(t)) ?? taskKey(t);
-    currentKeys.add(k);
-    const list = sigToKeys.get(taskSig(t)) ?? [];
-    list.push(k);
-    sigToKeys.set(taskSig(t), list);
-  }
+  // 第四步：任务消失的条目回收。续期与盖印都不改任务键，分组视图的键集合
+  // 仍是准确的 currentKeys。冷却中的条目也删——任务没了，冷却没有意义；
+  // 停止失败则保留可跟踪条目，下轮继续尝试，绝不错删后遗留活会话。
   for (const [key, ent] of Object.entries({ ...bucket })) {
-    if (currentKeys.has(key)) continue;
-    const candidates = ent.sig ? (sigToKeys.get(ent.sig) ?? []) : [];
-    if (candidates.length === 1 && !bucket[candidates[0]]) {
-      const to = candidates[0];
-      bucket[to] = { ...ent, taskId: to };
-      delete bucket[key];
-      continue;
-    }
+    if (taskGroups.has(key)) continue;
     if (deps.trackedAlive(ent)) {
-      await stopEntry(ent, 'recycle', `回收 ${ws} 任务 ${key} pid=${ent.pid}：`
-        + '对应任务已删除，结束预热会话');
+      const stopped = await stopEntry(ent, key, 'recycle',
+        `回收 ${ws} 任务 ${key} pid=${ent.pid}：对应任务已删除，结束预热会话`);
+      if (!stopped) continue;
     }
     delete bucket[key];
   }
@@ -644,14 +668,13 @@ async function awaitWarmups(pending, state, cur, stats) {
 }
 
 // 等待期认到亲的会话补盖归属印：claimedByWs 的每个 ent 已是 bucket 条
-// 目，sig/认亲身份都在上面。无认亲的 ws 不调用、不写盘；撞 mtime 乐观
-// 锁或极端竞态（result=null）跳过，下轮再来。
+// 目，taskId 与认亲身份都在上面。无认亲的 ws 不调用、不写盘；撞 mtime 乐
+// 观锁或极端竞态（result=null）跳过，下轮再来。
 function stampClaimed(claimedByWs, taskfiles, stats) {
   for (const [ws, ents] of claimedByWs) {
     const stamps = new Map();
-    const conflicts = new Set();
     for (const ent of ents) {
-      if (entryClaimed(ent)) mergeStamp(stamps, conflicts, ent.sig, reownTarget(ent));
+      if (entryClaimed(ent)) stamps.set(ent.taskId, reownTarget(ent));
     }
     if (stamps.size === 0) continue;
     try {
@@ -675,10 +698,16 @@ function stampClaimed(claimedByWs, taskfiles, stats) {
 async function retireLegacy(legacy, stats) {
   for (const ent of legacy) {
     if (deps.trackedAlive(ent)) {
-      await deps.stopSession(ent);
-      bump(stats, 'recycle');
-      deps.log(`旧版迁移 ${ent.ws} pid=${ent.pid}：结束目录级预热会话，`
-        + '升级后按任务重新预热');
+      const stopped = await deps.stopSession(ent);
+      if (!stopped) {
+        bump(stats, 'warn');
+        deps.log(`旧版迁移暂缓 ${ent.ws} pid=${ent.pid}：记录的进程仍存活，`
+          + '本次无法安全停止目录级预热会话；本次不记为已回收');
+      } else {
+        bump(stats, 'recycle');
+        deps.log(`旧版迁移 ${ent.ws} pid=${ent.pid}：结束目录级预热会话，`
+          + '升级后按任务重新预热');
+      }
     }
   }
   const handled = new Set(legacy.filter((e) => e.pid).map((e) => e.pid));
@@ -690,10 +719,16 @@ async function retireLegacy(legacy, stats) {
     if (isTaskSessionLogName(path.basename(file))) continue; // 新一代命名
     const ent = { pid, procStart: deps.procStartedAt(pid) };
     if (!deps.trackedAlive(ent)) continue;
-    await deps.stopSession(ent);
-    bump(stats, 'recycle');
-    deps.log(`旧版迁移 pid=${pid}：结束目录级预热孤儿会话（日志 ${file}），`
-      + '升级后按任务重新预热');
+    const stopped = await deps.stopSession(ent);
+    if (!stopped) {
+      bump(stats, 'warn');
+      deps.log(`旧版迁移暂缓 pid=${pid}：记录的进程仍存活，本次无法安全停止`
+        + `目录级预热孤儿会话（日志 ${file}）；本次不记为已回收`);
+    } else {
+      bump(stats, 'recycle');
+      deps.log(`旧版迁移 pid=${pid}：结束目录级预热孤儿会话（日志 ${file}），`
+        + '升级后按任务重新预热');
+    }
   }
 }
 
@@ -711,8 +746,9 @@ export async function cmdRun(args) {
   const prevStopSession = deps.stopSession;
   const stoppedPids = new Set();
   deps.stopSession = async (ent) => {
-    if (ent?.pid) stoppedPids.add(ent.pid);
-    return prevStopSession(ent);
+    const stopped = await prevStopSession(ent);
+    if (stopped && ent?.pid) stoppedPids.add(ent.pid);
+    return stopped;
   };
   const prevProcStartedAt = deps.procStartedAt;
   const lstartCache = new Map();
@@ -901,7 +937,7 @@ export async function cmdRun(args) {
   } finally {
     deps.stopSession = prevStopSession;
     deps.procStartedAt = prevProcStartedAt;
-    releaseLock(lock);
+    deps.releaseRunLock(lock);
   }
 }
 
@@ -910,4 +946,5 @@ Object.assign(deps, {
   runPatrol: cmdRun,
   rotatePatrolLogs,
   acquireRunLock,
+  releaseRunLock,
 });

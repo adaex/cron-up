@@ -81,7 +81,8 @@ export function sessionArgv(ws, logPath) {
   // 里靠继承现成 PATH 一切正常，交给 launchd 就 fnm: command not found。
   return [
     '/usr/bin/script', '-q', logPath,
-    '/bin/zsh', '-lic', `cd ${shellQuote(ws)} && claude`,
+    '/bin/zsh', '-lic',
+    `cd ${shellQuote(ws)} && claude --permission-mode bypassPermissions`,
   ];
 }
 
@@ -107,6 +108,12 @@ export function rotateOnce(file) {
   const old = `${file}.1`;
   fs.rmSync(old, { force: true });
   fs.renameSync(file, old);
+}
+
+// 进程组信号只接受明确大于 1 的整数 pid：0/-1 等有广播含义，浮点、
+// 负数或非安全整数也都不能交给 process.kill。
+function canSignalProcessGroup(pid) {
+  return Number.isSafeInteger(pid) && pid > 1;
 }
 
 // 为一个任务拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
@@ -149,34 +156,68 @@ export function spawnSession(ws, taskId) {
   // 拉不起来（spawn 当场失败，pid 是 undefined）时返回 null：没有进程可跟
   // 踪，调用方按启动失败计数，不把 pid=undefined 写进 state。
   if (child.pid === undefined) return null;
-  return { pid: child.pid, procStart: deps.procStartedAt(child.pid) };
+  let procStart = null;
+  let fingerprintError = null;
+  try {
+    procStart = deps.procStartedAt(child.pid);
+  } catch (e) {
+    fingerprintError = e;
+  }
+  if (procStart) return { pid: child.pid, procStart };
+
+  // 没有指纹的条目今后无法安全发信号，不能登记成正常会话。这里只清理
+  // 刚刚由本次 spawn 创建的进程组；pid 形状异常时宁可留下日志也不冒险。
+  const reason = fingerprintError
+    ? `读取进程身份指纹失败：${fingerprintError?.message ?? fingerprintError}`
+    : '未读到进程身份指纹';
+  let cleanup;
+  if (canSignalProcessGroup(child.pid)) {
+    try {
+      process.kill(-child.pid, 'SIGTERM');
+      cleanup = '已向刚拉起的进程组发送 SIGTERM';
+    } catch (e) {
+      cleanup = `清理刚拉起的进程组失败：${e?.code ? `${e.code}：` : ''}`
+        + `${e?.message ?? e}`;
+    }
+  } else {
+    cleanup = 'pid 不是大于 1 的整数，未发信号';
+  }
+  deps.log(`会话启动失败 ${ws} 任务 ${taskId} pid=${child.pid}：${reason}；`
+    + cleanup);
+  return null;
 }
 
 // 按进程组结束我们拉起的会话。发信号前先核身份：state 条目可能比它命名
 // 的进程活得久，给回收 pid 发组信号会杀掉无关进程组。detached（用户
-// resume 接管）时 trackedAlive 为 false：本函数直接返回，绝不碰用户的裸
-// claude。
+// resume 接管）时 trackedAlive 为 false：本函数返回 true，绝不碰用户的裸
+// claude。false 表示记录的进程仍活着，但因缺少指纹或信号失败而未能安全
+// 停止；调用方必须保留跟踪并告警，不能假装已经回收。
 export async function stopSession(ent) {
-  if (!deps.trackedAlive(ent)) return;
-  const pid = ent.pid;
+  const pid = ent?.pid;
+  if (!canSignalProcessGroup(pid)) return true;
+  if (!deps.trackedAlive(ent)) return true;
+  // trackedAlive 为兼容旧条目会在没有 procStart 时退回 kill -0；读取可以
+  // 沿用这个判断，停止却不行。死进程无需处理，活进程只能如实报告未停止。
+  if (!ent.procStart) return deps.alive(pid) ? false : true;
   try {
     process.kill(-pid, 'SIGTERM');
   } catch {
-    return;
+    return deps.alive(pid) ? false : true;
   }
   for (let i = 0; i < 20; i++) {
     await deps.sleep(100);
-    if (!deps.alive(pid)) return;
+    if (!deps.alive(pid)) return true;
   }
-  // 升级 SIGKILL 前再核一次指纹。
-  if (deps.trackedAlive(ent)) {
-    try {
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      // 组已消失。
-    }
-    await deps.sleep(100);
+  if (!deps.trackedAlive(ent)) return true;
+  // 升级 SIGKILL 前已再核一次指纹；信号失败或结束后仍是同一进程，都不能
+  // 向调用方报告停止成功。
+  try {
+    process.kill(-pid, 'SIGKILL');
+  } catch {
+    return deps.alive(pid) ? false : true;
   }
+  await deps.sleep(100);
+  return deps.trackedAlive(ent) ? false : true;
 }
 
 // typescript 多少秒没被写。文件缺失读作「没有任何活动证据」：Infinity 大

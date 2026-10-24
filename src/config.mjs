@@ -11,7 +11,7 @@ import {
   isDecInt,
   ensurePrivateDir,
 } from './internals.mjs';
-import { DEFAULT_CONFIG, PID_T_MAX, HEARTBEAT_STALE_FACTOR } from './constants.mjs';
+import { PID_T_MAX, HEARTBEAT_STALE_FACTOR } from './constants.mjs';
 import { expandHome, isDir } from './tasks.mjs';
 
 // Shell 的 tilde 展开只发生在词首："--roots ~/a,~/b" 穿过 shell 后第二个
@@ -28,15 +28,9 @@ export function normalizeRoots(roots) {
   return out;
 }
 
-// 配置数值校验用：JSON 的 true 是布尔不能冒充秒数/深度
-// （Number.isInteger(true) === false，天然挡住）。
-export function isInt(x) {
-  return typeof x === 'number' && Number.isInteger(x);
-}
-
-// 宽容整型化（手改的 state/登记文件里字段可能是字符串或浮点）：纯十进制
-// 字符串接受，浮点截断，布尔拒绝；非法输入抛错由调用方按「字段不存在」
-// 处理。
+// 手改的 state/登记文件里的整数字段可能是字符串或浮点：纯十进制字符串接受，
+// 浮点截断，布尔拒绝；非法输入抛错由调用方按「字段不存在」处理。pid 另有
+// 更严的入口，不允许浮点截断。
 function lenientInt(v) {
   if (typeof v === 'boolean') throw new Error('布尔不是整数字段');
   if (typeof v === 'number') {
@@ -53,6 +47,9 @@ function lenientInt(v) {
 // 登记两个外部来源共用同一条入口规则——超大整数能穿过类型转换直到
 // process.kill 才抛，负数 pid 会被 kill 当成进程组号误伤无辜进程组。
 export function parsePid(v) {
+  // number 必须本身就是整数：1.5 截成 1 可能把停止信号发给完全无关的
+  // pid。字符串仍走纯十进制解析，不接受小数、指数或十六进制。
+  if (typeof v === 'number' && !Number.isInteger(v)) return null;
   let pid;
   try {
     pid = lenientInt(v);
@@ -66,7 +63,7 @@ export function parsePid(v) {
 // 「形同空转」，回退成默认家目录扫描则会动到用户没打算纳入的仓库，两个
 // 方向都比停机更危险。
 export function configFieldErrors(cfg) {
-  if (!Array.isArray(cfg.roots)) {
+  if (!Object.hasOwn(cfg, 'roots') || !Array.isArray(cfg.roots)) {
     return [['roots', `roots 应是字符串数组，当前为 ${JSON.stringify(cfg.roots)}`]];
   }
   return [];
@@ -99,13 +96,14 @@ export function loadConfig(file, opts = {}) {
     fail(`配置文件顶层应是 JSON 对象而不是${Array.isArray(cfg) ? '数组' : typeof cfg}：`
       + `${file}；运行 cron-up install 生成，或用 --config 指定路径`);
   }
-  const merged = { ...DEFAULT_CONFIG, ...cfg };
-  const errs = configFieldErrors(merged);
+  // 文件已经存在就必须自己声明 roots；这里绝不补默认值。默认扫描范围只
+  // 属于首次 install 或明确的安装修复，读取配置时补上会静默扩大巡检范围。
+  const errs = configFieldErrors(cfg);
   if (errs.length > 0) {
     fail(`配置字段类型不对：${errs.map(([, m]) => m).join('；')}`
       + `；修复 ${file} 或重跑 cron-up install`);
   }
-  return { roots: normalizeRoots(merged.roots) };
+  return { roots: normalizeRoots(cfg.roots) };
 }
 
 // ---- state.json：两级嵌套 {ws: {taskId: entry}} ----
@@ -115,9 +113,9 @@ export function loadConfig(file, opts = {}) {
 // deadSince、log、notified。pid 为 null 的条目是「当场没拉起/冷却中」的
 // 合法形态；未认亲时 claude* 三字段缺省。
 
-// 旧版顶层标记字段：旧 state 是 {ws: entry}，新 state 是 {ws: {taskId:
-// entry}}。taskId 只可能是 8 位十六进制或 anon: 前缀，永不与这些名字冲
-// 突，因此「顶层值自身是否带 entry 标记」就是两代形状的区分判据。
+// 旧版顶层标记字段只用于识别「值仍是标量的扁平 entry」，不能单独拿键名
+// 判代：手工任务 id 也可以叫 pid/startedAt。新桶的自有值里会有任务 entry
+// 对象，旧扁平 entry 的字段值则是标量或 null，先看这个值结构再分代。
 const LEGACY_MARKERS = ['pid', 'startedAt', 'cooldownUntil', 'fails'];
 
 function cleanEntry(raw, ws, taskId) {
@@ -153,8 +151,13 @@ function cleanEntry(raw, ws, taskId) {
   return ent;
 }
 
+function hasNestedEntries(v) {
+  return isPlainObject(v) && Object.values(v).some(isPlainObject);
+}
+
 function looksLegacyEntry(v) {
-  return isPlainObject(v) && LEGACY_MARKERS.some((k) => k in v);
+  return isPlainObject(v) && !hasNestedEntries(v)
+    && LEGACY_MARKERS.some((k) => Object.hasOwn(v, k));
 }
 
 export function loadState() {
@@ -181,7 +184,7 @@ export function loadState() {
 
 // 旧版扁平 state（{ws: 目录级单 entry}）：升级轮用它停掉旧预热后整体丢
 // 弃，不迁移任务归属（新流程按任务重拉）。与 loadState 读同一个文件，
-// 两个读取器按标记字段互斥，互不污染。
+// 两个读取器按值结构与标记字段互斥，互不污染。
 export function loadLegacyEntries() {
   let state;
   try {

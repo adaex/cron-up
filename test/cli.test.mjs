@@ -67,6 +67,12 @@ test('unknown subcommand exits 2', () => {
   assert.throws(() => parseCli(['frobnicate']), exit2);
 });
 
+test('prototype property names are not commands', () => {
+  for (const name of ['toString', 'constructor', '__proto__']) {
+    assert.throws(() => parseCli([name]), exit2, name);
+  }
+});
+
 test('renew subcommand has been removed', () => {
   assert.throws(() => parseCli(['renew']), exit2);
 });
@@ -104,6 +110,16 @@ test('uninstall accepts --purge only; --keep-sessions is gone', () => {
   assert.throws(() => parseCli(['uninstall', '--keep-sessions']), exit2);
 });
 
+test('bool options reject every =value form instead of becoming true', () => {
+  for (const args of [
+    ['uninstall', '--purge=false'],
+    ['uninstall', '--purge='],
+    ['logs', '--follow=true'],
+  ]) {
+    assert.throws(() => parseCli(args), exit2, args.join(' '));
+  }
+});
+
 test('legacy --stop-sessions flag is gone (exit 2)', async (t) => {
   mockDeps(t);
   await assert.rejects(
@@ -125,6 +141,16 @@ test('logs --follow works and rejects two positionals', () => {
 
 test('unknown option exits 2', () => {
   assert.throws(() => parseCli(['run', '--bogus']), exit2);
+});
+
+test('prototype property names are not options', () => {
+  for (const args of [
+    ['run', '--constructor=x'],
+    ['run', '--toString=x'],
+    ['install', '--__proto__=x'],
+  ]) {
+    assert.throws(() => parseCli(args), exit2, args.join(' '));
+  }
 });
 
 test('an option before the subcommand is rejected', () => {

@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { cmdRun, patrolWorkspace } from '../src/patrol.mjs';
+import {
+  acquireRunLock,
+  cmdRun,
+  patrolWorkspace,
+  releaseRunLock,
+} from '../src/patrol.mjs';
 import { sessionLogPath, isTaskSessionLogName } from '../src/sessions.mjs';
-import { taskKey, taskSig } from '../src/tasks.mjs';
 import {
   WARMUP_GRACE_SECONDS,
   FAIL_LIMIT,
@@ -85,6 +89,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
       alive.delete(rec.zshPid);
       if (rec.claudePid !== null) alive.delete(rec.claudePid);
     }
+    return true;
   };
   deps.listScriptProcesses = () => scriptProcs;
   deps.acquireRunLock = () => ({ lockPath: null });
@@ -110,7 +115,6 @@ async function setupMachine(t, { realDiscover = false } = {}) {
           sessionId: r.sid,
           procStart: `cstart-${r.claudePid}`,
           ancestors: [r.zshPid, r.scriptPid, 1],
-          chainComplete: true,
         });
       }
     }
@@ -118,7 +122,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
       if (alive.has(u.pid)) {
         list.push({
           pid: u.pid, sessionId: u.sid, procStart: `ustart-${u.pid}`,
-          ancestors: [1], chainComplete: true,
+          ancestors: [1],
         });
       }
     }
@@ -126,7 +130,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
       if (alive.has(pid)) {
         list.push({
           pid, sessionId: sid, procStart: `rstart-${pid}`,
-          ancestors: [1], chainComplete: true,
+          ancestors: [1],
         });
       }
     }
@@ -321,10 +325,31 @@ test('a live creator session is fully respected: no spawn, no stamp', async (t) 
     undefined);
 });
 
-test('identical-content tasks (sig collision) are not force-stamped to one warm', async (t) => {
+test('identical content with one live creator stamps only the dead-owner id', async (t) => {
+  const m = await setupMachine(t);
+  const creatorSid = 'creator-lives';
+  m.addUser(creatorSid);
+  const soon = cronAt(300, nowAt(T0));
+  const base = { cron: soon, prompt: '完全一样', createdAt: T0 * 1000 - 1000 };
+  writeTaskFile(m.WS, [
+    makeTask({ id: '00000002', ...base, createdBySessionId: creatorSid }),
+    makeTask({ id: '00000004', ...base, createdBySessionId: 'creator-dead' }),
+  ]);
+  await m.patrol();
+  assert.deepEqual(m.spawns.map((r) => r.taskId), ['00000004']);
+  m.claim(m.spawns[0], 'sid-dead-task');
+  await m.patrol(T0 + 1);
+  assert.equal(sidOf(m, '00000002'), creatorSid);
+  assert.equal(fileTasks(m).find((x) => x.id === '00000002').createdByPid,
+    undefined);
+  assert.equal(sidOf(m, '00000004'), 'sid-dead-task');
+  assert.equal(m.spawns.length, 1);
+});
+
+test('identical-content tasks with different ids stamp their own warm sessions', async (t) => {
   const m = await setupMachine(t);
   const soon = cronAt(300, nowAt(T0));
-  // 病态重复：同毫秒、同 prompt、同 cron，只有 id 不同。
+  // 同毫秒、同 prompt、同 cron，只有 id 不同：内容签名相同也不再串盖。
   const base = { cron: soon, prompt: '完全一样', createdAt: T0 * 1000 - 1000 };
   writeTaskFile(m.WS, [
     makeTask({ id: '00000002', ...base }),
@@ -335,11 +360,8 @@ test('identical-content tasks (sig collision) are not force-stamped to one warm'
   m.claim(m.spawns[0], 'sid-A');
   m.claim(m.spawns[1], 'sid-B');
   await m.patrol(T0 + 1);
-  // 两个任务都不盖：交给调度锁原生规则，避免错盖导致空转预热泄漏。
-  for (const t2 of fileTasks(m)) {
-    assert.equal(t2.createdBySessionId, undefined);
-    assert.equal(t2.createdByPid, undefined);
-  }
+  assert.equal(sidOf(m, '00000002'), 'sid-A');
+  assert.equal(sidOf(m, '00000004'), 'sid-B');
   assert.ok(m.alive.has(m.spawns[0].scriptPid));
   assert.ok(m.alive.has(m.spawns[1].scriptPid));
 });
@@ -381,6 +403,32 @@ test('stuck warmup with a live creator is killed but not respawned', async (t) =
   assert.ok(!m.alive.has(stuckPid));
   assert.equal(m.spawns.length, 0, '活创建者可承接，不另拉');
   assert.equal(m.bucket['00000001'], undefined);
+});
+
+test('missing fingerprint makes stop return false: keep entry, warn, no respawn', async (t) => {
+  const m = await setupMachine(t);
+  const lines = [];
+  m.deps.log = (msg) => lines.push(msg);
+  writeTaskFile(m.WS, [makeTask()]);
+  const pid = 900;
+  m.alive.add(pid);
+  m.bucket['00000001'] = {
+    ws: m.WS, taskId: '00000001', pid,
+    startedAt: T0 - WARMUP_GRACE_SECONDS - 1, fails: 0,
+    // 旧条目没有 procStart；新版 stopSession 无法确认身份时返回 false。
+  };
+  const prevStop = m.deps.stopSession;
+  m.deps.stopSession = async (ent) => {
+    if (!ent.procStart) return false;
+    return prevStop(ent);
+  };
+  await m.patrol(T0);
+  assert.equal(m.bucket['00000001'].pid, pid);
+  assert.ok(m.alive.has(pid));
+  assert.equal(m.spawns.length, 0, '停止失败不能再拉重复会话');
+  assert.equal(m.bucket['00000001'].fails, 0, '未停止不记启动失败');
+  assert.ok(lines.some((l) => l.includes('无法安全停止')
+    && l.includes('保留跟踪')));
 });
 
 // ---- resume 脱离 ----
@@ -445,7 +493,6 @@ function seedWarm(m, task, { startedAt = T0 - 1000, claimed = true,
   const ent = {
     ws: m.WS,
     taskId: '00000001',
-    sig: taskSig(task),
     pid: scriptPid,
     procStart: `start-${scriptPid}`,
     startedAt,
@@ -564,42 +611,19 @@ test('orphan script process is adopted by its task-specific log path', async (t)
   assert.equal(m.bucket['00000001'].pid, orphanPid);
 });
 
-// ---- id 改键 ----
+// ---- 病态重复任务键 ----
 
-test('minify id change rebinds the state entry in the same round', async (t) => {
+test('duplicate anonymous task keys are skipped with an alert', async (t) => {
   const m = await setupMachine(t);
-  writeTaskFile(m.WS, [
-    makeTask({ id: 'c1363d8b', prompt: '大 id 任务' }),
-  ]);
+  const lines = [];
+  m.deps.log = (msg) => lines.push(msg);
+  const a = makeTask({ prompt: '无 id 重复' });
+  delete a.id;
+  writeTaskFile(m.WS, [a, { ...a }]);
   await m.patrol();
-  // 同轮：id 已改小，entry 也在新键上，持同一个 pid。
-  const pid = m.spawns[0].scriptPid;
-  assert.equal(m.bucket['00000001'].pid, pid);
-  assert.equal(m.bucket['c1363d8b'], undefined);
-  assert.equal(fileTasks(m)[0].id, '00000001');
-  // 下轮不重拉。
-  m.claim(m.spawns[0], 'sid-x');
-  await m.patrol(T0 + 1);
-  assert.equal(m.spawns.length, 1);
-});
-
-test('stale entry key heals by content signature, without killing the session', async (t) => {
-  const m = await setupMachine(t);
-  const task = makeTask({ id: '00000001', prompt: '大 id 任务' });
-  writeTaskFile(m.WS, [task]);
-  // state 停在旧键（模拟上轮文件已改小、state 未存盘即崩溃）。
-  const oldPid = 888;
-  m.alive.add(oldPid);
-  m.bucket['c1363d8b'] = {
-    ws: m.WS, taskId: 'c1363d8b',
-    sig: JSON.stringify([task.cron, task.prompt, task.createdAt, true]),
-    pid: oldPid, procStart: `start-${oldPid}`, startedAt: T0 - 10,
-    fails: 0,
-  };
-  await m.patrol();
-  assert.ok(m.alive.has(oldPid), '按签名治愈，不杀会话');
-  assert.equal(m.bucket['00000001'].pid, oldPid);
-  assert.equal(m.bucket['c1363d8b'], undefined);
+  assert.equal(m.spawns.length, 0);
+  assert.deepEqual(m.bucket, {});
+  assert.ok(lines.some((l) => l.includes('任务键重复') && l.includes('anon:')));
 });
 
 // ---- 一次性错过补执行窗口 ----
@@ -761,18 +785,22 @@ test('cmdRun: two tasks claimed on different polls are both stamped same round',
   assert.equal(sidOf(m, '00000004'), 'sid-B');
 });
 
-test('cmdRun: id minified in the same round still waits and stamps the warm session', async (t) => {
+test('cmdRun: partial claim of identical-content tasks stamps only the claimed id', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
+  const base = { cron: cronAt(300), prompt: '完全一样', createdAt: Date.now() - 1000 };
   writeTaskFile(m.WS, [
-    makeTask({ id: 'deadbeef', prompt: '大 id 日报' }),
+    makeTask({ id: '00000002', ...base }),
+    makeTask({ id: '00000004', ...base }),
   ]);
-  m.claimAt(() => m.byTask.get('deadbeef'), 1, 'sid-A');
+  m.claimAt(() => m.byTask.get('00000002'), 1, 'sid-A');
   assert.equal(await m.patrol(), true);
-  // id 已改小为首个空闲序号，归属盖在新 id 上，只拉过一个会话。
-  assert.deepEqual(fileTasks(m).map((x) => x.id), ['00000001']);
-  assert.equal(sidOf(m, '00000001'), 'sid-A');
-  assert.equal(m.spawns.length, 1);
-  assert.equal(m.state()[m.WS]['00000001'].sessionId, 'sid-A');
+  assert.equal(sidOf(m, '00000002'), 'sid-A');
+  assert.equal(sidOf(m, '00000004'), undefined,
+    '未认亲的另一条不能按内容签名跟着盖印');
+  assert.equal(m.polls(), 8, '另一条仍等待到本轮预算结束');
+  const st = m.state()[m.WS];
+  assert.equal(st['00000002'].sessionId, 'sid-A');
+  assert.equal(st['00000004'].sessionId, undefined);
 });
 
 test('cmdRun: no pending sessions means no extra scans or sleeps', async (t) => {
@@ -789,7 +817,7 @@ test('cmdRun: stamp write lost to a concurrent task-file change is skipped', asy
   writeTaskFile(m.WS, [task]);
   m.claimAt(() => m.byTask.get('00000002'), 1, 'sid-A');
   // 巡逻第三步是第 1 次 loadTaskDoc；盖印收尾是第 2 次——在它 stat 之后、
-  // rename 之前改写文件，逼乐观锁撞车。
+  // rename 之前改写文件，逼 mtime 乐观检测撞车。
   const lines = [];
   m.deps.log = (msg) => lines.push(msg);
   // loadTaskDoc 三次：巡逻 readTasks、巡逻第三步维护、盖印收尾维护。
@@ -834,4 +862,111 @@ test('dead fails counts survive within TTL and age out past it', async (t) => {
   writeJson(m.deps.paths.statePath, st);
   await m.patrol();
   assert.equal(m.state()[m.WS]?.['00000002'], undefined);
+});
+
+// ---- 真实巡检锁（进程探测打桩，不发真实信号）----
+
+function lockFixture(t) {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  const living = new Set([process.pid]);
+  const starts = new Map([[process.pid, 'self-start']]);
+  deps.alive = (pid) => living.has(pid);
+  deps.procStartedAt = (pid) => starts.get(pid) ?? null;
+  const lockPath = path.join(deps.paths.dataDir, 'run.lock');
+  const writeLock = (value) => {
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+    fs.writeFileSync(lockPath, text);
+  };
+  return { lockPath, living, starts, writeLock };
+}
+
+test('run lock enforces mutual exclusion and releases its own token', (t) => {
+  const { lockPath } = lockFixture(t);
+  const first = acquireRunLock();
+  assert.equal(typeof first.token, 'string');
+  assert.equal(acquireRunLock(), null);
+  releaseRunLock(first);
+  assert.equal(fs.existsSync(lockPath), false);
+  const second = acquireRunLock();
+  assert.ok(second);
+  assert.notEqual(second.token, first.token);
+  releaseRunLock(second);
+  assert.equal(fs.existsSync(lockPath), false);
+});
+
+test('run lock detects an unrelated live process reusing the holder pid', (t) => {
+  const { lockPath, living, starts, writeLock } = lockFixture(t);
+  const pid = 4242;
+  living.add(pid);
+  starts.set(pid, 'replacement-process');
+  writeLock({ pid, procStart: 'dead-holder', token: 'old-token' });
+  const handle = acquireRunLock();
+  assert.ok(handle, '指纹不同说明是 pid 复用，旧锁可回收');
+  assert.ok(living.has(pid), '清锁不碰那个无关活进程');
+  assert.equal(readJson(lockPath).token, handle.token);
+  releaseRunLock(handle);
+});
+
+test('run lock gives a fresh empty file an initialization grace period', (t) => {
+  const { lockPath, writeLock } = lockFixture(t);
+  writeLock('');
+  assert.equal(acquireRunLock(), null);
+  assert.equal(fs.readFileSync(lockPath, 'utf-8'), '', '新空锁不能立刻被删');
+  const old = new Date(Date.now() - 11_000);
+  fs.utimesSync(lockPath, old, old);
+  const handle = acquireRunLock();
+  assert.ok(handle, '超过初始化宽限的半成品才可清理');
+  releaseRunLock(handle);
+});
+
+test('run lock preserves a live legacy pid lock until its holder dies', (t) => {
+  const { lockPath, living, writeLock } = lockFixture(t);
+  living.add(4242);
+  writeLock('4242\n');
+  const old = new Date(Date.now() - 11_000);
+  fs.utimesSync(lockPath, old, old); // 活旧锁即使超过无效文件宽限也不能删。
+  assert.equal(acquireRunLock(), null);
+  assert.equal(fs.readFileSync(lockPath, 'utf-8'), '4242\n');
+  living.delete(4242);
+  const handle = acquireRunLock();
+  assert.ok(handle, '旧版 holder 明确死亡后才回收纯 pid 锁');
+  releaseRunLock(handle);
+});
+
+test('run lock reclaims a dead holder', (t) => {
+  const { writeLock } = lockFixture(t);
+  writeLock({ pid: 4242, procStart: 'dead-holder', token: 'old-token' });
+  const handle = acquireRunLock();
+  assert.ok(handle);
+  releaseRunLock(handle);
+});
+
+test('run lock keeps a live lock when process identity is unreadable', (t) => {
+  const { lockPath, living, writeLock } = lockFixture(t);
+  living.add(4242); // starts 故意没有当前指纹。
+  writeLock({ pid: 4242, procStart: 'recorded-start', token: 'old-token' });
+  assert.equal(acquireRunLock(), null);
+  assert.equal(readJson(lockPath).token, 'old-token');
+});
+
+test('run lock refuses to create a lock without its own fingerprint', (t) => {
+  const { lockPath, starts } = lockFixture(t);
+  starts.delete(process.pid);
+  assert.throws(() => acquireRunLock(), /不能安全创建巡检锁/);
+  assert.equal(fs.existsSync(lockPath), false, '无指纹时不能留下未来的自锁');
+});
+
+test('releaseRunLock refuses to unlink a replacement token', (t) => {
+  const { lockPath } = lockFixture(t);
+  const first = acquireRunLock();
+  fs.unlinkSync(lockPath);
+  fs.writeFileSync(lockPath, JSON.stringify({
+    pid: 4242, procStart: 'other-start', token: 'replacement-token',
+  }));
+  releaseRunLock(first);
+  assert.equal(readJson(lockPath).token, 'replacement-token');
+  releaseRunLock({ lockPath, token: 'replacement-token' });
+  assert.equal(fs.existsSync(lockPath), false);
 });

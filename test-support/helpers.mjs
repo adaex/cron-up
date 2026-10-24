@@ -94,7 +94,6 @@ export function sessionDetail(over = {}) {
     sessionId: over.sessionId ?? 'sid-1',
     procStart: over.procStart ?? 'Fri Oct 16 06:01:20 2026',
     ancestors: over.ancestors ?? [1],
-    chainComplete: over.chainComplete ?? true,
   };
 }
 

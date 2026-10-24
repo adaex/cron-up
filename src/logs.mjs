@@ -72,7 +72,8 @@ export function cmdLogs(args) {
       + `「${args.workspace}」匹配的会话日志`);
     throw new ExitError(1);
   }
-  const tailArgs = args.follow ? ['-f'] : ['-n', '100'];
+  // -F 同时按名字与描述符跟随：日志 rename 后原路径重建也能接上。
+  const tailArgs = args.follow ? ['-F'] : ['-n', '100'];
   tailArgs.push(file);
   const r = deps.spawnSync('/usr/bin/tail', tailArgs, { stdio: 'inherit' });
   if (r.error) throw r.error;

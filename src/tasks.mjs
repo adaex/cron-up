@@ -1,5 +1,5 @@
-// Claude Code 任务文件层：发现工作区、读任务、续期（permanent 标记）、id
-// 改小、归属盖印与原子写。任务文件是另一个程序写的外部输入，所有入口都
+// Claude Code 任务文件层：发现工作区、读任务、续期（permanent 标记）、
+// 归属盖印与原子写。任务文件是另一个程序写的外部输入，所有入口都
 // 校验形状，坏数据读作「没有任务」而不是抛进巡检循环。
 
 import fs from 'node:fs';
@@ -10,8 +10,6 @@ import { deps, isPlainObject } from './internals.mjs';
 import { TASK_REL } from './paths.mjs';
 import {
   PRUNE_DIRS,
-  CC_JITTER,
-  AUTO_MIN_ID_TARGET_DELAY_MS,
   MAX_SCAN_DEPTH,
 } from './constants.mjs';
 
@@ -140,9 +138,9 @@ export function taskKey(t) {
   return `anon:${createHash('sha1').update(taskSig(t)).digest('hex').slice(0, 16)}`;
 }
 
-// 任务的稳定内容签名：只含不会被我们与调度器改动的字段。minify 改 id、盖
-// 印改 createdBy*、执行改 lastFiredAt、续期加 permanent 都不改变签名——
-// 它是「id 改写前后 state 条目改键」与「一批多 target 盖印」的串联键。
+// 任务的稳定内容签名：只含不会被我们与调度器改动的字段。盖印改
+// createdBy*、执行改 lastFiredAt、续期加 permanent 都不改变签名；无 id
+// 任务的 taskKey 用它生成内容摘要键。
 export function taskSig(t) {
   return JSON.stringify([
     t?.cron ?? null,
@@ -152,9 +150,25 @@ export function taskSig(t) {
   ]);
 }
 
+// 按任务身份键分组的共享视图：重复键天然落在同一组，调用方不必各自
+// 维护重复计数与键集合。非对象条目不参与盖印或巡检，和 readTasks/
+// maintain 的既有口径一致。
+export function groupTasksByKey(tasks) {
+  const groups = new Map();
+  for (const t of tasks) {
+    if (!isPlainObject(t)) continue;
+    const key = taskKey(t);
+    const group = groups.get(key) ?? [];
+    group.push(t);
+    groups.set(key, group);
+  }
+  return groups;
+}
+
 // 任务文件在「读到」与「写回」之间被别的写者改了（Claude Code 更新
-// lastFiredAt 或删除已触发任务）：绝不覆盖，抛 TaskFileChanged 让下轮
-// 巡检基于更新的文档重试。
+// lastFiredAt 或删除已触发任务）：最终检查时能发现就抛 TaskFileChanged，
+// 让下轮巡检基于更新的文档重试。检查与 rename 之间仍有极小竞态，不能把
+// 这层检测当成与上游共用的互斥锁。
 export class TaskFileChanged extends Error {
   constructor(file) {
     super(`任务文件已被其他写者改动：${file}`);
@@ -184,8 +198,8 @@ function tmpSibling(file) {
 
 // 旁边写再 rename 的原子替换，保留原文件权限位与中文字面量。
 // tmp 以 0600 创建（绝不更宽），写完再放宽到原 mode。expectedMtimeNs 是
-// 乐观锁：路径 mtime 自调用方读后变了说明别的写者抢先，抛
-// TaskFileChanged 而不是覆盖它的更新。
+// 乐观检测：最终检查时路径 mtime 已变说明别的写者抢先，抛 TaskFileChanged
+// 而不是覆盖这次检查之前发生的更新。
 export function atomicWriteJson(file, doc, expectedMtimeNs) {
   let mode = 0o600;
   try {
@@ -221,72 +235,17 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
   fs.renameSync(tmp, file);
 }
 
-// 严格 8 位十六进制的任务 id（Claude Code 自己生成的形状）转数值；其他
-// 形状（短串、UUID、缺失、非字符串）返回 null——它们算「未达标」，由
-// minifyIds 改写成合规小号。
-export function parseTaskIdN(id) {
-  if (typeof id !== 'string' || !/^[0-9a-fA-F]{8}$/.test(id)) return null;
-  return parseInt(id, 16);
-}
-
-// autoMinId 的 id 数值上界：每日任务延迟 ≤ AUTO_MIN_ID_TARGET_DELAY_MS。
-export function minTaskIdMaxN() {
-  return Math.floor(
-    AUTO_MIN_ID_TARGET_DELAY_MS
-      / (CC_JITTER.recurringFrac * 86400_000) * 2 ** 32);
-}
-
-// 把显式周期任务里 id 数值超过上界（或形状不合法）的，改写成文件内未占用
-// 的小号（00000001 起的 8 位十六进制），使其投递抖动降到目标延迟内。原地
-// 修改 tasks 元素，返回 {changed, idChanges}；idChanges 用 taskKey 口径
-// 记录改前/改后键，巡检同轮把 state 条目跟着改键（state 以任务 id 为
-// 键，不改键会把刚换 id 的任务误判为「旧任务删除 + 新任务」而错杀重
-// 拉）。关键纪律：
-//   - 只碰 t.recurring truthy 的显式周期任务，一次性与无标志手写条目不碰；
-//   - 已达标的小号（含 00000000）原样保留，永不重排——多次巡检结果稳定，
-//     第二轮起 0 改动、文件字节不动；
-//   - 空号在「文件内全部任务」（含一次性）已占用的 id 之外分配，保证同文
-//     件唯一；跨文件重复无妨（各工作区独立加载）。
-export function minifyIds(tasks) {
-  const maxN = minTaskIdMaxN();
-  const used = new Set();
-  for (const t of tasks) {
-    if (!isPlainObject(t)) continue;
-    const n = parseTaskIdN(t.id);
-    if (n !== null) used.add(n);
-  }
-  let next = 1;
-  const takeFree = () => {
-    while (used.has(next)) next += 1;
-    used.add(next);
-    return next;
-  };
-  let changed = 0;
-  const idChanges = [];
-  for (const t of tasks) {
-    if (!isPlainObject(t) || !t.recurring) continue;
-    const n = parseTaskIdN(t.id);
-    if (n !== null && n <= maxN) continue;
-    const from = taskKey(t);
-    const to = takeFree().toString(16).padStart(8, '0');
-    t.id = to;
-    changed += 1;
-    idChanges.push({ from, to });
-  }
-  return { changed, idChanges };
-}
-
-// 一轮巡检对一个任务文件做的维护：renew（补 permanent）、minify（id 改
-// 小）、reown（把任务归属盖给各自的预热会话）合并为同一次受 mtime 乐观
-// 锁保护的原子写。renew/minify 无条件执行，没有开关。先取 mtimeNs、清残
-// 留 .cron-up-tmp、loadTaskDoc round-trip 整文档；三项计数都为 0 时字节
-// 级不动。返回 {renewed,minified,reowned,idChanges}；null 表示文件缺失/
-// 损坏；读到写间被改抛 TaskFileChanged。
+// 一轮巡检对一个任务文件做的维护：renew（补 permanent）与 reown（把任务
+// 归属盖给各自的预热会话）合并为同一次带 mtime 乐观检测的原子写。先取
+// mtimeNs、清残留 .cron-up-tmp、loadTaskDoc round-trip 整文档；两项计数
+// 都为 0 时字节级不动。返回 {renewed,reowned}；null 表示文件缺失/损坏；
+// 读到写间被改抛 TaskFileChanged。
 //
-// reown 形状：Map<taskSig, {sessionId, pid, procStart}>。一轮内同一文件的
-// 不同任务可盖向不同预热（一任务一会话）；Map 以签名为键，minify 先改 id
-// 不影响随后的盖印查找。只盖 createdBySessionId 不等于目标的任务，第二轮
-// 起字节级不动；pid/procStart 是会话登记里 claude 进程的 pid 与 lstart。
+// reown 形状：Map<taskKey, {sessionId, pid, procStart}>。一轮内同一文件的
+// 不同任务可盖向不同预热（一任务一会话）；内容相同但 id 不同的任务互不
+// 影响。同一个 taskKey 对应多条任务是病态输入，无法把 state/会话唯一对应
+// 到条目，这些键全部跳过盖印。只盖 createdBySessionId 不等于目标的任务，
+// 第二轮起字节级不动；pid/procStart 是登记里 claude 进程的 pid 与 lstart。
 export function maintainWorkspace(taskfile, { reown = null } = {}) {
   let mtimeNs;
   try {
@@ -306,23 +265,25 @@ export function maintainWorkspace(taskfile, { reown = null } = {}) {
   if (doc === null) return null;
   let renewed = 0;
   for (const t of doc.tasks) {
+    if (!isPlainObject(t)) continue;
     // truthy 而非 === true：与 Claude Code 自己的加载器一致
     // （...o.permanent && {permanent:true}），它已认作永久的任何值都算，
     // 不再重写。只有显式周期任务有资格——绝不从 cron 形状推断周期性，
     // 一次性任务不碰。
-    if (isPlainObject(t) && t.recurring && !t.permanent) {
+    if (t.recurring && !t.permanent) {
       t.permanent = true;
       renewed += 1;
     }
   }
-  const { changed: minified, idChanges } = minifyIds(doc.tasks);
   let reowned = 0;
   if (reown instanceof Map && reown.size > 0) {
-    for (const t of doc.tasks) {
+    // 只有确实需要盖印时才计算任务键；纯续期与常见空操作不付摘要成本。
+    for (const [key, group] of groupTasksByKey(doc.tasks)) {
+      if (group.length !== 1) continue;
+      const t = group[0];
+      const target = reown.get(key);
       // 没有 owner 字段的外部条目同样盖——窗口内任务统一归各自预热，语义
       // 不因条目来源留例外。
-      if (!isPlainObject(t)) continue;
-      const target = reown.get(taskSig(t));
       if (target && t.createdBySessionId !== target.sessionId) {
         t.createdBySessionId = target.sessionId;
         t.createdByPid = target.pid;
@@ -332,11 +293,11 @@ export function maintainWorkspace(taskfile, { reown = null } = {}) {
       }
     }
   }
-  if (renewed === 0 && minified === 0 && reowned === 0) {
-    return { renewed: 0, minified: 0, reowned: 0, idChanges: [] };
+  if (renewed === 0 && reowned === 0) {
+    return { renewed: 0, reowned: 0 };
   }
   atomicWriteJson(taskfile, doc, mtimeNs);
-  return { renewed, minified, reowned, idChanges };
+  return { renewed, reowned };
 }
 
 Object.assign(deps, { discover, readTasks, loadTaskDoc });

@@ -47,6 +47,23 @@ test('non-positive step is rejected, not hung on', () => {
   }
 });
 
+test('huge cron integers and ranges cannot hang or iterate without bound', () => {
+  // 2^53 起 v+=1 不再前进； unsafe 整数整条按 cron 无效处理。
+  for (const expr of ['9007199254740992 * * * *',
+    '-9007199254740992 * * * *', '0-999999999999999999999 * * * *']) {
+    assert.equal(parseCronOrNone(expr), null, expr);
+  }
+  // 安全但巨大的区间也只展开合法值域，测试立即返回且结果不越界。
+  assert.deepEqual([...parseCronField('0-9007199254740991', 0, 59)],
+    Array.from({ length: 60 }, (_, i) => i));
+  assert.equal(new Cron('9007199254740991 * * * *').satisfiable, false);
+});
+
+test('clamped range keeps the original step phase', () => {
+  assert.deepEqual([...parseCronField('0-20/3', 1, 31)], [3, 6, 9, 12, 15, 18]);
+  assert.deepEqual([...parseCronField('0-20/6', 1, 31)], [6, 12, 18]);
+});
+
 test('rolls to next day', () => {
   assert.equal(new Cron('3 9 * * *').nextAfter(NOW)?.getTime(),
     dt(2026, 9, 21, 9, 3));

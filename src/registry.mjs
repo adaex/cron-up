@@ -62,18 +62,18 @@ export function processParentMap() {
   return map.size > 0 ? map : null;
 }
 
-// 沿父子表上溯（不含 pid 自身），直到 launchd(1；其父记为 0)。中途父 pid
-// 在快照里缺失（ps 退化/进程刚好退出）或成环时 chainComplete=false。
+// 沿父子表上溯（不含 pid 自身），直到 launchd(1；其父记为 0)、父 pid 在
+// 快照里缺失或成环。调用方只消费祖先列表；断链时保留已读到的部分即可。
 export function ancestorChain(pid, parentMap) {
   const ancestors = [];
   const seen = new Set([pid]);
   let cur = pid;
   for (;;) {
     const parent = parentMap?.get(cur);
-    if (parent === undefined) return { ancestors, chainComplete: false };
+    if (parent === undefined) return ancestors;
     ancestors.push(parent);
-    if (parent <= 1) return { ancestors, chainComplete: true }; // 0/1 即根
-    if (seen.has(parent)) return { ancestors, chainComplete: false };
+    if (parent <= 1) return ancestors; // 0/1 即根
+    if (seen.has(parent)) return ancestors;
     seen.add(parent);
     cur = parent;
   }
@@ -159,9 +159,9 @@ async function readSessionFile(file) {
 }
 
 // 返回 [拥有活消费者会话的工作区集合, 告警字符串|null, 会话详情 Map]。
-// 第三个元素是 Map<cwd, Array<{pid, sessionId, procStart, ancestors,
-// chainComplete}>>。祖先链恒拍：快照失败给空链，相关预热本轮认不到亲、
-// 下轮自动重试；consumers 判定不受影响。
+// 第三个元素是 Map<cwd, Array<{pid, sessionId, procStart, ancestors}>>。
+// 祖先链恒拍：快照失败给空链，相关预热本轮认不到亲、下轮自动重试；
+// consumers 判定不受影响。
 export async function scanSessions() {
   let files = [];
   try {
@@ -217,9 +217,7 @@ export async function scanSessions() {
       if (typeof cwd === 'string' && path.isAbsolute(cwd)) {
         const ws = lexReal(cwd);
         consumers.add(ws);
-        const chain = parentMap
-          ? ancestorChain(pid, parentMap)
-          : { ancestors: [], chainComplete: false };
+        const ancestors = parentMap ? ancestorChain(pid, parentMap) : [];
         const list = details.get(ws) ?? [];
         list.push({
           pid,
@@ -227,8 +225,7 @@ export async function scanSessions() {
           // procStart 是 ps lstart 原文（单位数日期含双空格），只许原样
           // 传递给任务文件，绝不能自己拼。
           procStart: typeof s.procStart === 'string' ? s.procStart : null,
-          ancestors: chain.ancestors,
-          chainComplete: chain.chainComplete,
+          ancestors,
         });
         details.set(ws, list);
         continue;

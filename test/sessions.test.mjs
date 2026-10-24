@@ -5,6 +5,7 @@ import path from 'node:path';
 
 import {
   spawnSession,
+  stopSession,
   buildChildEnv,
   sessionArgv,
   shellQuote,
@@ -15,6 +16,22 @@ import {
 } from '../src/sessions.mjs';
 import { loadState } from '../src/config.mjs';
 import { mkTmp, mockDeps, tmpPaths } from '../test-support/helpers.mjs';
+
+// process.kill 是全局可变方法：每个用例显式打桩，并即使断言失败也在
+// finally 里恢复，既不发真实信号，也不把桩泄漏给后续测试。
+async function withMockKill(fn, kill = () => true) {
+  const originalKill = process.kill;
+  const calls = [];
+  process.kill = (pid, signal) => {
+    calls.push([pid, signal]);
+    return kill(pid, signal);
+  };
+  try {
+    return await fn(calls);
+  } finally {
+    process.kill = originalKill;
+  }
+}
 
 // ---- 日志命名 ----
 
@@ -100,10 +117,71 @@ test('spawn that never started returns null, not a pid-less record', (t) => {
   assert.equal(spawnSession(ws, '00000001'), null);
 });
 
+test('spawn without a process fingerprint cleans only the new process group',
+  async (t) => {
+    const tmp = mkTmp(t);
+    const deps = mockDeps(t);
+    deps.paths = tmpPaths(tmp);
+    deps.procStartedAt = () => null;
+    deps.spawn = () => ({ pid: 4242, on() {}, unref() {} });
+    const logged = [];
+    deps.log = (msg) => logged.push(msg);
+    const ws = path.join(tmp, 'proj');
+    fs.mkdirSync(ws);
+    await withMockKill(async (calls) => {
+      assert.equal(spawnSession(ws, '00000001'), null);
+      assert.deepEqual(calls, [[-4242, 'SIGTERM']]);
+      assert.equal(logged.length, 1);
+      assert.ok(logged[0].includes('未读到进程身份指纹'));
+      assert.ok(logged[0].includes('已向刚拉起的进程组发送 SIGTERM'));
+    });
+  });
+
+test('spawn fingerprint cleanup failure is logged with the real error',
+  async (t) => {
+    const tmp = mkTmp(t);
+    const deps = mockDeps(t);
+    deps.paths = tmpPaths(tmp);
+    deps.procStartedAt = () => null;
+    deps.spawn = () => ({ pid: 4242, on() {}, unref() {} });
+    const logged = [];
+    deps.log = (msg) => logged.push(msg);
+    const ws = path.join(tmp, 'proj');
+    fs.mkdirSync(ws);
+    await withMockKill(async (calls) => {
+      assert.equal(spawnSession(ws, '00000001'), null);
+      assert.deepEqual(calls, [[-4242, 'SIGTERM']]);
+      assert.equal(logged.length, 1);
+      assert.ok(logged[0].includes('清理刚拉起的进程组失败'));
+      assert.ok(logged[0].includes('EPERM'));
+    }, () => {
+      throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+    });
+  });
+
+test('spawn fingerprint cleanup never signals an unsafe pid', async (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  deps.procStartedAt = () => null;
+  deps.spawn = () => ({ pid: 1, on() {}, unref() {} });
+  const logged = [];
+  deps.log = (msg) => logged.push(msg);
+  const ws = path.join(tmp, 'proj');
+  fs.mkdirSync(ws);
+  await withMockKill(async (calls) => {
+    assert.equal(spawnSession(ws, '00000001'), null);
+    assert.deepEqual(calls, []);
+    assert.equal(logged.length, 1);
+    assert.ok(logged[0].includes('未发信号'));
+  });
+});
+
 test('async spawn error is logged with workspace and task id', (t) => {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp);
+  deps.procStartedAt = () => 'start';
   let onError;
   deps.spawn = () => ({
     pid: 4242,
@@ -167,11 +245,12 @@ test('buildChildEnv is a pure function', () => {
   assert.equal('CLAUDE_CODE_X' in env, true); // 输入不被改
 });
 
-test('session argv quotes the workspace and runs login interactive zsh', () => {
+test('session argv quotes the workspace and sets unattended permission mode', () => {
   const argv = sessionArgv('/Users/aex/My Proj', '/tmp/x.log');
   assert.deepEqual(argv, [
     '/usr/bin/script', '-q', '/tmp/x.log',
-    '/bin/zsh', '-lic', "cd '/Users/aex/My Proj' && claude",
+    '/bin/zsh', '-lic',
+    "cd '/Users/aex/My Proj' && claude --permission-mode bypassPermissions",
   ]);
 });
 
@@ -181,6 +260,147 @@ test('shellQuote keeps the safe set bare and single-quotes the rest', () => {
   assert.equal(shellQuote('a b'), "'a b'");
   assert.equal(shellQuote("a'b"), `'a'"'"'b'`);
 });
+
+// ---- stop ----
+
+test('stop: a tracked session exits after SIGTERM', async (t) => {
+  const deps = mockDeps(t);
+  let living = true;
+  deps.alive = () => living;
+  deps.procStartedAt = () => 'start';
+  let sleeps = 0;
+  deps.sleep = async (ms) => {
+    sleeps++;
+    assert.equal(ms, 100);
+  };
+  await withMockKill(async (calls) => {
+    assert.equal(await stopSession({ pid: 4242, procStart: 'start' }), true);
+    assert.deepEqual(calls, [[-4242, 'SIGTERM']]);
+    assert.equal(sleeps, 1);
+  }, (pid, signal) => {
+    if (signal === 'SIGTERM') living = false;
+    return true;
+  });
+});
+
+test('stop: a tracked session that ignores SIGTERM gets SIGKILL', async (t) => {
+  const deps = mockDeps(t);
+  let living = true;
+  deps.alive = () => living;
+  deps.procStartedAt = () => 'start';
+  let sleeps = 0;
+  deps.sleep = async (ms) => {
+    sleeps++;
+    assert.equal(ms, 100);
+  };
+  await withMockKill(async (calls) => {
+    assert.equal(await stopSession({ pid: 4242, procStart: 'start' }), true);
+    assert.deepEqual(calls, [
+      [-4242, 'SIGTERM'],
+      [-4242, 'SIGKILL'],
+    ]);
+    assert.equal(sleeps, 21);
+  }, (pid, signal) => {
+    if (signal === 'SIGKILL') living = false;
+    return true;
+  });
+});
+
+test('stop: SIGTERM failure keeps the entry marked as not stopped', async (t) => {
+  const deps = mockDeps(t);
+  deps.alive = () => true;
+  deps.procStartedAt = () => 'start';
+  deps.sleep = async () => {
+    throw new Error('failed SIGTERM must not enter the wait loop');
+  };
+  await withMockKill(async (calls) => {
+    assert.equal(await stopSession({ pid: 4242, procStart: 'start' }), false);
+    assert.deepEqual(calls, [[-4242, 'SIGTERM']]);
+  }, () => {
+    throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+  });
+});
+
+test('stop: surviving SIGKILL is not reported as stopped', async (t) => {
+  const deps = mockDeps(t);
+  deps.alive = () => true;
+  deps.procStartedAt = () => 'start';
+  deps.sleep = async () => {};
+  await withMockKill(async (calls) => {
+    assert.equal(await stopSession({ pid: 4242, procStart: 'start' }), false);
+    assert.deepEqual(calls, [
+      [-4242, 'SIGTERM'],
+      [-4242, 'SIGKILL'],
+    ]);
+  });
+});
+
+test('stop: dead or detached sessions need no signals', async (t) => {
+  const deps = mockDeps(t);
+  let living = false;
+  deps.alive = () => living;
+  deps.procStartedAt = () => 'other';
+  deps.sleep = async () => {
+    throw new Error('dead or detached sessions must not wait');
+  };
+  await withMockKill(async (calls) => {
+    const ent = { pid: 4242, procStart: 'start' };
+    assert.equal(await stopSession(ent), true, '已死');
+    living = true;
+    assert.equal(await stopSession(ent), true, '已脱离');
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('stop: unsafe pids return without any process operation', async (t) => {
+  const deps = mockDeps(t);
+  deps.alive = () => {
+    throw new Error('unsafe pids must not be probed');
+  };
+  deps.trackedAlive = () => {
+    throw new Error('unsafe pids must not be identity-checked');
+  };
+  deps.sleep = async () => {
+    throw new Error('unsafe pids must not wait');
+  };
+  await withMockKill(async (calls) => {
+    for (const pid of [1, 1.5, -4242, 0]) {
+      assert.equal(await stopSession({ pid, procStart: 'start' }), true,
+        `pid=${pid}`);
+    }
+    assert.deepEqual(calls, []);
+  });
+});
+
+test('stop: a live legacy entry without a fingerprint is not signalled',
+  async (t) => {
+    const deps = mockDeps(t);
+    deps.alive = () => true;
+    deps.sleep = async () => {
+      throw new Error('an unidentified live process must not wait');
+    };
+    await withMockKill(async (calls) => {
+      const ent = { pid: 4242 };
+      assert.equal(trackedAlive(ent), true, '旧条目仍兼容 kill -0 读取');
+      assert.equal(await stopSession(ent), false);
+      assert.deepEqual(calls, []);
+    });
+  });
+
+test('stop: a dead legacy entry without a fingerprint needs no action',
+  async (t) => {
+    const deps = mockDeps(t);
+    deps.alive = () => false;
+    deps.sleep = async () => {
+      throw new Error('a dead process must not wait');
+    };
+    await withMockKill(async (calls) => {
+      const ent = { pid: 4242 };
+      assert.equal(trackedAlive(ent), false);
+      assert.equal(await stopSession(ent), true);
+      assert.deepEqual(calls, []);
+    });
+  });
 
 // ---- 嵌套 state 的清洗 ----
 
@@ -209,8 +429,8 @@ test('nested state: hand-edited numeric fields are sanitised per entry', (t) => 
   // 非法 pid 落空。
   assert.equal(st['/c']['00000003'].pid, null);
   assert.equal(st['/d']['00000004'].pid, null);
-  // 浮点截断。
-  assert.equal(st['/e']['00000005'].pid, 1);
+  // pid 入口拒绝浮点，不截成另一个进程编号。
+  assert.equal(st['/e']['00000005'].pid, null);
 });
 
 test('nested state: bad buckets and bad entries are dropped', (t) => {

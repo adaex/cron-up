@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 
 import { resolveLogPath, cmdLogs } from '../src/logs.mjs';
 import { sessionLogPath } from '../src/sessions.mjs';
@@ -126,7 +128,7 @@ test('absolute path recovers the on-disk case', async (t) => {
   assert.equal(s.resolve(typed), file);
 });
 
-test('cmdLogs tails -f with the resolved file', async (t) => {
+test('cmdLogs tails -F with the resolved file', async (t) => {
   const s = await setup(t);
   fs.writeFileSync(s.out, 'patrol ok\n');
   let seen;
@@ -136,8 +138,55 @@ test('cmdLogs tails -f with the resolved file', async (t) => {
   };
   cmdLogs({ follow: true });
   assert.equal(seen.file, '/usr/bin/tail');
-  assert.deepEqual(seen.args, ['-f', s.out]);
+  assert.deepEqual(seen.args, ['-F', s.out]);
   assert.equal(seen.opts.stdio, 'inherit');
+});
+
+test('real tail -F survives log rename and recreation', { timeout: 12000 }, async (t) => {
+  const s = await setup(t);
+  fs.writeFileSync(s.out, 'before rename\n');
+  const child = spawn('/usr/bin/tail', ['-F', s.out], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf-8');
+  child.stderr.setEncoding('utf-8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+  const exited = once(child, 'exit');
+  const running = () => child.exitCode === null && child.signalCode === null;
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  t.after(() => {
+    if (running()) child.kill('SIGKILL');
+  });
+  const waitFor = async (marker) => {
+    const deadline = Date.now() + 6000;
+    while (!stdout.includes(marker)) {
+      if (!running()) {
+        throw new Error(`tail 提前退出：${stderr}\n${stdout}`);
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`等待 ${marker} 超时：${stderr}\n${stdout}`);
+      }
+      await sleep(50);
+    }
+  };
+  try {
+    await waitFor('before rename');
+    fs.renameSync(s.out, `${s.out}.1`);
+    fs.writeFileSync(s.out, 'after recreate\n');
+    await waitFor('after recreate');
+  } finally {
+    if (running()) child.kill('SIGTERM');
+    await Promise.race([exited, sleep(1000)]);
+    if (running()) {
+      child.kill('SIGKILL');
+      await exited;
+    }
+  }
+  assert.match(stdout, /before rename/);
+  assert.match(stdout, /after recreate/);
 });
 
 test('cmdLogs defaults to tail -n 100', async (t) => {

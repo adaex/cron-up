@@ -51,7 +51,6 @@ test('live claude consumers; dead and other kinds ignored', async (t) => {
   const list = details.get(fs.realpathSync(tmp));
   assert.deepEqual(list.map((d) => d.pid), [101]); // 202 不是 interactive
   assert.deepEqual(list[0].ancestors, [1]);
-  assert.equal(list[0].chainComplete, true);
   assert.equal(list[0].sessionId, null);
   assert.equal(list[0].procStart, null);
 });
@@ -270,25 +269,22 @@ test('processParentMap parses full-table snapshot', (t) => {
   assert.equal(processParentMap(), null);
 });
 
-test('ancestorChain walks to launchd, flags broken chains', () => {
+test('ancestorChain walks to launchd and stops on broken chains', () => {
   // script(10) → zsh(20) → claude(30) 的生产三层结构；上溯到 launchd(1)
   // 即终止（不追加其父 0）。
   const full = new Map([[30, 20], [20, 10], [10, 1], [1, 0]]);
-  assert.deepEqual(ancestorChain(30, full),
-    { ancestors: [20, 10, 1], chainComplete: true });
+  assert.deepEqual(ancestorChain(30, full), [20, 10, 1]);
 
   // 中间代在快照里缺失：链断在 20。
   const broken = new Map([[30, 20], [10, 1], [1, 0]]);
-  assert.deepEqual(ancestorChain(30, broken),
-    { ancestors: [20], chainComplete: false });
+  assert.deepEqual(ancestorChain(30, broken), [20]);
 
-  // 无快照：空链、断链。
-  assert.deepEqual(ancestorChain(30, null),
-    { ancestors: [], chainComplete: false });
+  // 无快照：空链。
+  assert.deepEqual(ancestorChain(30, null), []);
 
-  // 成环防御：不能死循环。
+  // 成环防御：不能死循环，保留已经读到的祖先。
   const loop = new Map([[30, 20], [20, 30]]);
-  assert.equal(ancestorChain(30, loop).chainComplete, false);
+  assert.deepEqual(ancestorChain(30, loop), [20, 30]);
 });
 
 test('details group sessions by cwd with identity fields', async (t) => {
@@ -312,7 +308,6 @@ test('details group sessions by cwd with identity fields', async (t) => {
   assert.deepEqual(consumers, new Set([ws]));
   const byPid = new Map(details.get(ws).map((d) => [d.pid, d]));
   assert.deepEqual(byPid.get(30).ancestors, [20, 10, 1]);
-  assert.equal(byPid.get(30).chainComplete, true);
   assert.equal(byPid.get(30).sessionId, 'sess-warm');
   // 双空格 lstart 原文透传，不做规范化。
   assert.equal(byPid.get(40).procStart, 'Thu Oct  8 09:10:00 2026');
@@ -333,7 +328,6 @@ test('broken lineage is quiet: consumer kept with empty chain and no alert', asy
   assert.deepEqual(consumers, new Set([ws]));
   assert.equal(alert, null);
   assert.deepEqual(details.get(ws)[0].ancestors, []);
-  assert.equal(details.get(ws)[0].chainComplete, false);
 });
 
 test('null parent map yields empty chains without alerting', async (t) => {
@@ -347,7 +341,6 @@ test('null parent map yields empty chains without alerting', async (t) => {
   assert.deepEqual(consumers, new Set([ws]));
   assert.equal(alert, null);
   assert.deepEqual(details.get(ws)[0].ancestors, []);
-  assert.equal(details.get(ws)[0].chainComplete, false);
 });
 
 // ---- claimWarm：script pid → 登记详情的认亲 ----
@@ -355,7 +348,7 @@ test('null parent map yields empty chains without alerting', async (t) => {
 function claimDetail(over = {}) {
   return {
     pid: 30, sessionId: 's', procStart: 'start',
-    ancestors: [1], chainComplete: true, ...over,
+    ancestors: [1], ...over,
   };
 }
 

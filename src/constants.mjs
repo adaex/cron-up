@@ -1,7 +1,7 @@
 // 全部调参常量集中一处，改动时便于通盘核对。
 
-// 配置文件只有 roots 一个字段：巡检间隔、提前量、扫描深度、续期、改 id、
-// 任务归属盖印都是不可关闭的唯一行为（见 README），常量化在本文件。
+// 配置文件只有 roots 一个字段：巡检间隔、提前量、扫描深度、续期与任务归属
+// 盖印都是不可关闭的唯一行为（见 README），常量化在本文件。
 export const DEFAULT_CONFIG = {
   // 默认只扫本人的三个任务制容器，不扫整个家目录——他人可写仓库里的周期
   // 任务会被自动续期永久化，默认范围必须是用户完全掌控的领地（见 README
@@ -90,14 +90,6 @@ export const CC_JITTER = {
   oneShotFloorMs: 0,
   oneShotMinuteMod: 30,
 };
-
-// autoMinId 改小 id 的目标投递延迟上界。周期延迟 = hash(id)·frac·周期，
-// 按每日周期（86400000ms，周期最短、要求最严）反解 id 数值上界：
-//   maxN = floor(目标延迟 / (frac·每日ms) · 2^32) ≈ 5_965_232 (0x005b05b0)
-// id 数值不超过它的每日任务延迟 ≤ 60 秒；周/月任务周期更长，同阈值下延迟
-// 更小。改小逻辑（src/tasks.mjs 的 minifyIds）从这里与 CC_JITTER 现算
-// maxN，常量只保留「目标延迟」这一个可调项。
-export const AUTO_MIN_ID_TARGET_DELAY_MS = 60 * 1000;
 
 // 投递尾窗判定的回看/前探窗口（wanted 与 nextDelivery 共用，见
 // src/cron.mjs 的 recurringTailWindow）：找上一落点用 prevAtOrBefore、算

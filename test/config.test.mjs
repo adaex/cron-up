@@ -11,6 +11,7 @@ import {
   saveState,
   validateConfig,
   configFieldErrors,
+  parsePid,
   isCooling,
   cooldownEtaMinutes,
   heartbeatStale,
@@ -175,14 +176,17 @@ test('legacy keys are silently ignored and absent from the returned config', (t)
   assert.deepEqual(loadConfig(file), { roots: ['/tmp'] });
 });
 
-test('config without roots falls back to defaults', (t) => {
+test('existing config without roots fails instead of widening to defaults', (t) => {
   const tmp = mkTmp(t);
   mockDeps(t);
   const file = path.join(tmp, 'cfg.json');
   writeJson(file, {});
-  const cfg = loadConfig(file);
-  assert.ok(Array.isArray(cfg.roots));
-  assert.deepEqual(Object.keys(cfg).sort(), ['roots']);
+  assert.throws(() => loadConfig(file), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('roots'));
+    return true;
+  });
 });
 
 test('roots type error can be raised as a plain error for human pages', (t) => {
@@ -287,7 +291,7 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
   assert.equal(b.taskId, '00000003');
 });
 
-test('oversized pid and float pid are sanitised in nested state', (t) => {
+test('oversized pid and non-integer number pid are sanitised in nested state', (t) => {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp);
@@ -299,7 +303,16 @@ test('oversized pid and float pid are sanitised in nested state', (t) => {
   }));
   const st = loadState();
   assert.equal(st['/a']['00000001'].pid, null);
-  assert.equal(st['/a']['00000002'].pid, 1);
+  assert.equal(st['/a']['00000002'].pid, null);
+});
+
+test('parsePid accepts integer numbers and decimal strings, never truncates', () => {
+  assert.equal(parsePid(1), 1, 'pid=1 可由登记读取入口保留');
+  assert.equal(parsePid(123), 123);
+  assert.equal(parsePid('123'), 123);
+  for (const bad of [1.5, -1.5, NaN, Infinity, '1.5', '1e2', '0x10', '12x']) {
+    assert.equal(parsePid(bad), null, String(bad));
+  }
 });
 
 // ---- 旧版扁平 state：loadState 与 loadLegacyEntries 互斥 ----
@@ -352,6 +365,30 @@ test('legacy markers: any of pid/startedAt/cooldownUntil/fails flags a flat entr
   const legacy = loadLegacyEntries().map((e) => e.ws).sort();
   assert.deepEqual(legacy, ['/a', '/b', '/c']);
   assert.deepEqual(Object.keys(loadState()), ['/d']);
+});
+
+test('legacy marker names are valid manual task ids beside ordinary siblings', (t) => {
+  const tmp = mkTmp(t);
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  writeJson(deps.paths.statePath, {
+    '/ws': {
+      pid: { pid: 101, startedAt: 1 },
+      startedAt: { pid: 102, startedAt: 2 },
+      cooldownUntil: { pid: 103, startedAt: 3 },
+      fails: { pid: 104, startedAt: 4 },
+      '00000001': { pid: 105, startedAt: 5 },
+    },
+  });
+  const state = loadState();
+  assert.deepEqual(Object.keys(state['/ws']).sort(),
+    ['00000001', 'cooldownUntil', 'fails', 'pid', 'startedAt']);
+  for (const [taskId, pid] of [['pid', 101], ['startedAt', 102],
+    ['cooldownUntil', 103], ['fails', 104], ['00000001', 105]]) {
+    assert.equal(state['/ws'][taskId].pid, pid);
+    assert.equal(state['/ws'][taskId].taskId, taskId);
+  }
+  assert.deepEqual(loadLegacyEntries(), [], '新桶不能因任务键名被旧读取器拿走');
 });
 
 // ---- 保存权限 ----
