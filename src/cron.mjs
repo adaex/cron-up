@@ -48,7 +48,9 @@ export function parseCronField(expr, lo, hi) {
       start = lo;
       end = hi;
     } else if (rng.includes('-')) {
-      const [a, b] = rng.split('-');
+      const bounds = rng.split('-');
+      if (bounds.length !== 2) throw new Error(`cron 区间格式无效：${rng}`);
+      const [a, b] = bounds;
       start = strictInt(a);
       end = strictInt(b);
     } else {
@@ -173,7 +175,7 @@ export class Cron {
 // CronCreate 产生的一次性任务形状像 'M H DoM Mon *'，作为没有 recurring
 // 标志时的兜底识别法。
 function cronLooksOneshot(expr) {
-  const parts = expr.split(/\s+/);
+  const parts = expr.trim().split(/\s+/);
   return parts.length === 5 && parts[4] === '*'
     && parts.slice(0, 4).every((p) => /^\d+$/.test(p));
 }

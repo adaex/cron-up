@@ -303,6 +303,23 @@ test('reown is idempotent: owner already on target is a byte-level noop', (t) =>
   assert.equal(fs.readFileSync(file, 'utf-8'), before);
 });
 
+test('reown refreshes a stale pid and fingerprint under the same session id', (t) => {
+  const { file } = taskDir(t);
+  const a = {
+    id: '00000002', cron: '0 5 * * *', prompt: 'x',
+    createdAt: 1, recurring: true, permanent: true,
+    createdBySessionId: WARM_A.sessionId,
+    createdByPid: 1,
+    createdByProcStart: 'stale',
+  };
+  fs.writeFileSync(file, JSON.stringify({ tasks: [a] }));
+  const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
+  assert.deepEqual(r, { renewed: 0, reowned: 1 });
+  const ta = readJson(file).tasks[0];
+  assert.equal(ta.createdByPid, WARM_A.pid);
+  assert.equal(ta.createdByProcStart, WARM_A.procStart);
+});
+
 test('reown with identical content but different ids stamps only the target id', (t) => {
   const { file } = taskDir(t);
   const a = { id: '00000002', cron: '0 5 * * *', prompt: '相同内容',

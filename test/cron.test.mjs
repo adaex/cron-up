@@ -47,6 +47,12 @@ test('non-positive step is rejected, not hung on', () => {
   }
 });
 
+test('extra range separators are rejected instead of ignored', () => {
+  for (const expr of ['1-2-3 * * * *', '*/1-2 * * * *']) {
+    assert.equal(parseCronOrNone(expr), null, expr);
+  }
+});
+
 test('huge cron integers and ranges cannot hang or iterate without bound', () => {
   // 2^53 起 v+=1 不再前进； unsafe 整数整条按 cron 无效处理。
   for (const expr of ['9007199254740992 * * * *',
@@ -248,6 +254,7 @@ test('recurring flag identifies one-shot', () => {
 
 test('shape fallback without flag', () => {
   assert.equal(taskIsOneshot({ cron: '0 0 1 1 *' }), true);
+  assert.equal(taskIsOneshot({ cron: '  0 0 1 1 *  ' }), true);
   assert.equal(taskIsOneshot({ cron: '0 0 * * *' }), false);
 });
 

@@ -292,7 +292,10 @@ function scriptPathDirs(scriptPath) {
 export function launcherHealth() {
   if (!fs.existsSync(deps.paths.plistPath)) return null;
   const args = readPlistProgramArgs();
-  if (!args || args.length !== 1) return null;
+  if (!args || args.length !== 1) {
+    return `LaunchAgent ${deps.paths.plistPath} 的 ProgramArguments 无法解读，`
+      + '重跑 cron-up install 覆盖重生成';
+  }
   const [scriptPath] = args;
   if (!fs.existsSync(scriptPath)) {
     return `launchd 配置中的启动脚本已失效（${path.basename(scriptPath)} `

@@ -201,6 +201,14 @@ test('cmdLogs defaults to tail -n 100', async (t) => {
   assert.deepEqual(seen.args, ['-n', '100', s.out]);
 });
 
+test('cmdLogs does not report success when tail dies by signal', async (t) => {
+  const s = await setup(t);
+  fs.writeFileSync(s.out, 'patrol ok\n');
+  s.deps.spawnSync = () => ({ status: null, signal: 'SIGTERM' });
+  assert.throws(() => cmdLogs({}), (e) => e instanceof ExitError
+    && e.code === 1 && e.message.includes('SIGTERM'));
+});
+
 test('cmdLogs on an unmatched fragment exits 1', async (t) => {
   const s = await setup(t);
   s.deps.spawnSync = () => {

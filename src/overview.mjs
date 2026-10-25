@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { deps, packageVersion } from './internals.mjs';
+import { deps, packageVersion, getOwn } from './internals.mjs';
 import {
   INTERVAL_SECONDS,
   LEAD_SECONDS,
@@ -87,7 +87,7 @@ function overviewTasks(cfg, cols, details, state) {
       // 承接，都不是异常；否则按 entry 的冷却/失败状态给一条可执行的告
       // 警。
       const key = taskKey(t);
-      const ent = state[ws]?.[key];
+      const ent = getOwn(state[ws], key);
       if (deps.creatorSessionAlive(t, liveSids) || entryHolds(ent, details, ws)) {
         continue;
       }

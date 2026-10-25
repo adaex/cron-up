@@ -219,6 +219,14 @@ test('launcherHealth flags a hand-edited service script', (t) => {
   assert.ok(alert && alert.includes('无法解读'));
 });
 
+test('launcherHealth flags an unreadable ProgramArguments block', (t) => {
+  const deps = mockDeps(t);
+  deps.paths = tmpPaths(mkTmp(t));
+  fs.writeFileSync(deps.paths.plistPath, '<plist>broken</plist>');
+  const alert = launcherHealth();
+  assert.ok(alert && alert.includes('ProgramArguments'));
+});
+
 test('launcherHealth is null without a plist', (t) => {
   const deps = mockDeps(t);
   deps.paths = tmpPaths(mkTmp(t));

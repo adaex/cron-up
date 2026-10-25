@@ -77,5 +77,8 @@ export function cmdLogs(args) {
   tailArgs.push(file);
   const r = deps.spawnSync('/usr/bin/tail', tailArgs, { stdio: 'inherit' });
   if (r.error) throw r.error;
-  if (r.status && r.status !== 0) throw new ExitError(r.status);
+  if (r.signal) {
+    throw new ExitError(1, `日志查看进程被信号 ${r.signal} 终止`);
+  }
+  if (r.status !== 0) throw new ExitError(r.status ?? 1);
 }

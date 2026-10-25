@@ -10,7 +10,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import { deps, packageVersion, isPlainObject } from './internals.mjs';
+import {
+  deps,
+  packageVersion,
+  isPlainObject,
+  getOwn,
+  setOwn,
+} from './internals.mjs';
 import {
   FAIL_LIMIT,
   COOLDOWN_SECONDS,
@@ -41,6 +47,7 @@ import {
   TaskFileChanged,
   taskFileExists,
   groupTasksByKey,
+  taskOwnedBy,
 } from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wantedNow } from './cron.mjs';
 import {
@@ -381,7 +388,7 @@ export async function patrolWorkspace(
   for (const [key, group] of taskGroups) {
     if (group.length !== 1) continue;
     const t = group[0];
-    let ent = bucket[key] ?? null;
+    let ent = getOwn(bucket, key) ?? null;
     const logPath = sessionLogPath(ws, key);
     const ownerIsOurs = entryClaimed(ent)
       && typeof t.createdBySessionId === 'string'
@@ -476,9 +483,9 @@ export async function patrolWorkspace(
     // 盖印（跨轮老条目）：已认亲且任务归属还没盖到本代预热（活创建者
     // 已在 (a) 排除）。当轮新 spawn 的会话在第三步之后的轮内等待里认
     // 亲，由 cmdRun 的 stampClaimed 补盖，不走这里。
-    if (entryClaimed(ent)
-        && (!t.createdBySessionId || t.createdBySessionId !== ent.sessionId)) {
-      stamps.set(key, reownTarget(ent));
+    if (entryClaimed(ent)) {
+      const target = reownTarget(ent);
+      if (!taskOwnedBy(t, target)) stamps.set(key, target);
     }
 
     // warm 未到回收 / spawning 宽限内：本轮无事。
@@ -496,15 +503,15 @@ export async function patrolWorkspace(
     }
 
     if (fails >= FAIL_LIMIT) {
-      bucket[key] = {
+      const next = setOwn(bucket, key, {
         ...ent,
         ws,
         taskId: key,
         pid: null,
         fails,
         log: ent?.log ?? logPath,
-      };
-      enterCooldown(bucket[key], ws, key, fails, cur, stats);
+      });
+      enterCooldown(next, ws, key, fails, cur, stats);
       continue;
     }
 
@@ -520,7 +527,7 @@ export async function patrolWorkspace(
           scriptProcLogPath(procArgs) === logPath && deps.alive(procPid));
       if (adopted) {
         const [procPid] = adopted;
-        bucket[key] = {
+        setOwn(bucket, key, {
           ws,
           taskId: key,
           pid: procPid,
@@ -528,7 +535,7 @@ export async function patrolWorkspace(
           procStart: deps.procStartedAt(procPid),
           fails: 0,
           log: logPath,
-        };
+        });
         note('adopt', `接管 ${ws} 任务 ${key} pid=${procPid}：state 记录缺失，`
           + '但进程表里仍有本该任务的预热会话，重新纳入跟踪');
         pending.push({ ws, key, pid: procPid });
@@ -542,25 +549,25 @@ export async function patrolWorkspace(
     if (spawned?.pid == null) {
       const newFails = fails + 1;
       if (newFails >= FAIL_LIMIT) {
-        bucket[key] = {
+        const next = setOwn(bucket, key, {
           ws, taskId: key, pid: null, fails: newFails, log: logPath,
-        };
-        enterCooldown(bucket[key], ws, key, newFails, cur, stats);
+        });
+        enterCooldown(next, ws, key, newFails, cur, stats);
         continue;
       }
-      bucket[key] = {
+      setOwn(bucket, key, {
         ws,
         taskId: key,
         pid: null,
         startedAt: cur,
         fails: newFails,
         log: logPath,
-      };
+      });
       note('fail', `启动失败 ${ws} 任务 ${key}：会话进程没有拉起`
         + `（连续失败计数 ${newFails}）`);
       continue;
     }
-    bucket[key] = {
+    setOwn(bucket, key, {
       ws,
       taskId: key,
       pid: spawned.pid,
@@ -568,7 +575,7 @@ export async function patrolWorkspace(
       procStart: spawned.procStart,
       fails,
       log: logPath,
-    };
+    });
     note('spawn', `已启动 ${ws} 任务 ${key} pid=${spawned.pid}`
       + `（连续失败计数 ${fails}）`);
     pending.push({ ws, key, pid: spawned.pid });
@@ -588,8 +595,9 @@ export async function patrolWorkspace(
     }
     throw e;
   }
-  // 与 readTasks 不一致的极端竞态：保守不动，新 spawn 也全留跨轮路径。
-  if (result === null) return [];
+  // 与 readTasks 不一致的极端竞态：维护保守不动，但本轮新 spawn 仍要进入
+  // 等待认亲与补盖流程；丢掉 pending 会把同轮收尾无故推迟到下一轮。
+  if (result === null) return pending;
   if (result.renewed) {
     deps.log(`已续期 ${ws}：${result.renewed} 个周期任务标记为 permanent，`
       + '不再受 7 天过期限制');
@@ -628,7 +636,7 @@ async function awaitWarmups(pending, state, cur, stats) {
   const recognize = () => {
     const rest = [];
     for (const p of pending) {
-      const ent = state[p.ws]?.[p.key];
+      const ent = getOwn(state[p.ws], p.key);
       if (!ent || ent.pid !== p.pid) continue;
       if (!deps.trackedAlive(ent)) {
         // 启动即崩的典型窗口：真拉起过却死掉，计一次失败并置空 pid，条
@@ -696,10 +704,12 @@ function stampClaimed(claimedByWs, taskfiles, stats) {
 // 拉）；state.json 已丢的旧孤儿 script（日志是旧命名，不含任务键段）从
 // 进程表兜底清扫。只在 loadLegacyEntries 非空（确在跨版本）时执行。
 async function retireLegacy(legacy, stats) {
+  let retired = true;
   for (const ent of legacy) {
     if (deps.trackedAlive(ent)) {
       const stopped = await deps.stopSession(ent);
       if (!stopped) {
+        retired = false;
         bump(stats, 'warn');
         deps.log(`旧版迁移暂缓 ${ent.ws} pid=${ent.pid}：记录的进程仍存活，`
           + '本次无法安全停止目录级预热会话；本次不记为已回收');
@@ -721,6 +731,7 @@ async function retireLegacy(legacy, stats) {
     if (!deps.trackedAlive(ent)) continue;
     const stopped = await deps.stopSession(ent);
     if (!stopped) {
+      retired = false;
       bump(stats, 'warn');
       deps.log(`旧版迁移暂缓 pid=${pid}：记录的进程仍存活，本次无法安全停止`
         + `目录级预热孤儿会话（日志 ${file}）；本次不记为已回收`);
@@ -730,6 +741,7 @@ async function retireLegacy(legacy, stats) {
         + '升级后按任务重新预热');
     }
   }
+  return retired;
 }
 
 // 跑一轮巡检；抢不到锁返回 false。
@@ -793,8 +805,9 @@ export async function cmdRun(args) {
       deps.log(`告警：${registryAlert}`);
     }
 
-    // 旧版收尾必须先于一切 spawn 决策（state 轮末被新形状整体覆盖）。
-    if (legacy.length > 0) await retireLegacy(legacy, stats);
+    // 旧版收尾必须先于一切 spawn 决策。停止失败时轮末保留原 state，下轮
+    // 才能继续重试；本轮新会话可由任务专属日志认领，不会因未落盘而重拉。
+    const legacyRetired = legacy.length === 0 || await retireLegacy(legacy, stats);
 
     // 轮初把上轮末仍相信活着的条目分成三组：活、resume 脱离（script 已
     // 死但 sid 还在，不报退出）、真死（立即报）。带 deadSince 的旧报条
@@ -865,7 +878,7 @@ export async function cmdRun(args) {
         for (const d of died) {
           bump(stats, 'exit');
           deps.log(exitLine(d.ws, d.key,
-            { ...state[d.ws]?.[d.key], pid: d.pid }));
+            { ...getOwn(state[d.ws], d.key), pid: d.pid }));
         }
         stampClaimed(claimedByWs, taskfiles, stats);
       } catch (e) {
@@ -894,27 +907,23 @@ export async function cmdRun(args) {
     for (const [ws, bucket] of Object.entries(state)) {
       const out = {};
       for (const [taskId, ent] of Object.entries(bucket)) {
-        if (deps.trackedAlive(ent)) {
-          out[taskId] = ent;
-          continue;
-        }
-        if (typeof ent.sessionId === 'string'
-            && sidInDetails(ws, ent.sessionId)) {
-          out[taskId] = ent;
-          continue;
-        }
-        if (isCooling(ent, cur)) {
-          out[taskId] = ent;
+        if (deps.trackedAlive(ent)
+            || (typeof ent.sessionId === 'string'
+              && sidInDetails(ws, ent.sessionId))
+            || isCooling(ent, cur)) {
+          setOwn(out, taskId, ent);
           continue;
         }
         if ((ent.fails ?? 0) > 0) {
           ent.deadSince ??= cur;
-          if (cur - ent.deadSince < FAIL_TTL_SECONDS) out[taskId] = ent;
+          if (cur - ent.deadSince < FAIL_TTL_SECONDS) {
+            setOwn(out, taskId, ent);
+          }
         }
       }
-      if (Object.keys(out).length > 0) kept[ws] = out;
+      if (Object.keys(out).length > 0) setOwn(kept, ws, out);
     }
-    saveState(kept);
+    if (legacyRetired) saveState(kept);
 
     // 轮末汇总：一行交代这轮看见了什么、动了什么、花了多久，随后更新心跳。
     const actions = EVENT_LABELS

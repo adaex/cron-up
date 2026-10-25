@@ -235,6 +235,14 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
   fs.renameSync(tmp, file);
 }
 
+// 任务归属是否已完全等于盖印目标。巡检预判与实际写入共用同一判据，
+// 避免一层只看 sessionId、另一层比较三字段而逐渐漂移。
+export function taskOwnedBy(t, target) {
+  return t.createdBySessionId === target.sessionId
+    && t.createdByPid === target.pid
+    && t.createdByProcStart === target.procStart;
+}
+
 // 一轮巡检对一个任务文件做的维护：renew（补 permanent）与 reown（把任务
 // 归属盖给各自的预热会话）合并为同一次带 mtime 乐观检测的原子写。先取
 // mtimeNs、清残留 .cron-up-tmp、loadTaskDoc round-trip 整文档；两项计数
@@ -244,8 +252,8 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
 // reown 形状：Map<taskKey, {sessionId, pid, procStart}>。一轮内同一文件的
 // 不同任务可盖向不同预热（一任务一会话）；内容相同但 id 不同的任务互不
 // 影响。同一个 taskKey 对应多条任务是病态输入，无法把 state/会话唯一对应
-// 到条目，这些键全部跳过盖印。只盖 createdBySessionId 不等于目标的任务，
-// 第二轮起字节级不动；pid/procStart 是登记里 claude 进程的 pid 与 lstart。
+// 到条目，这些键全部跳过盖印。归属三字段未完全等于目标时才写，第二轮起
+// 字节级不动；pid/procStart 是登记里 claude 进程的 pid 与 lstart。
 export function maintainWorkspace(taskfile, { reown = null } = {}) {
   let mtimeNs;
   try {
@@ -284,7 +292,7 @@ export function maintainWorkspace(taskfile, { reown = null } = {}) {
       const target = reown.get(key);
       // 没有 owner 字段的外部条目同样盖——窗口内任务统一归各自预热，语义
       // 不因条目来源留例外。
-      if (target && t.createdBySessionId !== target.sessionId) {
+      if (target && !taskOwnedBy(t, target)) {
         t.createdBySessionId = target.sessionId;
         t.createdByPid = target.pid;
         // ps lstart 原文（含「Oct  8」双空格），原样取自会话登记。

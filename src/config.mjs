@@ -10,6 +10,7 @@ import {
   isPlainObject,
   isDecInt,
   ensurePrivateDir,
+  setOwn,
 } from './internals.mjs';
 import { PID_T_MAX, HEARTBEAT_STALE_FACTOR } from './constants.mjs';
 import { expandHome, isDir } from './tasks.mjs';
@@ -175,9 +176,9 @@ export function loadState() {
     const cleanBucket = {};
     for (const [taskId, raw] of Object.entries(bucket)) {
       const ent = cleanEntry(raw, ws, taskId);
-      if (ent) cleanBucket[taskId] = ent;
+      if (ent) setOwn(cleanBucket, taskId, ent);
     }
-    if (Object.keys(cleanBucket).length > 0) out[ws] = cleanBucket;
+    if (Object.keys(cleanBucket).length > 0) setOwn(out, ws, cleanBucket);
   }
   return out;
 }

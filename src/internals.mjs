@@ -26,6 +26,23 @@ export function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 
+// state 的桶键来自外部任务 id。普通对象的 __proto__ 赋值会改原型而不是
+// 建条目，读取还会把继承来的 Object.prototype 当成 entry；所有外部键都
+// 通过自有属性访问，保持 JSON 形状不变，也无需特殊的任务 id 黑名单。
+export function getOwn(obj, key) {
+  return obj != null && Object.hasOwn(obj, key) ? obj[key] : undefined;
+}
+
+export function setOwn(obj, key, value) {
+  Object.defineProperty(obj, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+  return value;
+}
+
 // 严格十进制整数（可选负号 + 纯数字）：parseInt("5x")、Number("0x10") 都会
 // 静默给出错误结果，来自外部字符串的整数一律先过这个谓词再 parseInt。
 export function isDecInt(s) {

@@ -276,6 +276,38 @@ test('two same-time dead-owner tasks get two separate warm sessions and stamps',
   assert.equal(st2.mtimeNs, st.mtimeNs);
 });
 
+test('cross-round reown refreshes process identity under the same session id', async (t) => {
+  const m = await setupMachine(t);
+  writeTaskFile(m.WS, [makeTask()]);
+  await m.patrol(T0);
+  const rec = m.spawns[0];
+  m.claim(rec, 'sid-warm');
+  await m.patrol(T0 + 1);
+
+  // 同一 script 下的 claude 进程换了 pid，但 sessionId 保持不变。
+  m.alive.delete(rec.claudePid);
+  m.claim(rec, 'sid-warm');
+  await m.patrol(T0 + 2);
+
+  const stamped = fileTasks(m)[0];
+  assert.equal(stamped.createdBySessionId, 'sid-warm');
+  assert.equal(stamped.createdByPid, rec.claudePid);
+  assert.equal(stamped.createdByProcStart, `cstart-${rec.claudePid}`);
+  assert.equal(m.spawns.length, 1);
+});
+
+test('a __proto__ task id persists as an own entry without duplicate spawns', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [makeTask({ id: '__proto__' })]);
+  await m.patrol();
+  const first = m.state();
+  assert.ok(Object.hasOwn(first[m.WS], '__proto__'));
+  assert.equal(first[m.WS].__proto__.pid, m.spawns[0].scriptPid);
+  await m.patrol();
+  assert.equal(m.spawns.length, 1, '落盘再读取后仍应复用同一代预热');
+  assert.ok(Object.hasOwn(m.state()[m.WS], '__proto__'));
+});
+
 test('cooldown for one task never blocks the other task', async (t) => {
   const m = await setupMachine(t);
   // 甲永远拉不起来；乙正常。
@@ -682,6 +714,24 @@ test('cmdRun: legacy flat state sessions are stopped and state replaced', async 
   assert.equal(st[m.WS]['00000001'].pid, m.spawns[0].scriptPid);
 });
 
+test('cmdRun: failed legacy stop preserves the old state for a later retry', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [makeTask()]);
+  const oldPid = 222;
+  m.alive.add(oldPid);
+  writeJson(m.deps.paths.statePath, {
+    [m.WS]: {
+      pid: oldPid, procStart: `start-${oldPid}`, startedAt: T0 - 10,
+      fails: 0, log: path.join(m.deps.paths.sessionLogDir, 'old-style.log'),
+    },
+  });
+  m.deps.stopSession = async () => false;
+  await m.patrol();
+  const preserved = m.state();
+  assert.equal(preserved[m.WS].pid, oldPid,
+    '未停掉的旧条目不能被新形状状态覆盖遗忘');
+});
+
 test('cmdRun: passive death between rounds is reported with task id', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   const lines = [];
@@ -697,6 +747,19 @@ test('cmdRun: passive death between rounds is reported with task id', async (t) 
 });
 
 // ---- cmdRun 轮内等待认亲盖印 ----
+
+test('maintenance disappearing keeps new sessions in the same-round wait', async (t) => {
+  const m = await setupMachine(t);
+  writeTaskFile(m.WS, [makeTask({ id: '00000002' })]);
+  const originalLoad = m.deps.loadTaskDoc;
+  let loads = 0;
+  m.deps.loadTaskDoc = (file) => {
+    loads += 1;
+    return loads === 2 ? null : originalLoad(file);
+  };
+  const pending = await m.patrol();
+  assert.deepEqual(pending.map((p) => p.key), ['00000002']);
+});
 
 test('cmdRun: registration during in-round wait is claimed and stamped same round', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });

@@ -86,6 +86,18 @@ test('mixed unreadable and empty files are itemized', async (t) => {
   assert.ok(out.includes('其余的任务列表均为空'));
 });
 
+test('unreadable files stay visible beside readable tasks', async (t) => {
+  const s = await setup(t);
+  writeTaskFile(s.WS, [makeTask()]);
+  fs.mkdirSync(path.join(s.WS2, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(s.WS2, '.claude', 'scheduled_tasks.json'), '{ broken');
+  s.lines.length = 0;
+  await cmdList({ config: s.cfgPath });
+  const out = s.lines.join('\n');
+  assert.ok(out.includes('共 1 个工作区、1 个定时任务'));
+  assert.ok(out.includes('另有 1 个任务文件读不出'));
+});
+
 test('one-shot weeks ahead shows its date, not missed', async (t) => {
   const s = await setup(t);
   const future = new Date(Date.now() + 60 * 86400_000);

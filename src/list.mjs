@@ -1,7 +1,7 @@
 // `cron-up list`：逐工作区列出任务的下次触发、节奏、类型、摘要与该任务
 // 的预热状态。
 
-import { deps } from './internals.mjs';
+import { deps, getOwn } from './internals.mjs';
 import { LEAD_SECONDS } from './constants.mjs';
 import { loadConfig, loadState, isCooling } from './config.mjs';
 import { taskKey } from './tasks.mjs';
@@ -70,7 +70,7 @@ export async function cmdList(args) {
       return {
         v,
         t,
-        tag: warmTag(t, v, state[ws]?.[taskKey(t)], liveSids, ws, cur),
+        tag: warmTag(t, v, getOwn(state[ws], taskKey(t)), liveSids, ws, cur),
       };
     });
     // 错过待补执行排最前，然后按下次时间升序，一年内无安排的垫底，无效
@@ -96,6 +96,9 @@ export async function cmdList(args) {
 
   blocks.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
   deps.print(`共 ${blocks.length} 个工作区、${total} 个定时任务`);
+  if (unreadable > 0) {
+    deps.print(`另有 ${unreadable} 个任务文件读不出，其中的定时任务不会执行`);
+  }
 
   // 列宽从全部实际文案动态算；cadence 是截断列，取固定上限。
   const statusW = Math.max(11,
