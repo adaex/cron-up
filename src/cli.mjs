@@ -4,7 +4,7 @@
 
 // 先引全量入口，保证所有业务模块都已向 deps 自注册，再引命令函数。
 import './index.mjs';
-import { deps, ExitError } from './internals.mjs';
+import { ExitError } from './internals.mjs';
 import { cmdRun } from './patrol.mjs';
 import { cmdInstall, cmdUninstall } from './service.mjs';
 import { cmdList } from './list.mjs';
@@ -102,31 +102,13 @@ export function parseCli(argv) {
   return result;
 }
 
-const USAGE = `cron-up —— 为 Claude Code 定时任务按需预热交互会话（一任务一会话）
-
-用法：
-  cron-up                    查看总览（服务、配置、任务、预热会话）
-  cron-up install            安装配置与 LaunchAgent（可用 --roots 指定扫描目录）
-  cron-up uninstall          停止预热并移除 LaunchAgent（--purge 另删配置与日志）
-  cron-up list               逐个列出任务的设定/预计投递时间与预热状态
-  cron-up run                执行一轮巡检（launchd 入口，也可手动立即跑一轮）
-  cron-up logs [目录片段]    查看巡检日志或后台会话记录（-f 跟踪）
-
-升级：npm i -g cron-up@latest --prefer-online
-      cron-up install
-
-完全移除：cron-up uninstall --purge
-          npm uninstall -g cron-up`;
-
 export async function main(argv = process.argv) {
   const parsed = parseCli(argv.slice(2));
-  if (parsed.help) {
-    deps.print(USAGE);
-    return;
-  }
   // --config 缺失时键根本不存在，命令内部用 args?.config ?? 默认路径读取。
   const args = { ...parsed.opts };
   if (parsed.config !== undefined) args.config = parsed.config;
+  // 总览本身就是使用说明；--help/-h 只是同一入口的别名。
+  if (parsed.help) return cmdOverview(args);
   switch (parsed.command) {
     case null:
       return cmdOverview(args);

@@ -65,6 +65,10 @@ test('empty world renders cleanly', async (t) => {
   assert.ok(out.includes('任务：暂无'));
   assert.ok(out.includes('预热会话：无'));
   assert.ok(out.includes('常用命令'));
+  assert.ok(out.includes('列出所有扫描工作区的任务时间、模型配置与预热状态'));
+  assert.ok(out.includes('模型：工作区 .claude/cron-up.json'));
+  assert.ok(out.includes('只影响之后新启动的预热会话'));
+  assert.ok(out.indexOf('常用命令') < out.indexOf('模型：工作区'));
 });
 
 test('fixed patrol line: interval and lead, no behaviour tags', async (t) => {

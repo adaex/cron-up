@@ -4,7 +4,7 @@ import path from 'node:path';
 
 import { main, parseCli } from '../src/cli.mjs';
 import { ExitError } from '../src/internals.mjs';
-import { mkTmp, mockDeps, tmpPaths, writeJson } from '../test-support/helpers.mjs';
+import { mkTmp, mockDeps, tmpPaths, writeJson, scanFrom } from '../test-support/helpers.mjs';
 
 const exit2 = (e) => {
   assert.ok(e instanceof ExitError);
@@ -46,19 +46,23 @@ test('--config= inline form', () => {
   assert.equal(parseCli(['--config=/x/c.json', 'run']).config, '/x/c.json');
 });
 
-test('--help prints commands and maintenance next steps', async (t) => {
+test('--help shows the overview and model configuration', async (t) => {
+  const tmp = mkTmp(t);
   const deps = mockDeps(t);
+  deps.paths = tmpPaths(tmp);
+  deps.launchctlInfo = () => null;
+  deps.scanSessions = async () => scanFrom();
+  deps.discover = () => [];
   const lines = [];
   deps.print = (m) => lines.push(m);
   await main(['node', 'cron-up', '--help']);
-  const usage = lines.join('\n');
-  assert.ok(usage.startsWith('cron-up ——'));
-  for (const name of ['install', 'uninstall', 'list', 'run', 'logs']) {
-    assert.ok(usage.includes(`cron-up ${name}`), name);
-  }
-  assert.ok(!usage.includes('renew'));
-  assert.match(usage, /npm i -g cron-up@latest --prefer-online\n\s+cron-up install/);
-  assert.match(usage, /cron-up uninstall --purge\n\s+npm uninstall -g cron-up/);
+  const out = lines.join('\n');
+  assert.ok(out.includes('cron-up'));
+  assert.ok(out.includes('服务：'));
+  assert.ok(out.includes('常用命令：'));
+  assert.ok(out.includes('模型：工作区 .claude/cron-up.json'));
+  assert.ok(!out.includes('用法：'));
+  assert.ok(!out.includes('完全移除：'));
 });
 
 test('-h is the same as --help', () => {

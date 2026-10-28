@@ -99,12 +99,11 @@ CronCreate 是 Claude Code 内部工具，不是在终端里直接执行的 shel
 
 ```bash
 cron-up                        # 总览：服务、配置、最近任务、预热会话与告警
-cron-up list                   # 逐任务列出时间、类型、摘要与预热状态
+cron-up list                   # 列出所有工作区的任务时间、摘要、模型配置与预热状态
 cron-up run                    # 立即手动巡检一次
 cron-up logs                   # 查看最近 100 行巡检日志
 cron-up logs team-space        # 按文件名片段选择后台会话日志
 cron-up logs team-space--00000002 -f
-cron-up --help                 # 查看命令帮助
 ```
 
 会话日志按文件名片段匹配，可以输入目录名、任务 id 或两者组合；命中多个日志时会列出候选，请补充更长的片段

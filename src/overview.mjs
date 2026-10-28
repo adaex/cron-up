@@ -198,7 +198,7 @@ function overviewSessions(cols, state, details, suppressCooling, discovered) {
 }
 
 const COMMANDS = [
-  ['list', '逐个列出任务的内容摘要、设定/预计投递时间与预热状态'],
+  ['list', '列出所有扫描工作区的任务时间、模型配置与预热状态'],
   ['logs [目录片段] [-f]', '查看巡检日志或后台会话记录'],
   ['run', '立即手动巡检一轮'],
   ['install --roots ~/a,~/b', '更新扫描目录并重新安装（不带参数沿用有效配置）'],
@@ -286,4 +286,7 @@ export async function cmdOverview(args) {
   for (const [name, desc] of COMMANDS) {
     deps.print(`  cron-up ${pad(name, nameW)}  ${desc}`);
   }
+  deps.print('');
+  deps.print('模型：工作区 .claude/cron-up.json；顶层 model 为默认，tasks.<任务 id>.model 覆盖');
+  deps.print('      只影响之后新启动的预热会话');
 }
