@@ -254,6 +254,17 @@ test('session argv quotes the workspace and sets unattended permission mode', ()
   ]);
 });
 
+test('session argv adds a shell-quoted model only when configured', () => {
+  assert.equal(
+    sessionArgv('/x', '/tmp/x.log', 'claude-opus-5-5').at(-1),
+    'cd /x && claude --permission-mode bypassPermissions --model claude-opus-5-5',
+  );
+  assert.equal(
+    sessionArgv('/x', '/tmp/x.log', "model; printf 'bad'").at(-1),
+    `cd /x && claude --permission-mode bypassPermissions --model 'model; printf '"'"'bad'"'"''`,
+  );
+});
+
 test('shellQuote keeps the safe set bare and single-quotes the rest', () => {
   assert.equal(shellQuote(''), "''");
   assert.equal(shellQuote('abc-def.g'), 'abc-def.g');

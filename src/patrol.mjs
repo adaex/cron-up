@@ -48,6 +48,8 @@ import {
   taskFileExists,
   groupTasksByKey,
   taskOwnedBy,
+  readWorkspaceConfig,
+  configuredModel,
 } from './tasks.mjs';
 import { taskWanted, parseCronOrNone, wantedNow } from './cron.mjs';
 import {
@@ -364,6 +366,12 @@ export async function patrolWorkspace(
     return [];
   }
 
+  const workspaceConfig = readWorkspaceConfig(ws);
+  if (workspaceConfig.error) {
+    note('warn', `工作区模型配置无效：${workspaceConfig.error}；`
+      + '修复前不会启动新的预热会话，已有会话仍照常管理');
+  }
+
   // 与任务文件层共用一份按键分组视图。重复键对应多条任务时，state 与
   // 会话都无法唯一对应到条目：跳过这些组并告警，maintainWorkspace 也只
   // 处理单元素组。组的键集合同时就是后面的 currentKeys。
@@ -493,6 +501,10 @@ export async function patrolWorkspace(
 
     if (isCooling(ent, cur)) continue;
 
+    // 已存在但无效的配置绝不能静默退成默认模型。已有活会话在上面已继续
+    // 管理；这里只冻结新启动，且不把这种人为配置问题计入启动失败/冷却。
+    if (workspaceConfig.error) continue;
+
     // 失败计数：冷却刚结束给一次干净缓刑；只有真拉起过（pid 非空）的条
     // 目死亡才算一次新失败，当场没拉起的尝试已在写入时计过。
     let fails;
@@ -545,7 +557,8 @@ export async function patrolWorkspace(
 
     // spawn：成败只认有没有拿到 pid。当场失败立即计入；本轮就顶满失败上
     // 限的，直接进冷却（不必再空跑一轮）。
-    const spawned = deps.spawnSession(ws, key);
+    const model = configuredModel(workspaceConfig, key);
+    const spawned = deps.spawnSession(ws, key, model);
     if (spawned?.pid == null) {
       const newFails = fails + 1;
       if (newFails >= FAIL_LIMIT) {
@@ -577,7 +590,7 @@ export async function patrolWorkspace(
       log: logPath,
     });
     note('spawn', `已启动 ${ws} 任务 ${key} pid=${spawned.pid}`
-      + `（连续失败计数 ${fails}）`);
+      + `${model ? `，模型 ${model}` : ''}（连续失败计数 ${fails}）`);
     pending.push({ ws, key, pid: spawned.pid });
   }
 

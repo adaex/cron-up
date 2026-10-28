@@ -4,7 +4,7 @@
 import { deps, getOwn } from './internals.mjs';
 import { LEAD_SECONDS } from './constants.mjs';
 import { loadConfig, loadState, isCooling } from './config.mjs';
-import { taskKey } from './tasks.mjs';
+import { taskKey, readWorkspaceConfig, configuredModel } from './tasks.mjs';
 import {
   clip,
   pad,
@@ -63,21 +63,24 @@ export async function cmdList(args) {
       continue;
     }
     if (tasks.length === 0) continue;
+    const workspaceConfig = readWorkspaceConfig(ws);
     const liveSids = deps.liveSessionIds(details, ws);
     const views = tasks.map((t) => {
       // 带提前量：「待预热」标签与巡检的预热窗口同一口径。
       const v = taskView(t, now, LEAD_SECONDS * 1000);
+      const key = taskKey(t);
       return {
         v,
         t,
-        tag: warmTag(t, v, getOwn(state[ws], taskKey(t)), liveSids, ws, cur),
+        model: configuredModel(workspaceConfig, key),
+        tag: warmTag(t, v, getOwn(state[ws], key), liveSids, ws, cur),
       };
     });
     // 错过待补执行排最前，然后按下次时间升序，一年内无安排的垫底，无效
     // 的最后。
     views.sort((a, b) => rank(a.v) - rank(b.v)
       || ((a.v.nxt?.getTime() ?? Infinity) - (b.v.nxt?.getTime() ?? Infinity)));
-    blocks.push([ws, views]);
+    blocks.push([ws, views, workspaceConfig.error]);
     total += tasks.length;
   }
 
@@ -107,10 +110,13 @@ export async function cmdList(args) {
   const cadW = 16;
   // 固定列："  " status "  " kind "  " cadence "  " summary ["  " tag]。
   const fixedW = 2 + statusW + 2 + kindW + 2 + cadW;
-  for (const [ws, views] of blocks) {
+  for (const [ws, views, configError] of blocks) {
     deps.print('');
     deps.print(clip(ws, cols));
-    for (const { v, tag } of views) {
+    if (configError) {
+      deps.print(clip(`  配置告警：修复前不会启动新的预热会话；${configError}`, cols));
+    }
+    for (const { v, tag, model } of views) {
       let kind;
       let cadence;
       let summary;
@@ -123,8 +129,10 @@ export async function cmdList(args) {
         cadence = v.cadence;
         summary = v.summary;
       }
-      // 给预热标签预留宽度（含括号与间隔）；极窄屏摘要可以截到 0。
-      const tagPart = tag ? ` [${tag}]` : '';
+      // 给模型与预热标签预留宽度（含括号与间隔）；极窄屏摘要可以截到 0。
+      const tags = [model ? `模型 ${clip(model, 32)}` : '', tag].filter(Boolean);
+      const rawTagPart = tags.length ? ` [${tags.join('，')}]` : '';
+      const tagPart = clip(rawTagPart, Math.max(0, cols - fixedW - 2));
       const summaryW = Math.max(0,
         cols - fixedW - 2 - dispWidth(tagPart));
       let line = '  ' + pad(statusText(v), statusW) + '  '

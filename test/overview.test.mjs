@@ -178,6 +178,17 @@ test('unreadable task file is alerted, not ghosted', async (t) => {
   assert.ok(s.lines.join('\n').includes('任务文件读不出'));
 });
 
+test('invalid workspace model config blocks the generic auto-start promise', async (t) => {
+  const s = await setup(t);
+  const ws = path.join(s.tmp, 'proj');
+  writeJson(path.join(ws, '.claude', 'cron-up.json'), { model: '' });
+  s.deps.discover = () => [[ws, 'x']];
+  const out = await s.render([soonOneshot()]);
+  assert.ok(out.includes('工作区模型配置无效'));
+  assert.ok(out.includes('修复前不会启动新的预热会话'));
+  assert.ok(!out.includes('下轮巡检会自动启动预热'));
+});
+
 test('corrupt config renders the whole page', async (t) => {
   const s = await setup(t);
   fs.writeFileSync(s.cfgPath, '{ not valid json');

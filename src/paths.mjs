@@ -7,8 +7,9 @@ import path from 'node:path';
 export const LABEL = 'local.cron-up';
 
 const HOME = os.homedir();
-// 被预热的 agent 工作区里，定时任务文件的相对路径。
+// 被预热的 agent 工作区里，定时任务文件与 cron-up 工作区配置的相对路径。
 export const TASK_REL = path.join('.claude', 'scheduled_tasks.json');
+export const WORKSPACE_CONFIG_REL = path.join('.claude', 'cron-up.json');
 
 // 派生 getter 只写这一份：生产 paths 与测试重定向用的 tmpPaths
 // （test-support/helpers.mjs）共用同一工厂，派生路径改布局不会出现两处各

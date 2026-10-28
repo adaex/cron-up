@@ -177,6 +177,51 @@ test('status shows slot to predicted-fire range for jittered tasks', async (t) =
   assert.ok(out.includes('→ 13:30'), out);
 });
 
+test('model tags show workspace defaults and per-task overrides', async (t) => {
+  const s = await setup(t);
+  writeJson(path.join(s.WS, '.claude', 'cron-up.json'), {
+    model: 'claude-opus-5-5',
+    tasks: { '00000002': { model: 'sonnet' } },
+  });
+  const out = await s.render([
+    makeTask({ id: '00000001', prompt: '工作区默认模型' }),
+    makeTask({ id: '00000002', prompt: '任务覆盖模型' }),
+  ]);
+  const defaultLine = s.lines.find((line) => line.includes('工作区默认模型'));
+  const overrideLine = s.lines.find((line) => line.includes('任务覆盖模型'));
+  assert.ok(defaultLine.includes('模型 claude-opus-5-5'), out);
+  assert.ok(overrideLine.includes('模型 sonnet'), out);
+});
+
+test('model and warm tags still respect the narrow terminal floor', async (t) => {
+  const s = await setup(t);
+  s.deps.terminalWidth = () => 60;
+  writeJson(path.join(s.WS, '.claude', 'cron-up.json'), {
+    model: 'claude-opus-5-5',
+  });
+  await s.render([makeTask({ id: '00000001', prompt: '日报',
+    createdBySessionId: 'dead-creator' })], {
+    state: {
+      '00000001': {
+        ws: s.WS, taskId: '00000001', pid: 4242, procStart: 'start-4242',
+        startedAt: 1, fails: 0,
+      },
+    },
+  });
+  for (const line of s.lines) {
+    assert.ok(dispWidth(line) <= 60, line);
+  }
+});
+
+test('invalid workspace model config is visible in list', async (t) => {
+  const s = await setup(t);
+  fs.mkdirSync(path.join(s.WS, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(s.WS, '.claude', 'cron-up.json'), '{ broken');
+  const out = await s.render([makeTask()]);
+  assert.ok(out.includes('配置告警'));
+  assert.ok(out.includes('修复前不会启动新的预热会话'));
+});
+
 // ---- 逐任务预热标签 ----
 
 const WARM_TASK = () => makeTask({ id: '00000001', prompt: '日报',

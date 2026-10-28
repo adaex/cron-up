@@ -74,15 +74,17 @@ export function shellQuote(s) {
   return `'${s.replace(/'/g, `'"'"'`)}'`;
 }
 
-export function sessionArgv(ws, logPath) {
+export function sessionArgv(ws, logPath, model) {
   // -l -i 都不能少。-i 加载定义了私有端点/模型路由（claude shell 函数）
   // 的交互 rc；-l 加载 /etc/zprofile 的 path_helper，这是 launchd 最小环
   // 境里唯一把 homebrew（进而 fnm/node）放上 PATH 的东西。光 -ic 在终端
   // 里靠继承现成 PATH 一切正常，交给 launchd 就 fnm: command not found。
+  // 模型是会话级启动参数；缺省时不传，继续服从 Claude Code 自身配置。
+  const modelPart = model ? ` --model ${shellQuote(model)}` : '';
   return [
     '/usr/bin/script', '-q', logPath,
     '/bin/zsh', '-lic',
-    `cd ${shellQuote(ws)} && claude --permission-mode bypassPermissions`,
+    `cd ${shellQuote(ws)} && claude --permission-mode bypassPermissions${modelPart}`,
   ];
 }
 
@@ -116,8 +118,9 @@ function canSignalProcessGroup(pid) {
   return Number.isSafeInteger(pid) && pid > 1;
 }
 
-// 为一个任务拉起一个 detached 的 pty TUI，返回 {pid, procStart}。
-export function spawnSession(ws, taskId) {
+// 为一个任务拉起一个 detached 的 pty TUI，返回 {pid, procStart}。model 是
+// 该次启动的快照；已有会话不会因之后改写配置而自动换模型。
+export function spawnSession(ws, taskId, model) {
   const logPath = sessionLogPath(ws, taskId);
   // 会话日志目录 700（README 权限约定）：每任务独立文件，目录只在此处创建。
   ensurePrivateDir(path.dirname(logPath));
@@ -138,7 +141,7 @@ export function spawnSession(ws, taskId) {
   } catch {
     // 维持 0600。
   }
-  const argv = sessionArgv(ws, logPath);
+  const argv = sessionArgv(ws, logPath, model);
   const child = deps.spawn(argv[0], argv.slice(1), {
     detached: true, // 子侧 setsid：child.pid 即新进程组组长
     stdio: 'ignore', // script 把 typescript 写进 logPath

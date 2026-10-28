@@ -19,7 +19,11 @@ import {
   isCooling,
   cooldownEtaMinutes,
 } from './config.mjs';
-import { taskFileExists, taskKey } from './tasks.mjs';
+import {
+  taskFileExists,
+  taskKey,
+  readWorkspaceConfig,
+} from './tasks.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
 import {
   humanDelta,
@@ -69,6 +73,11 @@ function overviewTasks(cfg, cols, details, state) {
     if (tasks.length === 0) continue;
     nWs += 1;
     nTasks += tasks.length;
+    const workspaceConfig = readWorkspaceConfig(ws);
+    if (workspaceConfig.error) {
+      alerts.push(`工作区模型配置无效：${workspaceConfig.error}；`
+        + '修复前不会启动新的预热会话');
+    }
     const liveSids = deps.liveSessionIds(details, ws);
     let bad = 0;
     for (const t of tasks) {
@@ -99,7 +108,7 @@ function overviewTasks(cfg, cols, details, state) {
           + `${ent.fails ?? '?'} 次正处冷却中，约 ${eta} 分钟后才会重试；`
           + `请运行 cron-up logs ${path.basename(ws)}--${key} 排查`);
         coolingWarned.add(`${ws}\0${key}`);
-      } else {
+      } else if (!workspaceConfig.error) {
         const fails = ent?.fails ?? 0;
         const streak = fails > 0 ? `，近期已失败 ${fails} 次` : '';
         alerts.push(`${ws} 任务 ${key} 即将执行（或错过待补执行）${streak}，`

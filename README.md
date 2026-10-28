@@ -205,10 +205,38 @@ cron-up install --roots "$HOME/code,$HOME/work"
 
 巡检间隔、提前量、扫描深度、失败退避等均为固定行为，完整常量和生命周期规则见[内部机制](docs/internals.md#巡检与会话生命周期)
 
+### 按工作区和任务指定模型
+
+在工作区放置可选的 `.claude/cron-up.json`，可以指定该目录预热会话的默认模型，并按任务覆盖：
+
+```json
+{
+  "model": "claude-opus-5-5",
+  "tasks": {
+    "00000002": {
+      "model": "sonnet"
+    }
+  }
+}
+```
+
+两个 `model` 都可省略，优先级为“任务 `model` > 工作区 `model` > 不传 `--model`，沿用 Claude Code 自身配置”。模型值由本机 Claude Code 解释，可以使用其支持的别名或完整模型名；cron-up 不维护模型清单，也不会提前验证模型是否可用，启动失败仍走原有的重试与冷却流程
+
+`tasks` 的键使用 cron-up 的任务键：常规 CronCreate 任务就是 `.claude/scheduled_tasks.json` 中对应任务的 `id`；无 id 的手写任务使用 `anon:` 内容摘要键，这类任务更适合只配置工作区默认模型
+
+该配置只作用于 **cron-up 新拉起的预热会话**：
+
+- 修改配置不会自动重启或切换已有会话，等该任务下次重新预热时生效；`cron-up list` 显示的是当前配置值，不是运行中会话的实际模型探测结果
+- 原创建者会话仍在线时，任务继续复用该会话及其模型，不另起具有指定模型的预热会话
+- 配置文件存在但 JSON 损坏、顶层形状或模型字段类型不对时，巡检会告警，并暂停该工作区的新预热，避免悄悄回退到默认模型；已有会话仍照常管理，配置问题不计入启动失败次数
+
+此文件由用户维护，install、uninstall 和 `--purge` 都不会创建、改写或删除它
+
 | 产物 | 位置 |
 | --- | --- |
 | 命令行与代码 | npm 全局目录，具体位置取决于 Node 与 npm 安装方式 |
 | 配置文件 | `~/.local/share/cron-up/config.json` |
+| 工作区模型配置（可选） | `<工作区>/.claude/cron-up.json`，由用户维护 |
 | 运行状态 | `~/.local/share/cron-up/state.json`，按工作区与任务 id 记录预热 |
 | 巡检心跳 | `~/.local/share/cron-up/heartbeat`，每轮成功完成后写入 |
 | LaunchAgent | `~/Library/LaunchAgents/local.cron-up.plist` |
@@ -261,6 +289,7 @@ launchd 的初始 PATH 很小，因此 install 会把 `node` 与 `cron-up` 所�
 | 删除 `~/Library/Logs/cron-up` 中的巡检与会话日志 | 否 | 是 |
 | 卸载 npm 全局 `cron-up` 命令 | 否 | 否 |
 | 删除 Claude Code 任务或 `~/.claude/projects` 对话记录 | 否 | 否 |
+| 删除各工作区的 `.claude/cron-up.json` | 否 | 否 |
 | 恢复任务文件中的 `permanent`、`createdBy*` 字段 | 否 | 否 |
 
 完全移除命令行和 cron-up 自有产物：

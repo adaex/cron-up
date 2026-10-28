@@ -63,19 +63,20 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   const resumed = new Map(); // sid → bare claude pid
   const scriptProcs = []; // ps 孤儿表：[pid, args]
   const logs = [];
+  const patrolLogs = [];
   // 每个任务独立的 spawn 成败/行为钩子。
   const hooks = new Map();
 
   deps.alive = (p) => alive.has(p);
   deps.procStartedAt = (p) => (alive.has(p) ? `start-${p}` : null);
-  deps.spawnSession = (wsArg, taskId) => {
+  deps.spawnSession = (wsArg, taskId, model) => {
     logs.push(taskId);
     if (hooks.get(taskId)?.failSpawn) return null;
     const scriptPid = nextPid++;
     const zshPid = nextPid++;
     alive.add(scriptPid);
     const rec = {
-      ws: wsArg, taskId, scriptPid, zshPid,
+      ws: wsArg, taskId, model, scriptPid, zshPid,
       claimed: false, sid: null, claudePid: null,
     };
     spawns.push(rec);
@@ -94,7 +95,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   deps.listScriptProcesses = () => scriptProcs;
   deps.acquireRunLock = () => ({ lockPath: null });
   deps.rotatePatrolLogs = () => {};
-  deps.log = () => {};
+  deps.log = (msg) => patrolLogs.push(msg);
   // 等待轮询默认不真睡：拍钩子里突变世界（认亲/死亡），复刻 registry 测
   // 试的既有手法。拍号从 1 开始（第 N 拍 = 第 N 次 sleep 后的重扫）。
   let polls = 0;
@@ -208,6 +209,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
       ? readJson(deps.paths.statePath) : {}),
     scriptProcs,
     spawnLog: logs,
+    patrolLogs,
   };
 
   if (realDiscover) {
@@ -274,6 +276,44 @@ test('two same-time dead-owner tasks get two separate warm sessions and stamps',
   await m.patrol();
   const st2 = fs.statSync(m.taskfile);
   assert.equal(st2.mtimeNs, st.mtimeNs);
+});
+
+test('workspace and task model config flow into each task spawn', async (t) => {
+  const m = await setupMachine(t);
+  writeJson(path.join(m.WS, '.claude', 'cron-up.json'), {
+    model: 'claude-opus-5-5',
+    tasks: { '00000002': { model: 'sonnet' } },
+  });
+  writeTaskFile(m.WS, [
+    makeTask({ id: '00000002', prompt: '任务级模型' }),
+    makeTask({ id: '00000004', prompt: '工作区模型' }),
+  ]);
+  await m.patrol();
+  assert.equal(m.byTask.get('00000002').model, 'sonnet');
+  assert.equal(m.byTask.get('00000004').model, 'claude-opus-5-5');
+  assert.ok(m.patrolLogs.some((line) =>
+    line.includes('任务 00000002') && line.includes('模型 sonnet')));
+
+  // 改配置不热切换已有会话，也不借巡检重启它们。
+  writeJson(path.join(m.WS, '.claude', 'cron-up.json'), {
+    model: 'next-default',
+    tasks: { '00000002': { model: 'next-task' } },
+  });
+  await m.patrol();
+  assert.equal(m.spawns.length, 2);
+  assert.equal(m.byTask.get('00000002').model, 'sonnet');
+  assert.equal(m.byTask.get('00000004').model, 'claude-opus-5-5');
+});
+
+test('invalid workspace model config blocks new spawns without failure counts', async (t) => {
+  const m = await setupMachine(t);
+  writeJson(path.join(m.WS, '.claude', 'cron-up.json'), { model: '' });
+  writeTaskFile(m.WS, [makeTask()]);
+  await m.patrol();
+  assert.equal(m.spawns.length, 0);
+  assert.equal(m.bucket['00000001'], undefined);
+  assert.ok(m.patrolLogs.some((line) =>
+    line.includes('工作区模型配置无效') && line.includes('不会启动新的预热会话')));
 });
 
 test('cross-round reown refreshes process identity under the same session id', async (t) => {

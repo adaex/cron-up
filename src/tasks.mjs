@@ -6,8 +6,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
-import { deps, isPlainObject } from './internals.mjs';
-import { TASK_REL } from './paths.mjs';
+import {
+  deps,
+  isPlainObject,
+  getOwn,
+} from './internals.mjs';
+import { TASK_REL, WORKSPACE_CONFIG_REL } from './paths.mjs';
 import {
   PRUNE_DIRS,
   MAX_SCAN_DEPTH,
@@ -129,6 +133,55 @@ export function* discover(roots) {
 export function readTasks(ws) {
   const doc = deps.loadTaskDoc(path.join(ws, TASK_REL));
   return doc === null ? null : doc.tasks.filter(isPlainObject);
+}
+
+// 工作区配置只归 cron-up 所有，不写进 Claude Code 的任务文件。返回
+// {config, error}：文件缺失等价于空配置；任何已存在但不可解读的配置都让
+// config 为 null，由巡检阻止新会话回退成默认模型。
+export function readWorkspaceConfig(ws) {
+  const file = path.join(ws, WORKSPACE_CONFIG_REL);
+  const invalid = (reason) => ({ config: null, error: `${file} ${reason}` });
+  let config;
+  try {
+    config = JSON.parse(fs.readFileSync(file, 'utf-8'));
+  } catch (e) {
+    if (e.code === 'ENOENT') return { config: { tasks: {} }, error: null };
+    const reason = e instanceof SyntaxError
+      ? `不是合法 JSON：${e.message}`
+      : `读取失败：${e.message}`;
+    return invalid(reason);
+  }
+  if (!isPlainObject(config)) return invalid('顶层应是 JSON 对象');
+
+  if (config.model !== undefined) {
+    if (typeof config.model !== 'string' || !config.model.trim()) {
+      return invalid('的 model 应是非空字符串');
+    }
+    config.model = config.model.trim();
+  }
+  if (config.tasks !== undefined && !isPlainObject(config.tasks)) {
+    return invalid('的 tasks 应是按任务键索引的对象');
+  }
+  for (const [key, entry] of Object.entries(config.tasks ?? {})) {
+    if (!isPlainObject(entry)) {
+      return invalid(`的 tasks.${key} 应是 JSON 对象`);
+    }
+    if (entry.model !== undefined) {
+      if (typeof entry.model !== 'string' || !entry.model.trim()) {
+        return invalid(`的 tasks.${key}.model 应是非空字符串`);
+      }
+      entry.model = entry.model.trim();
+    }
+  }
+  return { config, error: null };
+}
+
+// 任务级覆盖优先于工作区默认；都没有时返回 undefined，启动层因此不传
+// --model。配置无效时同样没有可用模型，但巡检会在到达启动前停下。
+export function configuredModel(workspaceConfig, key) {
+  const cfg = workspaceConfig.config;
+  if (cfg === null) return undefined;
+  return getOwn(cfg.tasks, key)?.model ?? cfg.model;
 }
 
 // 任务在 state 与盖印映射里的身份键：CronCreate 的任务总有唯一 8 位十六
