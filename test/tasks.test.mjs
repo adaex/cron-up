@@ -314,7 +314,11 @@ test('reown refreshes a stale pid and fingerprint under the same session id', (t
   };
   fs.writeFileSync(file, JSON.stringify({ tasks: [a] }));
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
-  assert.deepEqual(r, { renewed: 0, reowned: 1 });
+  assert.deepEqual(r, {
+    renewed: 0,
+    reowned: 1,
+    reownedTasks: [{ taskId: taskKey(a), target: WARM_A }],
+  });
   const ta = readJson(file).tasks[0];
   assert.equal(ta.createdByPid, WARM_A.pid);
   assert.equal(ta.createdByProcStart, WARM_A.procStart);
@@ -327,7 +331,11 @@ test('reown with identical content but different ids stamps only the target id',
   const b = { ...a, id: '00000004', createdBySessionId: 'live-creator' };
   fs.writeFileSync(file, JSON.stringify({ tasks: [a, b] }));
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
-  assert.deepEqual(r, { renewed: 0, reowned: 1 });
+  assert.deepEqual(r, {
+    renewed: 0,
+    reowned: 1,
+    reownedTasks: [{ taskId: taskKey(a), target: WARM_A }],
+  });
   const [ta, tb] = readJson(file).tasks;
   assert.equal(ta.createdBySessionId, WARM_A.sessionId);
   assert.equal(tb.createdBySessionId, 'live-creator');
@@ -362,7 +370,11 @@ test('renew and reown merge into the same atomic round-trip without changing id'
     prompt: 'x', createdAt: 5 };
   fs.writeFileSync(file, JSON.stringify({ tasks: [a] }));
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
-  assert.deepEqual(r, { renewed: 1, reowned: 1 });
+  assert.deepEqual(r, {
+    renewed: 1,
+    reowned: 1,
+    reownedTasks: [{ taskId: taskKey(a), target: WARM_A }],
+  });
   const ta = readJson(file).tasks[0];
   assert.equal(ta.permanent, true);
   assert.equal(ta.id, 'c1363d8b');

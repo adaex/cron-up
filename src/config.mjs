@@ -128,7 +128,8 @@ function cleanEntry(raw, ws, taskId) {
     if (claudePid === null) delete ent.claudePid;
     else ent.claudePid = claudePid;
   }
-  for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince']) {
+  for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince',
+    'observedFiredAt']) {
     if (ent[k] !== null && ent[k] !== undefined) {
       try {
         ent[k] = lenientInt(ent[k]);

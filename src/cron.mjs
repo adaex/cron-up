@@ -208,8 +208,8 @@ function createdAtDate(task) {
 }
 
 // 此刻是否已需要会话：一次性任务错过待补，或周期任务处在落点之后、抖动
-// 投递之前的尾窗。不带任何前瞻——display 的「已错过」判定与回收余量都
-// 按这个口径，未来落点子句不属于这里。
+// 投递之前的尾窗。不带任何前瞻——display 的「已错过」判定也按这个口径，
+// 未来落点子句不属于这里。
 function wantedNow(cron, task, now) {
   // 首次触发已过却仍在文件里：一次性任务意味着没有 REPL 运行时被错过
   // （重启/睡眠）。原生机制会在会话启动时补执行一次再删除它。
@@ -228,9 +228,8 @@ function wantedNow(cron, task, now) {
   }
   // 周期任务：投递不是在落点，而是落点 + 按 id 确定的抖动（每日任务通常
   // 30 分）。落点已过、抖动投递时刻未到的这段「投递尾窗」里会话仍必须在
-  // 场——否则 window 模式会把执行完近邻任务后空闲下来的会话回收且不重
-  // 拉，让本次触发漏跑（周期任务没有补执行）。机制与窗口口径见
-  // recurringTailWindow。
+  // 场——不能按「下一次未来落点」提前换代，让本次触发漏跑。机制与窗口口径
+  // 见 recurringTailWindow。
   return recurringTailWindow(cron, task.id, now) !== null;
 }
 
@@ -257,6 +256,20 @@ function wantedWithin(cron, task, now, leadMs) {
 export function taskWanted(task, now, leadMs) {
   const cron = parseCronOrNone(task?.cron);
   return cron !== null && wantedWithin(cron, task, now, leadMs);
+}
+
+// 周期任务在指定毫秒时刻之后的下一次预热起点。严格取该时刻之后的下一个
+// 落点，再减前瞻量；是否已经形成独立预热间隙由生命周期调用方判断。
+// 一次性任务没有下一代，非法时间、cron 或搜索窗内无后续落点都返回
+// Infinity，调用方不会据此安排换代。
+export function nextWarmupAfterMs(
+  task, afterMs, leadMs, withinDays = TAIL_WINDOW_DAYS,
+) {
+  if (taskIsOneshot(task) || !Number.isFinite(afterMs)) return Infinity;
+  const cron = parseCronOrNone(task?.cron);
+  if (cron === null) return Infinity;
+  const nextSlot = cron.nextAfter(new Date(afterMs), withinDays);
+  return nextSlot === null ? Infinity : nextSlot.getTime() - leadMs;
 }
 
 // 两个口径供展示视图复用（同一个已解析 cron 顺带回答巡检问题）。

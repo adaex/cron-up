@@ -16,7 +16,6 @@ import {
   COOLDOWN_SECONDS,
   FAIL_TTL_SECONDS,
   SESSION_RECYCLE_IDLE_SECONDS,
-  SESSION_RECYCLE_MARGIN_SECONDS,
 } from '../src/constants.mjs';
 import {
   mkTmp,
@@ -395,6 +394,8 @@ test('a live creator session is fully respected: no spawn, no stamp', async (t) 
   assert.equal(sidOf(m, '00000002'), creatorSid);
   assert.equal(fileTasks(m).find((x) => x.id === '00000002').createdByPid,
     undefined);
+  assert.ok(m.patrolLogs.some((line) => line.includes('不预热')
+    && line.includes('00000002') && line.includes('creator-lives')));
 });
 
 test('identical content with one live creator stamps only the dead-owner id', async (t) => {
@@ -534,20 +535,22 @@ test('resume in terminal detaches: no respawn, no kill; closes → fails reset a
   assert.equal(m.bucket['00000001'].fails, 0);
 });
 
-// ---- window 回收（三条件按单任务）----
+// ---- 下一代预热时替换上一代（按单任务）----
 
 function recycleTask(over = {}) {
-  // 远期年度任务：本代执行过，下一落点远在 margin 之外。
+  // 上一代 15 分钟前已投递，下一落点在 15 分钟后；因此下一代预热起点
+  // 是 9 分钟后。日期字段虽具体，recurring=true 仍按周期任务处理。
   return makeTask({
     id: '00000001',
-    cron: '30 3 1 1 *',
+    cron: cronAt(900, nowAt(T0)),
     lastFiredAt: (T0 - 900) * 1000,
     ...over,
   });
 }
+const NEXT_WARMUP = T0 + 540;
 
-// 手工布置一条「已认亲、本代执行过」的预热（远期任务在启动轮不在窗口，
-// 走不了真实 spawn 流程，回收用例直接构造终态）。
+// 手工布置一条「已认亲、本代执行过」的预热（窗口外任务在启动轮走不了
+// 真实 spawn 流程，回收用例直接构造终态）。
 function seedWarm(m, task, { startedAt = T0 - 1000, claimed = true,
   sid = 'sid-warm' } = {}) {
   writeTaskFile(m.WS, [task]);
@@ -580,53 +583,66 @@ function seedWarm(m, task, { startedAt = T0 - 1000, claimed = true,
   return rec;
 }
 
-test('recycle after fired + silent + distant next need', async (t) => {
+test('a fired generation is retained until the next warmup window', async (t) => {
   const m = await setupMachine(t);
   const rec = seedWarm(m, recycleTask());
   m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10);
   await m.patrol(T0);
+  assert.ok(m.alive.has(rec.scriptPid));
+  assert.equal(m.spawns.length, 1, '执行后不能按固定静默时长提前换代');
+});
+
+test('next warmup stops the old generation and starts its replacement in the same round', async (t) => {
+  const m = await setupMachine(t);
+  const rec = seedWarm(m, recycleTask());
+  m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10, NEXT_WARMUP);
+  const pending = await m.patrol(NEXT_WARMUP);
   assert.ok(!m.alive.has(rec.scriptPid));
-  assert.equal(m.bucket['00000001'], undefined);
+  assert.equal(m.spawns.length, 2);
+  const replacement = m.spawns[1];
+  assert.ok(m.alive.has(replacement.scriptPid));
+  assert.equal(m.bucket['00000001'].pid, replacement.scriptPid);
+  assert.deepEqual(pending.map((p) => p.pid), [replacement.scriptPid]);
+  assert.ok(m.patrolLogs.some((line) => line.includes('已进入下一次预热窗口')));
 });
 
-test('no recycle when this generation never fired', async (t) => {
-  const m = await setupMachine(t);
-  const rec = seedWarm(m,
-    recycleTask({ lastFiredAt: (T0 - 5000) * 1000 }));
-  m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10);
-  await m.patrol(T0);
-  assert.ok(m.alive.has(rec.scriptPid));
-});
+for (const [name, over, logAge] of [
+  ['the previous generation never fired',
+    { lastFiredAt: (T0 - 5000) * 1000 }, SESSION_RECYCLE_IDLE_SECONDS + 10],
+  ['the session log is fresh', {}, 10],
+  ['there is no separate warmup gap',
+    { cron: '*/5 * * * *' }, SESSION_RECYCLE_IDLE_SECONDS + 10],
+]) {
+  test(`no replacement when ${name}`, async (t) => {
+    const m = await setupMachine(t);
+    const rec = seedWarm(m, recycleTask(over));
+    m.touchLog('00000001', logAge, NEXT_WARMUP);
+    await m.patrol(NEXT_WARMUP);
+    assert.ok(m.alive.has(rec.scriptPid));
+    assert.equal(m.spawns.length, 1);
+  });
+}
 
-test('no recycle while the session log is fresh', async (t) => {
-  const m = await setupMachine(t);
-  const rec = seedWarm(m, recycleTask());
-  m.touchLog('00000001', 10);
-  await m.patrol(T0);
-  assert.ok(m.alive.has(rec.scriptPid));
-});
-
-test('no recycle inside the two-step margin before next need', async (t) => {
-  const m = await setupMachine(t);
-  // 近期一次性任务（窗口内、未触发）：needMs 很近。
-  const rec = seedWarm(m,
-    makeTask({
-      recurring: false,
-      cron: cronAt(60, nowAt(T0)),
-      createdAt: T0 * 1000 - 3600_000,
-      lastFiredAt: (T0 - 900) * 1000,
-    }));
-  m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10);
-  await m.patrol(T0);
-  assert.ok(m.alive.has(rec.scriptPid));
-});
-
-test('unregistered spawning session is never recycled', async (t) => {
+test('unregistered spawning session is never recycled by the generation path', async (t) => {
   const m = await setupMachine(t);
   const rec = seedWarm(m, recycleTask(), { claimed: false });
   m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10, T0);
   await m.patrol(T0);
   assert.ok(m.alive.has(rec.scriptPid));
+});
+
+test('delivery observation is logged once per lastFiredAt, not as success', async (t) => {
+  const m = await setupMachine(t);
+  seedWarm(m, recycleTask());
+  await m.patrol(T0);
+  await m.patrol(T0 + 1);
+  const deliveries = () => m.patrolLogs.filter((line) =>
+    line.includes('观测到投递'));
+  assert.equal(deliveries().length, 1);
+  assert.ok(deliveries()[0].includes('不代表任务已执行成功'));
+
+  await m.patrol(T0 + 2, [recycleTask({ lastFiredAt: T0 * 1000 })]);
+  assert.equal(deliveries().length, 2);
 });
 
 // ---- 任务消失 / 清空 / 损坏 ----
@@ -786,6 +802,20 @@ test('cmdRun: passive death between rounds is reported with task id', async (t) 
     && l.includes(`pid=${pid}`)));
 });
 
+test('cmdRun: persistent-window skip diagnostics do not repeat every round', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const creatorSid = 'creator-lives';
+  m.addUser(creatorSid);
+  writeTaskFile(m.WS, [makeTask({
+    id: '00000002', createdBySessionId: creatorSid,
+  })]);
+  await m.patrol();
+  await m.patrol();
+  const lines = m.patrolLogs.filter((line) => line.includes('不预热')
+    && line.includes('00000002'));
+  assert.equal(lines.length, 1);
+});
+
 // ---- cmdRun 轮内等待认亲盖印 ----
 
 test('maintenance disappearing keeps new sessions in the same-round wait', async (t) => {
@@ -815,6 +845,10 @@ test('cmdRun: registration during in-round wait is claimed and stamped same roun
   const ent = m.state()[m.WS]['00000002'];
   assert.equal(ent.sessionId, 'sid-A');
   assert.equal(ent.fails, 0);
+  assert.ok(m.patrolLogs.some((line) => line.includes('已登记')
+    && line.includes('00000002') && line.includes('sid-A')));
+  assert.ok(m.patrolLogs.some((line) => line.includes('已过户')
+    && line.includes('00000002') && line.includes('sid-A')));
 });
 
 test('cmdRun: unregistered warm session is waited out but not killed or counted', async (t) => {
@@ -832,6 +866,8 @@ test('cmdRun: unregistered warm session is waited out but not killed or counted'
   assert.equal(ent.pid, rec.scriptPid);
   assert.equal(ent.fails, 0);
   assert.equal(ent.sessionId, undefined);
+  assert.ok(m.patrolLogs.some((line) => line.includes('等待登记')
+    && line.includes('00000002') && line.includes('后续巡检继续检查')));
 });
 
 test('cmdRun: pending session dying during wait counts a failure and is kept', async (t) => {

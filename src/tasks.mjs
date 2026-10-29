@@ -299,7 +299,8 @@ export function taskOwnedBy(t, target) {
 // 一轮巡检对一个任务文件做的维护：renew（补 permanent）与 reown（把任务
 // 归属盖给各自的预热会话）合并为同一次带 mtime 乐观检测的原子写。先取
 // mtimeNs、清残留 .cron-up-tmp、loadTaskDoc round-trip 整文档；两项计数
-// 都为 0 时字节级不动。返回 {renewed,reowned}；null 表示文件缺失/损坏；
+// 都为 0 时字节级不动。返回 {renewed,reowned}，有实际盖印时另附
+// reownedTasks=[{taskId,target}] 供诊断使用；null 表示文件缺失/损坏；
 // 读到写间被改抛 TaskFileChanged。
 //
 // reown 形状：Map<taskKey, {sessionId, pid, procStart}>。一轮内同一文件的
@@ -336,7 +337,7 @@ export function maintainWorkspace(taskfile, { reown = null } = {}) {
       renewed += 1;
     }
   }
-  let reowned = 0;
+  const reownedTasks = [];
   if (reown instanceof Map && reown.size > 0) {
     // 只有确实需要盖印时才计算任务键；纯续期与常见空操作不付摘要成本。
     for (const [key, group] of groupTasksByKey(doc.tasks)) {
@@ -350,15 +351,17 @@ export function maintainWorkspace(taskfile, { reown = null } = {}) {
         t.createdByPid = target.pid;
         // ps lstart 原文（含「Oct  8」双空格），原样取自会话登记。
         t.createdByProcStart = target.procStart;
-        reowned += 1;
+        reownedTasks.push({ taskId: key, target });
       }
     }
   }
-  if (renewed === 0 && reowned === 0) {
+  if (renewed === 0 && reownedTasks.length === 0) {
     return { renewed: 0, reowned: 0 };
   }
   atomicWriteJson(taskfile, doc, mtimeNs);
-  return { renewed, reowned };
+  const result = { renewed, reowned: reownedTasks.length };
+  if (reownedTasks.length > 0) result.reownedTasks = reownedTasks;
+  return result;
 }
 
 Object.assign(deps, { discover, readTasks, loadTaskDoc });

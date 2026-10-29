@@ -239,7 +239,7 @@ for (const [mins, recurring, want, label] of [
 
 test('wantedNow has no lookahead: a future slot is not yet needed', () => {
   // 落点前 60 秒的未来任务：此刻口径只认错过∪尾窗，不前瞻——display 的
-  // missed 判定与回收余量都依赖它。
+  // missed 判定也依赖它。
   const d = new Date(NOW.getTime() + 60_000);
   const expr = `${d.getMinutes()} ${d.getHours()} ${d.getDate()} `
     + `${d.getMonth() + 1} *`;

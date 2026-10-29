@@ -45,16 +45,10 @@ export const WARMUP_GRACE_SECONDS = 180;
 // 帽与墙钟帽双出口，高负载拖慢 setTimeout 也不会把一轮撑过间隔。
 export const WARMUP_WAIT_MS = 24_000;
 export const WARMUP_POLL_MS = 3_000;
-// window 回收判据一：界面静默超过此时长，作为本代触发后空闲的启发式，
-// 不是任务完成状态的证明。取 WARMUP_GRACE 同值，结构上对齐既有心智。
+// 下一次预热窗口替换上一代会话前，要求界面至少静默这么久，避免打断仍在
+// 输出的任务。日志停更也可能只是等待输入，所以这不证明任务成功；上一代
+// 会保留到下次预热，而不是在这段静默时长后提前回收。
 export const SESSION_RECYCLE_IDLE_SECONDS = WARMUP_GRACE_SECONDS;
-// window 回收判据二：距该任务下次「需要会话在场」至少还有这么多秒。回收
-// 后下轮（≤INTERVAL）发现并 spawn，进程即在场，盖印在该轮等待期内完成；
-// 一个巡检间隔之外的 120 秒余量罩一次性任务最多 90 秒的提前投递与唤醒
-// 抖动。更近的触发不回收，复用现有会话。
-export const SESSION_FIRE_MARGIN_SECONDS = 120;
-export const SESSION_RECYCLE_MARGIN_SECONDS =
-  SESSION_FIRE_MARGIN_SECONDS + INTERVAL_SECONDS;
 // 巡检日志每轮两行心跳加零星事件，跑几年的机器也该有上限。launchd 每次按
 // 路径重开，轮初改名是安全的：本轮 fd 继续写改名后的 inode，下轮开新文件。
 export const PATROL_LOG_ROTATE_BYTES = 1024 * 1024;
