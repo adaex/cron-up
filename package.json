@@ -1,6 +1,6 @@
 {
   "name": "cron-up",
-  "version": "26.10.38",
+  "version": "26.10.39",
   "description": "为 Claude Code 定时任务在触发前按需预热交互会话",
   "type": "module",
   "bin": {
