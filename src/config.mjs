@@ -111,9 +111,11 @@ export function loadConfig(file, opts = {}) {
 //
 // entry 字段：pid/procStart（根进程指纹）、claudePid/sessionId/
 // claudeProcStart（认亲后回填）、startedAt、fails、cooldownUntil、
-// deadSince、notified、herdr（终端地址）、herdrTitleAttempted（是否已尝试
-// 设置标题）、herdrActivity（界面摘要）与 herdrActivityAt。pid 为 null 的
-// 条目是「当场没拉起/冷却中」的合法形态；未认亲时 claude* 三字段缺省。
+// deadSince、notified、sig（任务内容签名，供 id 改号后的崩溃窗口认回）、
+// herdr（终端地址）、herdrTaskId（仅在与 taskId 不同时保存的旧任务标签）、
+// herdrTitleAttempted（是否已尝试设置标题）、herdrActivity（界面摘要）与
+// herdrActivityAt。pid 为 null 的条目是「当场没拉起/冷却中」的合法形态；
+// 未认亲时 claude* 三字段缺省。
 function cleanEntry(raw, ws, taskId) {
   if (!isPlainObject(raw)) return null;
   const ent = { ws, taskId, pid: parsePid(raw.pid) };
@@ -129,7 +131,7 @@ function cleanEntry(raw, ws, taskId) {
     }
   }
   for (const k of ['sessionId', 'procStart', 'claudeProcStart',
-    'herdr', 'herdrActivity']) {
+    'herdr', 'herdrTaskId', 'herdrActivity', 'sig']) {
     if (typeof raw[k] === 'string' && raw[k] !== '') ent[k] = raw[k];
   }
   for (const k of ['notified', 'herdrTitleAttempted']) {

@@ -106,6 +106,38 @@ export function setHerdrTitle(address, title) {
   return result.status === 0 ? null : herdrResultDetail(result);
 }
 
+// 周期任务 id 改小后，把既有 Herdr 终端的机器标签同步到新 taskId。state
+// 只在旧标签与 taskId 不同时保存 herdrTaskId：同步失败时停止前身份核对仍按
+// 旧标签进行；标签确认一致后删除该字段，读取方直接回退到 taskId。
+// 返回 null 表示标签已经确认是目标值，否则返回可供日志展示的失败原因。
+export function syncHerdrTaskId(ent) {
+  const target = ent?.taskId;
+  if (typeof target !== 'string' || target === '') return '目标任务 id 无效';
+  if (typeof ent?.herdr !== 'string') return '缺少 Herdr 终端地址';
+  const hc = deps.findHerdr();
+  if (!hc) return '未找到 hc 命令';
+  const { result, terminal } = herdrTerminal(hc, 'get', ent.herdr);
+  if (!terminal) return herdrResultDetail(result);
+  if (terminal.pid !== ent.pid || terminal.cwd !== ent.ws) {
+    return '终端 pid 或工作区与 state 不一致';
+  }
+  const current = terminal.labels?.['cron-up'];
+  if (current === target) {
+    // 覆盖「标签已写、state 尚未落盘就进程退出」的恢复窗口。
+    delete ent.herdrTaskId;
+    return null;
+  }
+  const expected = ent.herdrTaskId ?? ent.taskId;
+  if (current !== expected) {
+    return `终端任务标签 ${String(current)} 与预期 ${expected} 不一致`;
+  }
+  const labelled = deps.execFile(hc, ['label', ent.herdr, `cron-up=${target}`],
+    { timeout: 5000 });
+  if (labelled.status !== 0) return herdrResultDetail(labelled);
+  delete ent.herdrTaskId;
+  return null;
+}
+
 // get 与 kill 都以 --json 返回完整 Terminal；run/ls 的 JSON 只是摘要，不能
 // 用它们替代这里的身份查询。kill 会等待停止结束并返回最终 state。
 function herdrTerminal(hc, command, address, timeout = 5000) {
@@ -187,8 +219,10 @@ export function stopSession(ent) {
   if (!hc) return false;
   const { terminal } = herdrTerminal(hc, 'get', ent.herdr);
   // 地址、pid、工作区和任务标签必须同时吻合，根 pid 指纹已在上面核验。
+  // 自动改小任务 id 后标签同步可能失败，此时仍以最后确认的旧标签为准。
+  const taskId = ent.herdrTaskId ?? ent.taskId;
   if (!terminal || terminal.pid !== pid || terminal.cwd !== ent.ws
-      || terminal.labels?.['cron-up'] !== ent.taskId) {
+      || terminal.labels?.['cron-up'] !== taskId) {
     return !deps.alive(pid);
   }
   const { terminal: killed } = herdrTerminal(hc, 'kill', ent.herdr, 10000);
@@ -307,6 +341,7 @@ Object.assign(deps, {
   trackedAlive,
   findHerdr,
   setHerdrTitle,
+  syncHerdrTaskId,
   spawnSession,
   stopSession,
   sessionIdleSeconds,

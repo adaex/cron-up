@@ -1,7 +1,7 @@
 // 全部调参常量集中一处，改动时便于通盘核对。
 
-// 配置文件只有 roots 一个字段：巡检间隔、提前量、扫描深度、续期与任务归属
-// 盖印都是不可关闭的唯一行为（见 README），常量化在本文件。
+// 配置文件只有 roots 一个字段：巡检间隔、提前量、扫描深度、续期、周期任务
+// id 改小与任务归属盖印都是不可关闭的唯一行为（见 README），常量化在本文件。
 export const DEFAULT_CONFIG = {
   // 默认只扫本人的三个任务制容器，不扫整个家目录——他人可写仓库里的周期
   // 任务会被自动续期永久化，默认范围必须是用户完全掌控的领地（见 README
@@ -82,6 +82,11 @@ export const CC_JITTER = {
   oneShotFloorMs: 0,
   oneShotMinuteMod: 30,
 };
+
+// 自动改小周期任务 id 的目标延迟上界。按尾窗覆盖的最长周期间隔反解 id
+// 数值阈值；实际分配从 00000001 起，日常、每周、每月乃至 2 月 29 日任务
+// 的延迟都落在同一分钟内。改号只消除上游按 id 计算的偏移，不改动 cron。
+export const AUTO_MIN_ID_TARGET_DELAY_MS = 60 * 1000;
 
 // 投递尾窗判定的回看/前探窗口（wanted 与 nextDelivery 共用，见
 // src/cron.mjs 的 recurringTailWindow）：找上一落点用 prevAtOrBefore、算

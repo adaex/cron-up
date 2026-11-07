@@ -8,11 +8,14 @@ import {
   readTasks,
   loadTaskDoc,
   maintainWorkspace,
+  minifyIds,
+  parseTaskIdN,
   taskKey,
   taskSig,
   atomicWriteJson,
   TaskFileChanged,
 } from '../src/tasks.mjs';
+import { minTaskIdMaxN } from '../src/cron.mjs';
 import { taskView } from '../src/display.mjs';
 import { mockDeps, mkTmp, readJson } from '../test-support/helpers.mjs';
 
@@ -88,7 +91,7 @@ test('stale tmp from a killed write is swept even when nothing changes', (t) => 
   fs.writeFileSync(`${file}.cron-up-tmp`, 'half-written');
   fs.writeFileSync(`${file}.tmp`, 'foreign writer in flight');
   const r = maintain(file);
-  assert.deepEqual(r, { renewed: 0, reowned: 0 });
+  assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0, idChanges: [] });
   assert.equal(fs.existsSync(`${file}.cron-up-tmp`), false);
   assert.equal(fs.existsSync(`${file}.tmp`), true);
 });
@@ -108,7 +111,7 @@ test('second run is a noop that does not even open for write', (t) => {
   assert.equal(maintain(file).renewed, 1);
   const first = fs.statSync(file, { bigint: true });
   const r2 = maintain(file);
-  assert.deepEqual(r2, { renewed: 0, reowned: 0 });
+  assert.deepEqual(r2, { renewed: 0, minified: 0, reowned: 0, idChanges: [] });
   const second = fs.statSync(file, { bigint: true });
   assert.equal(first.ino, second.ino);
   assert.equal(first.mtimeNs, second.mtimeNs);
@@ -137,7 +140,7 @@ test('any truthy permanent is already exempt', (t) => {
     fs.writeFileSync(file, JSON.stringify({ tasks: [{ ...RECURRING, permanent: flag }] }));
     const before = fs.readFileSync(file, 'utf-8');
     const r = maintain(file);
-    assert.deepEqual(r, { renewed: 0, reowned: 0 },
+    assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0, idChanges: [] },
       String(flag));
     assert.equal(fs.readFileSync(file, 'utf-8'), before);
   }
@@ -215,9 +218,109 @@ test('task view exposes the permanent flag', () => {
     .permanent, false);
 });
 
-// ---- maintainWorkspace：不再自动改 id ----
+// ---- 周期任务 id 改小：无条件、幂等且不碰一次性任务 ----
 
-test('maintainWorkspace renews without rewriting an existing large id', (t) => {
+test('minTaskIdMaxN keeps even the longest cron period within the target', () => {
+  const maxN = minTaskIdMaxN();
+  assert.equal(maxN, 1_629);
+  const longestPeriodMs = 3661 * 86400_000;
+  const delayOf = (n) => n / 2 ** 32 * 0.5 * longestPeriodMs;
+  assert.ok(delayOf(maxN) <= 60_000);
+  assert.ok(delayOf(maxN + 1) > 60_000);
+
+  const id = maxN.toString(16).padStart(8, '0');
+  for (const cron of ['0 9 * * 1', '0 9 1 * *']) {
+    const v = taskView({ id, cron, recurring: true }, NOW);
+    assert.ok(v.fire.getTime() - v.nxt.getTime() <= 60_000, cron);
+  }
+});
+
+test('parseTaskIdN accepts only strict 8-hex ids', () => {
+  assert.equal(parseTaskIdN('00000001'), 1);
+  assert.equal(parseTaskIdN('058e0149'), 0x058e0149);
+  assert.equal(parseTaskIdN('abc'), null);
+  assert.equal(parseTaskIdN('058e0149-aaaa-bbbb'), null);
+  assert.equal(parseTaskIdN('zzzzzzzz'), null);
+  assert.equal(parseTaskIdN(undefined), null);
+  assert.equal(parseTaskIdN(123), null);
+});
+
+test('minifyIds assigns free small numbers and reports old and new keys', () => {
+  const tasks = [
+    { id: '00000001', recurring: false },
+    { id: '00000003', recurring: true },
+    { id: '554e2879', recurring: true },
+    { id: '8c9d6c82', recurring: true },
+  ];
+  const r = minifyIds(tasks);
+  assert.equal(r.changed, 2);
+  assert.deepEqual(r.idChanges, [
+    { from: '554e2879', to: '00000002' },
+    { from: '8c9d6c82', to: '00000004' },
+  ]);
+  const ids = tasks.map((t) => t.id);
+  assert.equal(new Set(ids).size, ids.length, '文件内 id 唯一');
+  assert.equal(tasks[0].id, '00000001', '一次性任务即使占小号也原样保留');
+});
+
+test('minifyIds keeps qualifying ids and is idempotent', () => {
+  const maxN = minTaskIdMaxN();
+  const atEdge = maxN.toString(16).padStart(8, '0');
+  const over = (maxN + 1).toString(16).padStart(8, '0');
+  const tasks = [
+    { id: '00000000', recurring: true },
+    { id: atEdge, recurring: true },
+    { id: over, recurring: true },
+    { id: 'c1363d8b', recurring: false },
+    { cron: '0 5 * * *' },
+  ];
+  const r1 = minifyIds(tasks);
+  assert.equal(r1.changed, 1);
+  assert.deepEqual(r1.idChanges, [{ from: over, to: '00000001' }]);
+  assert.equal(tasks[0].id, '00000000');
+  assert.equal(tasks[1].id, atEdge);
+  assert.equal(tasks[3].id, 'c1363d8b', '一次性大 id 不改');
+  assert.equal(tasks[4].id, undefined, '无 recurring 标志不改');
+  const r2 = minifyIds(tasks);
+  assert.equal(r2.changed, 0);
+  assert.deepEqual(r2.idChanges, []);
+});
+
+test('minifyIds leaves a large id alone when all qualifying ids are occupied', () => {
+  const maxN = minTaskIdMaxN();
+  const tasks = Array.from({ length: maxN }, (_, i) => ({
+    id: (i + 1).toString(16).padStart(8, '0'), recurring: false,
+  }));
+  tasks.push({ id: 'c1363d8b', recurring: true });
+  const r = minifyIds(tasks);
+  assert.equal(r.changed, 0);
+  assert.deepEqual(r.idChanges, []);
+  assert.equal(tasks.at(-1).id, 'c1363d8b');
+});
+
+test('minifyIds gives a unique anonymous task a real id', () => {
+  const original = { cron: '0 5 * * *', prompt: 'x', createdAt: 1,
+    recurring: true };
+  const tasks = [{ ...original }];
+  const r = minifyIds(tasks);
+  assert.equal(r.changed, 1);
+  assert.deepEqual(r.idChanges, [{ from: taskKey(original), to: '00000001' }]);
+  assert.equal(tasks[0].id, '00000001');
+});
+
+test('minifyIds skips duplicate original keys instead of hiding ambiguity', () => {
+  const a = { id: 'c1363d8b', cron: '0 5 * * *', prompt: '甲', recurring: true };
+  const b = { ...a, prompt: '乙' };
+  const tasks = [a, b];
+  const r = minifyIds(tasks);
+  assert.equal(r.changed, 0);
+  assert.deepEqual(r.idChanges, []);
+  assert.deepEqual(tasks.map((t) => t.id), ['c1363d8b', 'c1363d8b']);
+});
+
+// ---- maintainWorkspace：续期与周期任务 id 改小无条件执行 ----
+
+test('maintainWorkspace renews and rewrites a large recurring id', (t) => {
   const { file } = taskDir(t);
   fs.writeFileSync(file, JSON.stringify({
     tasks: [
@@ -227,9 +330,14 @@ test('maintainWorkspace renews without rewriting an existing large id', (t) => {
     version: 7,
   }));
   const r = maintain(file);
-  assert.deepEqual(r, { renewed: 1, reowned: 0 });
+  assert.deepEqual(r, {
+    renewed: 1,
+    minified: 1,
+    reowned: 0,
+    idChanges: [{ from: 'c1363d8b', to: '00000001' }],
+  });
   const doc = readJson(file);
-  assert.equal(doc.tasks[0].id, 'c1363d8b');
+  assert.equal(doc.tasks[0].id, '00000001');
   assert.equal(doc.tasks[0].permanent, true);
   assert.equal(doc.version, 7, '未知顶层键 round-trip 保留');
 });
@@ -299,7 +407,7 @@ test('reown is idempotent: owner already on target is a byte-level noop', (t) =>
   fs.writeFileSync(file, JSON.stringify({ tasks: [a] }));
   const before = fs.readFileSync(file, 'utf-8');
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
-  assert.deepEqual(r, { renewed: 0, reowned: 0 });
+  assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0, idChanges: [] });
   assert.equal(fs.readFileSync(file, 'utf-8'), before);
 });
 
@@ -316,7 +424,9 @@ test('reown refreshes a stale pid and fingerprint under the same session id', (t
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
   assert.deepEqual(r, {
     renewed: 0,
+    minified: 0,
     reowned: 1,
+    idChanges: [],
     reownedTasks: [{ taskId: taskKey(a), target: WARM_A }],
   });
   const ta = readJson(file).tasks[0];
@@ -333,7 +443,9 @@ test('reown with identical content but different ids stamps only the target id',
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
   assert.deepEqual(r, {
     renewed: 0,
+    minified: 0,
     reowned: 1,
+    idChanges: [],
     reownedTasks: [{ taskId: taskKey(a), target: WARM_A }],
   });
   const [ta, tb] = readJson(file).tasks;
@@ -359,12 +471,12 @@ test('reown skips every entry of a duplicate anonymous task key', (t) => {
   fs.writeFileSync(file, JSON.stringify({ tasks: [a, { ...a }], extra: 7 }));
   const before = fs.readFileSync(file, 'utf-8');
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
-  assert.deepEqual(r, { renewed: 0, reowned: 0 });
+  assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0, idChanges: [] });
   assert.equal(fs.readFileSync(file, 'utf-8'), before,
     '同键多条不能一起盖，也不应触发写文件');
 });
 
-test('renew and reown merge into the same atomic round-trip without changing id', (t) => {
+test('renew, minify and reown merge into the same atomic round-trip', (t) => {
   const { file } = taskDir(t);
   const a = { id: 'c1363d8b', cron: '0 13 * * *', recurring: true,
     prompt: 'x', createdAt: 5 };
@@ -372,12 +484,14 @@ test('renew and reown merge into the same atomic round-trip without changing id'
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
   assert.deepEqual(r, {
     renewed: 1,
+    minified: 1,
     reowned: 1,
-    reownedTasks: [{ taskId: taskKey(a), target: WARM_A }],
+    idChanges: [{ from: 'c1363d8b', to: '00000001' }],
+    reownedTasks: [{ taskId: '00000001', target: WARM_A }],
   });
   const ta = readJson(file).tasks[0];
   assert.equal(ta.permanent, true);
-  assert.equal(ta.id, 'c1363d8b');
+  assert.equal(ta.id, '00000001');
   assert.equal(ta.createdBySessionId, WARM_A.sessionId);
   assert.equal(ta.createdByPid, WARM_A.pid);
 });

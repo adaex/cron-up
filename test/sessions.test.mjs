@@ -10,6 +10,7 @@ import {
   herdrDisplayTitle,
   herdrSessionArgv,
   setHerdrTitle,
+  syncHerdrTaskId,
   sessionIdleSeconds,
   getHerdrTerminal,
   listHerdrTerminals,
@@ -61,6 +62,52 @@ test('setHerdrTitle returns a compact backend error', (t) => {
   assert.equal(setHerdrTitle('t7', 'cron-up / ws / 任务'), 'label unsupported');
   deps.execFile = () => ({ status: 0, stdout: '', stderr: '' });
   assert.equal(setHerdrTitle('t7', 'title'), null);
+});
+
+test('syncHerdrTaskId moves a verified terminal label and accepts an already moved label', (t) => {
+  const deps = mockDeps(t);
+  let current = '554e2879';
+  const commands = [];
+  deps.execFile = (file, args) => {
+    commands.push(args);
+    if (args[0] === 'get') {
+      return { status: 0, stdout: JSON.stringify({
+        pid: 4242, cwd: '/ws', labels: { 'cron-up': current },
+      }) };
+    }
+    assert.deepEqual(args, ['label', 't7', 'cron-up=00000001']);
+    current = '00000001';
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const ent = {
+    pid: 4242, ws: '/ws', herdr: 't7',
+    taskId: '00000001', herdrTaskId: '554e2879',
+  };
+  assert.equal(syncHerdrTaskId(ent), null);
+  assert.equal('herdrTaskId' in ent, false);
+  assert.deepEqual(commands.map((args) => args[0]), ['get', 'label']);
+
+  // 模拟标签已更新但 state 尚未落盘：旧记录仍能认回新标签，不重复写。
+  ent.herdrTaskId = '554e2879';
+  assert.equal(syncHerdrTaskId(ent), null);
+  assert.equal('herdrTaskId' in ent, false);
+  assert.deepEqual(commands.map((args) => args[0]), ['get', 'label', 'get']);
+});
+
+test('syncHerdrTaskId refuses to relabel a terminal owned by another task', (t) => {
+  const deps = mockDeps(t);
+  deps.execFile = (file, args) => {
+    assert.equal(args[0], 'get');
+    return { status: 0, stdout: JSON.stringify({
+      pid: 4242, cwd: '/ws', labels: { 'cron-up': 'another-task' },
+    }) };
+  };
+  const ent = {
+    pid: 4242, ws: '/ws', herdr: 't7',
+    taskId: '00000001', herdrTaskId: '554e2879',
+  };
+  assert.match(syncHerdrTaskId(ent), /不一致/);
+  assert.equal(ent.herdrTaskId, '554e2879');
 });
 
 test('Herdr argv is the complete minimal native launch command', () => {
@@ -146,7 +193,7 @@ for (const [name, get, procStart] of [
   });
 }
 
-test('stop kills a Herdr terminal after identity verification and consumes its result', (t) => {
+test('stop kills a Herdr terminal using the last confirmed task label', (t) => {
   const deps = mockDeps(t);
   deps.alive = () => true;
   deps.procStartedAt = () => 'start';
@@ -155,14 +202,15 @@ test('stop kills a Herdr terminal after identity verification and consumes its r
     commands.push(args);
     if (args[0] === 'get') {
       return { status: 0, stdout: JSON.stringify({
-        pid: 4242, cwd: '/ws', labels: { 'cron-up': '00000001' },
+        pid: 4242, cwd: '/ws', labels: { 'cron-up': '554e2879' },
       }) };
     }
     assert.deepEqual(args, ['kill', '--json', 't7']);
     return { status: 0, stdout: '{"state":"finished"}' };
   };
   const ent = {
-    pid: 4242, procStart: 'start', herdr: 't7', ws: '/ws', taskId: '00000001',
+    pid: 4242, procStart: 'start', herdr: 't7', ws: '/ws',
+    taskId: '00000001', herdrTaskId: '554e2879',
   };
   assert.equal(stopSession(ent), true);
   assert.deepEqual(commands.map((args) => args[0]), ['get', 'kill']);

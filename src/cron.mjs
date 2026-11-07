@@ -6,6 +6,7 @@ import {
   DISPLAY_SEARCH_DAYS,
   CC_JITTER,
   TAIL_WINDOW_DAYS,
+  AUTO_MIN_ID_TARGET_DELAY_MS,
 } from './constants.mjs';
 import { isDecInt } from './internals.mjs';
 
@@ -286,8 +287,17 @@ export function taskIdHash(taskId) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// 任务在展示语境里的「设定时间 → 预计投递」对：一次性任务是落点加网格
-// 提前量；周期任务在投递尾窗内属于上一落点（即将到来的这次延迟投递，
+// 可保留的最大 id：即使相邻落点隔着尾窗所覆盖的最长周期（含 2 月 29 日
+// 任务的 8 年间隔），延迟也不超过目标值。与正向延迟公式放在同一调度层，
+// 任务文件层只负责分配空号，不复制上游哈希与周期的关系。
+export function minTaskIdMaxN() {
+  return Math.floor(
+    AUTO_MIN_ID_TARGET_DELAY_MS
+      / (CC_JITTER.recurringFrac * TAIL_WINDOW_DAYS * MS_DAY) * 2 ** 32);
+}
+
+// 任务在展示语境里的设定落点与预计投递：一次性任务是落点加网格提前量；
+// 周期任务在投递尾窗内属于上一落点（即将到来的这次延迟投递，
 // 不是 nextAfter 给出的下个落点——后者严格在未来，会把展示拐到明天），
 // 否则是下一落点 + 按 id 的抖动。先于窗口检查尾窗：2 月 29 日这类长周期
 // 任务的下一落点可能在展示窗口之外，正在等待的投递却依然成立。taskView

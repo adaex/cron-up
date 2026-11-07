@@ -1,5 +1,6 @@
 // 等宽终端展示原语与任务的展示视图。
 
+import { deps } from './internals.mjs';
 import {
   parseCronOrNone,
   taskIsOneshot,
@@ -52,6 +53,18 @@ export function pad(s, width) {
   return s + ' '.repeat(Math.max(0, width - dispWidth(s)));
 }
 
+// 用户输出里的绝对路径优先缩写家目录。必须匹配完整路径段，不能把
+// /Users/aex-other 误当成 /Users/aex 的内部路径；非家目录路径原样保留。
+export function displayPath(p) {
+  const value = String(p);
+  const home = deps.paths.home;
+  if (typeof home !== 'string' || home === '') return value;
+  const root = home.replace(/\/+$/, '') || '/';
+  if (value === root) return '~';
+  if (root === '/') return value.startsWith('/') ? `~${value}` : value;
+  return value.startsWith(`${root}/`) ? `~${value.slice(root.length)}` : value;
+}
+
 // 倒计时的粗略中文说法，只用于总览页。ms 为非负毫秒差。
 export function humanDelta(ms) {
   const secs = Math.max(0, Math.floor(ms / 1000));
@@ -94,8 +107,8 @@ export function taskView(task, now, leadMs) {
   // 回答：只问此刻、不带前瞻，与巡检的错过/尾窗判定同一口径。
   const missed = oneshot && wantedNow(cron, task, now);
   // 落点与投递由 nextDelivery 同源算出：尾窗内的周期任务即将到来的是上
-  // 一落点的这次延迟投递，箭头才画得出「09:00 → 09:30」，而不是从明天
-  // 的落点拐回来（2 月 29 日任务尾窗内 nextAfter 甚至找不到下一落点）。
+  // 一落点的这次延迟投递，而不是从明天的落点拐回来（2 月 29 日任务尾窗内
+  // nextAfter 甚至找不到下一落点）。list 只取 fire 显示一个时间。
   const { slot, fire } = nextDelivery(cron, task, now);
   return {
     valid: true,
@@ -123,7 +136,7 @@ function sameDay(a, b) {
     && a.getMonth() === b.getMonth()
     && a.getDate() === b.getDate();
 }
-// 「同一分钟」的唯一判据，fmtFireRange 的箭头省略与总览「设定」附注共用。
+// 「同一分钟」的唯一判据，总览「设定」附注使用。
 export function sameMinute(a, b) {
   return sameDay(a, b) && a.getHours() === b.getHours()
     && a.getMinutes() === b.getMinutes();
@@ -135,22 +148,6 @@ export function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
-// 「设定时间 → 预计投递」文案。抖动四舍五入到秒（调度器秒级轮询）：
-// 同日省略第二个日期；预计值带非零秒时显示 HH:MM:SS（如 05:15:37）；落
-// 在同一分钟（无抖动）则只显示落点，不画无意义的箭头。
-export function fmtFireRange(nxt, fire) {
-  if (!(fire instanceof Date) || !Number.isFinite(fire.getTime())) {
-    return fmtMDHM(nxt);
-  }
-  const r = new Date(Math.round(fire.getTime() / 1000) * 1000);
-  if (sameMinute(nxt, r)) return fmtMDHM(nxt);
-  const secs = r.getSeconds() ? `:${pad2(r.getSeconds())}` : '';
-  const tail = sameDay(nxt, r)
-    ? `${pad2(r.getHours())}:${pad2(r.getMinutes())}${secs}`
-    : `${fmtMDHM(r)}${secs}`;
-  return `${fmtMDHM(nxt)} → ${tail}`;
-}
-
 // 仅 HH:MM（总览「（设定 HH:MM）」附注用）。
 export function fmtHM(d) {
   return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
@@ -160,6 +157,13 @@ export function fmtHM(d) {
 export function fmtMDHM(d) {
   return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
     + `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+}
+
+// list 的单一预计投递时间：调度器秒级轮询，非整秒不能悄悄截掉。保留秒数
+// 不等于恢复旧的「设定 → 预计」双时间展示。
+export function fmtFire(d) {
+  const r = new Date(Math.round(d.getTime() / 1000) * 1000);
+  return `${fmtMDHM(r)}${r.getSeconds() ? `:${pad2(r.getSeconds())}` : ''}`;
 }
 
 // 会话年龄的粗粒度中文：长驻按天计，否则按分钟。

@@ -9,8 +9,9 @@ import {
   clip,
   pad,
   dispWidth,
+  displayPath,
   taskView,
-  fmtFireRange,
+  fmtFire,
 } from './display.mjs';
 
 function rank(v) {
@@ -19,12 +20,13 @@ function rank(v) {
   return v.nxt ? 1 : 2;
 }
 
-// 状态列文案：有效任务是「设定时间 → 预计投递」（无抖动时只有设定时间）。
+// 状态列只显示一个预计投递时间。周期任务经巡检改小 id 后通常就是 cron
+// 设定分钟；一次性任务仍计入上游可能的网格提前量。
 function statusText(v) {
   if (!v.valid) return 'cron 无效';
   if (v.missed) return '已错过';
   if (!v.nxt) return '一年内无';
-  return fmtFireRange(v.nxt, v.fire);
+  return fmtFire(v.fire ?? v.nxt);
 }
 
 // 单个任务的预热状态标签。创建者会话还开着时返回空串——任务原生投进创
@@ -112,7 +114,7 @@ export async function cmdList(args) {
   const fixedW = 2 + statusW + 2 + kindW + 2 + cadW;
   for (const [ws, views, configError] of blocks) {
     deps.print('');
-    deps.print(clip(ws, cols));
+    deps.print(clip(displayPath(ws), cols));
     if (configError) {
       deps.print(clip(`  配置告警：修复前不会启动新的预热会话；${configError}`, cols));
     }

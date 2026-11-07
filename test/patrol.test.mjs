@@ -9,6 +9,7 @@ import {
   patrolWorkspace,
   releaseRunLock,
 } from '../src/patrol.mjs';
+import { taskSig } from '../src/tasks.mjs';
 import {
   WARMUP_GRACE_SECONDS,
   FAIL_LIMIT,
@@ -370,16 +371,145 @@ test('Herdr display label failure does not block claiming or reowning', async (t
     && line.includes('会话仍照常运行')));
 });
 
-test('a __proto__ task id persists as an own entry without duplicate spawns', async (t) => {
+test('large recurring ids migrate task state, pending keys and Herdr labels together', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const synced = [];
+  m.deps.syncHerdrTaskId = (ent) => {
+    synced.push([ent.herdrTaskId, ent.taskId]);
+    delete ent.herdrTaskId;
+    return null;
+  };
+  writeTaskFile(m.WS, [
+    makeTask({ id: '554e2879', prompt: '每日补报' }),
+    makeTask({ id: '8c9d6c82', prompt: '每周成本' }),
+    makeTask({ id: '2e66e7dc', prompt: '双周周报' }),
+  ]);
+  await m.patrol();
+  assert.deepEqual(m.spawnLog, ['554e2879', '8c9d6c82', '2e66e7dc']);
+  assert.deepEqual(fileTasks(m).map((task) => task.id),
+    ['00000001', '00000002', '00000003']);
+  assert.deepEqual(Object.keys(m.state()[m.WS]).sort(),
+    ['00000001', '00000002', '00000003']);
+  assert.deepEqual(synced, [
+    ['554e2879', '00000001'],
+    ['8c9d6c82', '00000002'],
+    ['2e66e7dc', '00000003'],
+  ]);
+  const first = fs.statSync(m.taskfile, { bigint: true });
+  await m.patrol();
+  const second = fs.statSync(m.taskfile, { bigint: true });
+  assert.equal(m.spawns.length, 3, '改号后复用原会话，不重复启动');
+  assert.equal(second.ino, first.ino, '第二轮维护字节级不动');
+  assert.equal(second.mtimeNs, first.mtimeNs);
+});
+
+test('stable task signature heals state saved before an id rewrite', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const original = makeTask({ id: '554e2879', prompt: '每日补报' });
+  writeTaskFile(m.WS, [original]);
+  await m.patrol();
+  const current = m.state()[m.WS]['00000001'];
+  writeJson(m.deps.paths.statePath, {
+    [m.WS]: {
+      '554e2879': {
+        ...current,
+        taskId: '554e2879',
+        herdrTaskId: '554e2879',
+      },
+    },
+  });
+  await m.patrol();
+  const healed = m.state()[m.WS];
+  assert.ok(Object.hasOwn(healed, '00000001'));
+  assert.ok(!Object.hasOwn(healed, '554e2879'));
+  assert.equal(healed['00000001'].pid, current.pid);
+  assert.equal(m.spawns.length, 1, '崩溃窗口中的旧 state 不应触发换会话');
+});
+
+test('id allocation avoids live state left by a deleted task', async (t) => {
+  const m = await setupMachine(t);
+  const stalePid = 4242;
+  m.alive.add(stalePid);
+  m.bucket['00000001'] = {
+    ws: m.WS,
+    taskId: '00000001',
+    sig: 'deleted-task',
+    pid: stalePid,
+    procStart: `start-${stalePid}`,
+    startedAt: T0,
+    fails: 0,
+  };
+  writeTaskFile(m.WS, [makeTask({ id: '554e2879' })]);
+
+  await m.patrol();
+
+  assert.equal(fileTasks(m)[0].id, '00000002');
+  assert.equal(m.bucket['00000002'].pid, m.spawns[0].rootPid);
+  assert.equal(m.bucket['00000001'], undefined);
+  assert.equal(m.alive.has(stalePid), false, '旧任务会话按删除回收，不接给新任务');
+});
+
+test('an edited task refreshes the signature used for crash recovery', async (t) => {
+  const m = await setupMachine(t);
+  const previous = makeTask({ id: '554e2879', prompt: '修改前' });
+  const current = { ...previous, prompt: '修改后' };
+  const pid = 4242;
+  m.alive.add(pid);
+  m.bucket[previous.id] = {
+    ws: m.WS,
+    taskId: previous.id,
+    sig: taskSig(previous),
+    pid,
+    procStart: `start-${pid}`,
+    startedAt: T0,
+    fails: 0,
+  };
+  writeTaskFile(m.WS, [current]);
+
+  await m.patrol();
+
+  assert.equal(m.bucket['00000001'].sig, taskSig(current));
+});
+
+test('same-round stamping never performs an untracked second id migration', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const original = makeTask({ id: '554e2879' });
+  writeTaskFile(m.WS, [original]);
+  m.claimAt(() => m.spawns[0], 1);
+  const loadTaskDoc = m.deps.loadTaskDoc;
+  let reads = 0;
+  m.deps.loadTaskDoc = (file) => {
+    const doc = loadTaskDoc(file);
+    reads += 1;
+    if (file === m.taskfile && reads === 2) {
+      // 首轮维护读到任务后发生并发写入，首轮因此放弃；轮内补盖仍应只盖印，
+      // 不能趁第二次写文件改号而漏掉 state/pending/Herdr 的同步迁移。
+      writeJson(file, doc);
+    }
+    return doc;
+  };
+
+  await m.patrol();
+  assert.equal(fileTasks(m)[0].id, original.id);
+  assert.ok(m.state()[m.WS][original.id]);
+
+  await m.patrol();
+  assert.equal(fileTasks(m)[0].id, '00000001');
+  assert.equal(m.state()[m.WS]['00000001'].pid, m.spawns[0].rootPid);
+  assert.equal(m.spawns.length, 1);
+});
+
+test('a __proto__ task id is normalized without prototype pollution or duplicate spawns', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   writeTaskFile(m.WS, [makeTask({ id: '__proto__' })]);
   await m.patrol();
   const first = m.state();
-  assert.ok(Object.hasOwn(first[m.WS], '__proto__'));
-  assert.equal(first[m.WS].__proto__.pid, m.spawns[0].rootPid);
+  assert.ok(Object.hasOwn(first[m.WS], '00000001'));
+  assert.ok(!Object.hasOwn(first[m.WS], '__proto__'));
+  assert.equal(first[m.WS]['00000001'].pid, m.spawns[0].rootPid);
   await m.patrol();
-  assert.equal(m.spawns.length, 1, '落盘再读取后仍应复用同一代预热');
-  assert.ok(Object.hasOwn(m.state()[m.WS], '__proto__'));
+  assert.equal(m.spawns.length, 1, '改号落盘再读取后仍应复用同一代预热');
+  assert.ok(Object.hasOwn(m.state()[m.WS], '00000001'));
 });
 
 test('cooldown for one task never blocks the other task', async (t) => {

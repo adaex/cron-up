@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { dispWidth, clip, pad, fmtFireRange, taskView } from '../src/display.mjs';
+import {
+  dispWidth, clip, pad, displayPath, fmtFire, taskView,
+} from '../src/display.mjs';
+import { mockDeps } from '../test-support/helpers.mjs';
 
 test('display width handles cjk and punctuation', () => {
   assert.equal(dispWidth('中文：'), 6);
@@ -14,20 +17,23 @@ test('display width handles cjk and punctuation', () => {
   assert.equal(pad('中文', 6), '中文  ');
 });
 
-test('fmtFireRange renders slot to predicted fire', () => {
-  const mk = (d, h, min, sec = 0) => new Date(2026, 9, d, h, min, sec);
-  // 同日、整分顶格：省略第二个日期。
-  assert.equal(fmtFireRange(mk(2, 0, 0), mk(2, 0, 30)), '10-02 00:00 → 00:30');
-  // 跨天：两段都带日期。
-  assert.equal(fmtFireRange(mk(1, 23, 30), mk(2, 0, 0)),
-    '10-01 23:30 → 10-02 00:00');
-  // 非整分抖动：第二段带秒。
-  assert.equal(fmtFireRange(mk(1, 5, 0), mk(1, 5, 15, 37)),
-    '10-01 05:00 → 05:15:37');
-  // 同分钟（无抖动）：不画箭头。
-  assert.equal(fmtFireRange(mk(1, 5, 0), mk(1, 5, 0)), '10-01 05:00');
-  // fire 缺失：回退落点。
-  assert.equal(fmtFireRange(mk(1, 5, 0), null), '10-01 05:00');
+test('displayPath abbreviates home only on a complete path segment', (t) => {
+  const deps = mockDeps(t);
+  deps.paths = { home: '/Users/aex/' };
+  assert.equal(displayPath('/Users/aex'), '~');
+  assert.equal(displayPath('/Users/aex/space/infra-space'), '~/space/infra-space');
+  assert.equal(displayPath('/Users/aex-other/space'), '/Users/aex-other/space');
+  assert.equal(displayPath('/opt/project'), '/opt/project');
+
+  deps.paths.home = '/';
+  assert.equal(displayPath('/opt/project'), '~/opt/project');
+});
+
+test('fmtFire keeps a single predicted time without dropping seconds', () => {
+  assert.equal(fmtFire(new Date(2026, 9, 2, 5, 15, 37)),
+    '10-02 05:15:37');
+  assert.equal(fmtFire(new Date(2026, 9, 2, 5, 15, 0)),
+    '10-02 05:15');
 });
 
 test('taskView carries a predicted fire time', () => {
@@ -42,8 +48,8 @@ test('taskView carries a predicted fire time', () => {
 
 test('taskView aligns the slot to the pending tail delivery', () => {
   // 落点 15:30 已过、顶格 id 投递 16:00 未到：nxt 对齐今天 15:30（而非
-  // 明天的落点），fire 是今天 16:00——「15:30 → 16:00」箭头画得出，排序
-  // 也把它当最临近的事。
+  // 明天的落点），fire 是今天 16:00——list 显示这次投递，排序也把它当最
+  // 临近的事。
   const now = new Date(2026, 8, 20, 15, 47);
   const v = taskView(
     { id: 'c1363d8b', cron: '30 15 * * *', recurring: true }, now);

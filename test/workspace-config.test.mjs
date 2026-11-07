@@ -3,9 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 
-import { readWorkspaceConfig, configuredModel } from '../src/tasks.mjs';
+import {
+  readWorkspaceConfig, configuredModel, maintainWorkspace,
+} from '../src/tasks.mjs';
 import { WORKSPACE_CONFIG_REL } from '../src/paths.mjs';
-import { mkTmp, writeJson } from '../test-support/helpers.mjs';
+import {
+  mkTmp, writeJson, readJson, writeTaskFile, makeTask,
+} from '../test-support/helpers.mjs';
 
 function setup(t) {
   const ws = path.join(mkTmp(t), 'ws');
@@ -66,6 +70,58 @@ test('invalid model fields reject the whole workspace config', (t) => {
     assert.ok(cfg.error.includes(s.file), JSON.stringify(doc));
     assert.equal(configuredModel(cfg, '00000001'), undefined);
   }
+});
+
+test('task model override follows an automatically minimized task id', (t) => {
+  const s = setup(t);
+  writeJson(s.file, {
+    tasks: { '554e2879': { model: 'sonnet' } },
+    futureField: true,
+  });
+  const taskfile = writeTaskFile(s.ws, [
+    makeTask({ id: '554e2879', cron: '0 5 * * *' }),
+  ]);
+  const r = maintainWorkspace(taskfile);
+  assert.equal(r.minified, 1);
+  assert.equal(r.modelAliases, 1);
+  const cfg = readWorkspaceConfig(s.ws);
+  assert.equal(cfg.error, null);
+  assert.equal(configuredModel(cfg, '00000001'), 'sonnet');
+  assert.equal(configuredModel(cfg, '554e2879'), 'sonnet', '旧键保留为兼容别名');
+  assert.equal(readJson(s.file).futureField, true);
+});
+
+test('automatic id allocation does not reuse a configured key from another task', (t) => {
+  const s = setup(t);
+  writeJson(s.file, {
+    model: 'default-model',
+    tasks: {
+      '00000001': { model: 'old-task-model' },
+      '554e2879': { model: 'sonnet' },
+    },
+  });
+  const taskfile = writeTaskFile(s.ws, [
+    makeTask({ id: '554e2879', cron: '0 5 * * *' }),
+  ]);
+  const r = maintainWorkspace(taskfile);
+  assert.deepEqual(r.idChanges, [{ from: '554e2879', to: '00000002' }]);
+  const cfg = readWorkspaceConfig(s.ws);
+  assert.equal(configuredModel(cfg, '00000002'), 'sonnet');
+  assert.equal(configuredModel(cfg, '00000001'), 'old-task-model',
+    '旧任务留下的配置不能被新任务继承');
+});
+
+test('invalid workspace config postpones id minification instead of losing the override', (t) => {
+  const s = setup(t);
+  writeJson(s.file, { tasks: { '554e2879': { model: false } } });
+  const taskfile = writeTaskFile(s.ws, [
+    makeTask({ id: '554e2879', cron: '0 5 * * *' }),
+  ]);
+  const r = maintainWorkspace(taskfile);
+  assert.equal(r.minified, 0);
+  assert.deepEqual(r.idChanges, []);
+  assert.equal(readJson(taskfile).tasks[0].id, '554e2879');
+  assert.equal(readJson(taskfile).tasks[0].permanent, true, '续期不受改号暂缓影响');
 });
 
 test('malformed JSON is an explicit config error', (t) => {

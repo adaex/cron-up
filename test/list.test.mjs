@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 import { cmdList } from '../src/list.mjs';
-import { dispWidth, fmtMDHM } from '../src/display.mjs';
+import { maintainWorkspace } from '../src/tasks.mjs';
+import { dispWidth, fmtMDHM, fmtFire } from '../src/display.mjs';
 import {
   mkTmp, mockDeps, tmpPaths, writeJson,
   writeTaskFile, makeTask, sessionDetail, scanFrom,
@@ -119,15 +120,17 @@ test('valid cron that never fires reads as such', async (t) => {
   assert.ok(out.includes('一年内无'));
 });
 
-test('each task gets its own row under the full workspace path', async (t) => {
+test('each task gets its own row under a home-relative workspace path', async (t) => {
   const s = await setup(t);
+  s.deps.paths.home = path.dirname(s.WS);
   const out = await s.render([
     makeTask({ id: '00000001', cron: '5 0 * * *',
       prompt: '群人数每日定时任务：执行某脚本\n第二行细节不出现' }),
     makeTask({ id: '00000002', cron: '0 10 * * 0', prompt: '  周报任务：\n   做一些事' }),
   ]);
   assert.ok(out.includes('共 1 个工作区、2 个定时任务'));
-  assert.ok(out.includes(s.WS), '块首是完整工作区路径');
+  assert.ok(out.includes('~/ws'), '块首用 ~ 缩写家目录');
+  assert.ok(!out.includes(s.WS), '展示输出不再重复完整家目录');
   assert.ok(out.includes('群人数每日定时任务：执行某脚本'));
   assert.ok(out.includes('周报任务：'));
   assert.ok(!out.includes('第二行细节不出现'));
@@ -167,14 +170,46 @@ test('permanent recurring is labeled', async (t) => {
   assert.ok(out.includes('普通周期'));
 });
 
-test('status shows slot to predicted-fire range for jittered tasks', async (t) => {
+test('status shows only the predicted delivery time for a jittered task', async (t) => {
   const s = await setup(t);
   s.deps.terminalWidth = () => 120;
-  // id 哈希顶格：每日 13:00 的任务预计 13:30 才投递。
+  // 尚未经过巡检改号时也不展示双时间区间，只显示预计的 13:30。
   const out = await s.render([
     makeTask({ id: 'c1363d8b', cron: '0 13 * * *', prompt: 'Trae 成本刷新' }),
   ]);
-  assert.ok(out.includes('→ 13:30'), out);
+  assert.ok(out.includes('13:30'), out);
+  assert.ok(!out.includes('→'), out);
+});
+
+test('status retains nonzero seconds in the single predicted time', async (t) => {
+  const s = await setup(t);
+  const slot = new Date(Date.now() + 60 * 86400_000);
+  slot.setMinutes(30, 0, 0);
+  const cron = `${slot.getMinutes()} ${slot.getHours()} ${slot.getDate()} `
+    + `${slot.getMonth() + 1} *`;
+  const out = await s.render([makeTask({
+    id: '80000000', cron, recurring: false, createdAt: Date.now(),
+  })]);
+  assert.ok(out.includes(fmtFire(new Date(slot.getTime() - 45_000))), out);
+  assert.ok(!out.includes('→'), out);
+});
+
+test('maintained daily and weekly tasks show one time without a jitter arrow', async (t) => {
+  const s = await setup(t);
+  const taskfile = writeTaskFile(s.WS, [
+    makeTask({ id: '554e2879', cron: '0 5 * * *', prompt: '每日补报' }),
+    makeTask({ id: '8c9d6c82', cron: '0 11 * * 2', prompt: '每周成本' }),
+    makeTask({ id: '2e66e7dc', cron: '7 20 * * 4', prompt: '双周周报' }),
+  ]);
+  const maintained = maintainWorkspace(taskfile);
+  assert.equal(maintained.minified, 3);
+  s.lines.length = 0;
+  await cmdList({ config: s.cfgPath });
+  const out = s.lines.join('\n');
+  assert.ok(!out.includes('→'), out);
+  assert.ok(out.includes('05:00'), out);
+  assert.ok(out.includes('11:00'), out);
+  assert.ok(out.includes('20:07'), out);
 });
 
 test('model tags show workspace defaults and per-task overrides', async (t) => {

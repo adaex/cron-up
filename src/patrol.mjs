@@ -1,5 +1,5 @@
-// 一轮巡检：发现工作区 → 自动维护任务文件（续期/盖印）→ 保证每个
-// 「创建者会话已死且处于预热窗口」的任务都有一个只属于它的健康会话。
+// 一轮巡检：发现工作区 → 自动维护任务文件（续期/周期任务 id 改小/盖印）→
+// 保证每个「创建者会话已死且处于预热窗口」的任务都有一个只属于它的健康会话。
 // 这是 launchd 的入口（每 N 秒被拉起一次，跑完即退）。本轮新拉起的会话
 // 在所有工作区决策完后轮内等待登记（至多 WARMUP_WAIT_MS），认亲同一轮
 // 补盖归属印；等不到的留给跨轮宽限，绝不当轮判死。状态机还覆盖：卡死
@@ -44,6 +44,7 @@ import {
   taskFileExists,
   groupTasksByKey,
   taskOwnedBy,
+  taskSig,
   readWorkspaceConfig,
   configuredModel,
 } from './tasks.mjs';
@@ -310,6 +311,19 @@ function enterCooldown(ent, ws, key, fails, cur, stats) {
     + `${fails} 次，暂停重试 ${COOLDOWN_SECONDS / 60} 分钟`);
 }
 
+// 改号与崩溃恢复共用同一份 state 搬移。herdrTaskId 只在终端仍使用旧标签时
+// 保留；已经与新 taskId 一致就删除冗余字段，读取方会回退到 taskId。
+function moveTaskEntry(bucket, from, to) {
+  const ent = getOwn(bucket, from);
+  if (!ent || getOwn(bucket, to)) return null;
+  const herdrTaskId = ent.herdrTaskId ?? from;
+  const moved = setOwn(bucket, to, { ...ent, taskId: to });
+  if (herdrTaskId === to) delete moved.herdrTaskId;
+  else moved.herdrTaskId = herdrTaskId;
+  delete bucket[from];
+  return moved;
+}
+
 // 保证一个工作区里每个死主窗口任务都有专属预热，并完成本文件的续期/盖印
 // 维护。bucket 是 state[ws]（原地修改）。返回 pending：本轮新启动或认领、
 // 尚未认亲的 {ws,key,pid,prompt} 列表，cmdRun 据此轮内等待登记并补盖印。
@@ -351,6 +365,16 @@ export function patrolWorkspace(
     return true;
   };
 
+  // 只给活终端同步标签；死条目随后会被清理或由新会话替换，无需访问 Herdr。
+  const syncTaskLabel = (ent) => {
+    if ((ent.herdrTaskId ?? ent.taskId) === ent.taskId) return;
+    const detail = deps.syncHerdrTaskId(ent);
+    if (detail) {
+      note('warn', `Herdr 任务标签同步失败 ${ws} 任务 ${ent.taskId}：${detail}；`
+        + '仍按最后确认的旧标签管理会话，后续巡检会重试');
+    }
+  };
+
   if (tasks.length === 0) {
     // 文件完好但任务清空：一次性任务触发后被删、周期任务过期、或用户手
     // 删。我们为这些任务拉起的会话没理由继续留着；detached（用户 resume
@@ -376,6 +400,24 @@ export function patrolWorkspace(
   // 会话都无法唯一对应到条目：跳过这些组并告警，maintainWorkspace 也只
   // 处理单元素组。组的键集合同时就是后面的 currentKeys。
   const taskGroups = groupTasksByKey(tasks);
+
+  // id 已在上一轮写盘、state 却未及落盘时，用稳定内容签名认回唯一任务。
+  // herdrTaskId 保留终端最后确认的旧标签，后面的标签同步与停止前核验才能
+  // 覆盖「文件新 id、state 旧 id」的崩溃窗口。候选不唯一时不动，宁可告警。
+  const sigToKeys = new Map();
+  for (const [key, group] of taskGroups) {
+    if (group.length !== 1) continue;
+    const sig = taskSig(group[0]);
+    const keys = sigToKeys.get(sig) ?? [];
+    keys.push(key);
+    sigToKeys.set(sig, keys);
+  }
+  for (const [key, ent] of Object.entries({ ...bucket })) {
+    if (taskGroups.has(key) || !ent.sig) continue;
+    const candidates = sigToKeys.get(ent.sig) ?? [];
+    if (candidates.length !== 1) continue;
+    moveTaskEntry(bucket, key, candidates[0]);
+  }
   for (const [key, group] of taskGroups) {
     if (group.length < 2) continue;
     note('warn', `任务键重复 ${ws}：${key} 对应 ${group.length} 条任务，`
@@ -388,7 +430,10 @@ export function patrolWorkspace(
   for (const ent of Object.values(bucket)) {
     const group = taskGroups.get(ent.taskId);
     const prompt = group?.length === 1 ? group[0].prompt : undefined;
-    if (deps.trackedAlive(ent)) claimEntry(ent, details, ws, prompt);
+    if (deps.trackedAlive(ent)) {
+      claimEntry(ent, details, ws, prompt);
+      syncTaskLabel(ent);
+    }
   }
 
   // 第二步：逐任务决策。stamps 收本轮要盖的归属印（taskKey → 预热身份），
@@ -398,12 +443,14 @@ export function patrolWorkspace(
   for (const [key, group] of taskGroups) {
     if (group.length !== 1) continue;
     const t = group[0];
+    const sig = taskSig(t);
     const wanted = taskWanted(t, now, leadMs);
     // 只在进入窗口的那一轮解释无需新启动的原因；持续处于窗口的高频任务
     // 不能每 5 分钟重复刷同一条跳过日志。
     const enteredWindow = wanted && (previousNow === null
       || !taskWanted(t, previousNow, leadMs));
     let ent = getOwn(bucket, key) ?? null;
+    if (ent) ent.sig = sig;
     const ownerIsOurs = entryClaimed(ent)
       && typeof t.createdBySessionId === 'string'
       && t.createdBySessionId === ent.sessionId;
@@ -551,6 +598,7 @@ export function patrolWorkspace(
         ...ent,
         ws,
         taskId: key,
+        sig,
         pid: null,
         fails,
       });
@@ -568,7 +616,7 @@ export function patrolWorkspace(
       const newFails = fails + 1;
       if (newFails >= FAIL_LIMIT) {
         const next = setOwn(bucket, key, {
-          ws, taskId: key, pid: null, fails: newFails,
+          ws, taskId: key, sig, pid: null, fails: newFails,
         });
         enterCooldown(next, ws, key, newFails, cur, stats);
         continue;
@@ -576,6 +624,7 @@ export function patrolWorkspace(
       setOwn(bucket, key, {
         ws,
         taskId: key,
+        sig,
         pid: null,
         startedAt: cur,
         fails: newFails,
@@ -587,6 +636,7 @@ export function patrolWorkspace(
     setOwn(bucket, key, {
       ws,
       taskId: key,
+      sig,
       pid: spawned.pid,
       startedAt: cur,
       procStart: spawned.procStart,
@@ -604,16 +654,20 @@ export function patrolWorkspace(
     pending.push({ ws, key, pid: spawned.pid, prompt: t.prompt });
   }
 
-  // 第三步：任务文件维护（续期 + 盖印）合并为一次带 mtime 乐观检测的原子写。
-  // 撞车（Claude Code 刚写了 lastFiredAt/删了任务）放弃本轮老条目维护，但已
-  // spawn 的会话仍返回给 cmdRun 等待认亲，盖印收尾会再写一次。
+  // 第三步：任务文件维护（续期 + 周期任务 id 改小 + 盖印）合并为一次带
+  // mtime 乐观检测的原子写。撞车（Claude Code 刚写了 lastFiredAt/删了任务）
+  // 放弃本轮老条目维护，但已 spawn 的会话仍返回给 cmdRun 等待认亲，盖印收尾
+  // 会再写一次。
   let result;
   try {
-    result = maintainWorkspace(taskfile, { reown: stamps });
+    result = maintainWorkspace(taskfile, {
+      reown: stamps,
+      reservedIds: Object.keys(bucket),
+    });
   } catch (e) {
     if (e instanceof TaskFileChanged) {
-      note('warn', `维护暂缓 ${ws}：任务文件刚被 Claude Code 改动，本轮不覆盖，`
-        + '稍后重试');
+      note('warn', `维护暂缓 ${ws}：任务或模型配置文件刚被其他写者改动，`
+        + '本轮不覆盖，稍后重试');
       return pending;
     }
     throw e;
@@ -625,13 +679,36 @@ export function patrolWorkspace(
     deps.log(`已续期 ${ws}：${result.renewed} 个周期任务标记为 permanent，`
       + '不再受 7 天过期限制');
   }
+  if (result.minified) {
+    deps.log(`已改小 id ${ws}：${result.minified} 个周期任务改用文件内空出的`
+      + '小号，消除按 id 计算的投递延迟');
+  }
+  if (result.modelAliases) {
+    deps.log(`已同步模型配置 ${ws}：为 ${result.modelAliases} 个改号任务保留`
+      + '新 id 的同值配置键');
+  }
+
+  // 改号成功后同步迁移 state 和 pending；pending 不改会让轮内等待按旧键找
+  // 不到条目。Herdr 标签也尽快同步，失败时 herdrTaskId 仍保留旧标签供安全
+  // 停止，后续轮次重试。sig 不随 id 变化，可认回此落盘窗口中的旧 state。
+  const renamed = new Map(result.idChanges.map((c) => [c.from, c.to]));
+  for (const { from, to } of result.idChanges) {
+    const moved = moveTaskEntry(bucket, from, to);
+    if (!moved) continue;
+    for (const p of pending) {
+      if (p.key === from && p.pid === moved.pid) p.key = to;
+    }
+    if (deps.trackedAlive(moved)) syncTaskLabel(moved);
+  }
   if (result.reowned) noteReowned(ws, result, stats);
 
-  // 第四步：任务消失的条目回收。续期与盖印都不改任务键，分组视图的键集合
-  // 仍是准确的 currentKeys。冷却中的条目也删——任务没了，冷却没有意义；
-  // 停止失败则保留可跟踪条目，下轮继续尝试，绝不错删后遗留活会话。
+  // 第四步：任务消失的条目回收。currentKeys 必须应用同一组 id 映射，否则
+  // 刚改号的任务会被误删。冷却中的条目也删——任务没了，冷却没有意义；停止
+  // 失败则保留可跟踪条目，下轮继续尝试，绝不错删后遗留活会话。
+  const currentKeys = new Set();
+  for (const key of taskGroups.keys()) currentKeys.add(renamed.get(key) ?? key);
   for (const [key, ent] of Object.entries({ ...bucket })) {
-    if (taskGroups.has(key)) continue;
+    if (currentKeys.has(key)) continue;
     if (deps.trackedAlive(ent)) {
       const stopped = stopEntry(ent, key, 'recycle',
         `回收 ${ws} 任务 ${key} pid=${ent.pid}：对应任务已删除，结束预热会话`);
@@ -710,7 +787,11 @@ function stampClaimed(claimedByWs, taskfiles, stats) {
     }
     if (stamps.size === 0) continue;
     try {
-      const result = maintainWorkspace(taskfiles.get(ws), { reown: stamps });
+      const result = maintainWorkspace(taskfiles.get(ws), {
+        reown: stamps,
+        // 首轮维护已同步改号后的全部身份；这里若再次改号将无人迁移。
+        minify: false,
+      });
       if (result?.reowned) noteReowned(ws, result, stats);
     } catch (e) {
       if (e instanceof TaskFileChanged) {

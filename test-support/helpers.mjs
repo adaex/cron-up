@@ -27,6 +27,10 @@ export function mockDeps(t) {
   deps.getHerdrTerminal = () => null;
   deps.listHerdrTerminals = () => [];
   deps.findHerdrOrphan = () => null;
+  deps.syncHerdrTaskId = (ent) => {
+    delete ent.herdrTaskId;
+    return null;
+  };
   deps.sessionIdleSeconds = (ent, cur) =>
     Math.max(0, cur - (ent.herdrActivityAt ?? ent.startedAt ?? cur));
   t.after(() => {

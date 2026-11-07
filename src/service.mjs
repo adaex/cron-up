@@ -333,8 +333,8 @@ export async function cmdInstall(args) {
     // 与 README「安全与自动修改」同一口径，在配置落定时再提示一次。
     deps.print(`提示：未指定 --roots，默认扫描 ${DEFAULT_CONFIG.roots.join('、')}`
       + '（不存在的目录跳过）；今后 clone 进这些容器的仓库也会进入巡检，'
-      + '其中的周期任务会被自动续期永久化，任务、CLAUDE.md 与项目配置都会'
-      + '影响无人值守会话。目录布局不同或需收窄时用 --roots 指定'
+      + '其中的周期任务会被自动续期永久化并改小 ID，任务、CLAUDE.md 与项目配置'
+      + '都会影响无人值守会话。目录布局不同或需收窄时用 --roots 指定'
       + '（见 README「安全与自动修改」）');
   }
 

@@ -251,9 +251,9 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
         procStart: 'Mon Jan 1 00:00:00 2026',
         claudeProcStart: 'Tue Jan 2 00:00:00 2026',
         notified: true, deadSince: 55,
-        herdr: 't7', herdrTitleAttempted: true,
+        herdr: 't7', herdrTaskId: '554e2879', herdrTitleAttempted: true,
         herdrActivity: 'hash',
-        herdrActivityAt: '99',
+        herdrActivityAt: '99', sig: 'stable-task-signature',
       },
     },
     '/b': {
@@ -262,7 +262,7 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
       '00000003': {
         pid: -5, claudePid: 'abc', startedAt: true, fails: 1.7,
         sessionId: '', procStart: '', notified: 'yes',
-        herdr: '', herdrTitleAttempted: 9,
+        herdr: '', herdrTaskId: [], sig: '', herdrTitleAttempted: 9,
         herdrActivity: [], herdrActivityAt: 'bad',
       },
     },
@@ -279,6 +279,8 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
   assert.equal(a.deadSince, 55);
   assert.equal(a.notified, true);
   assert.equal(a.herdr, 't7');
+  assert.equal(a.herdrTaskId, '554e2879');
+  assert.equal(a.sig, 'stable-task-signature');
   assert.equal(a.herdrTitleAttempted, true);
   assert.equal(a.herdrActivity, 'hash');
   assert.equal(a.herdrActivityAt, 99);
@@ -293,6 +295,8 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
   assert.equal('procStart' in b, false);
   assert.equal('notified' in b, false);
   assert.equal('herdr' in b, false);
+  assert.equal('herdrTaskId' in b, false);
+  assert.equal('sig' in b, false);
   assert.equal('herdrTitleAttempted' in b, false);
   assert.equal('herdrActivity' in b, false);
   assert.equal('herdrActivityAt' in b, false);
