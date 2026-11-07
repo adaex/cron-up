@@ -152,7 +152,9 @@ test('Herdr selector accepts an absolute workspace and reports ambiguous candida
     seen = { file, args };
     return { status: 0 };
   };
-  cmdLogs({ workspace: 't8' });
+  // 用只存在于标题的片段验证唯一匹配；短地址可能出现在随机临时目录的
+  // 共同 cwd 中，反而再次命中两个候选。
+  cmdLogs({ workspace: '乙' });
   assert.deepEqual(seen.args, ['read', '--lines', '100', 't8']);
 });
 
