@@ -155,6 +155,7 @@ test('service script and launcherHealth agree on shell-special PATH dirs', (t) =
   const bin = path.join(tmp, "bin with ' \" $");
   fakeExecutable(path.join(bin, 'node'));
   fakeExecutable(path.join(bin, 'cron-up'));
+  fakeExecutable(path.join(bin, 'hc'));
   const script = writeServiceScript({ pathDirs: [bin] });
   fs.writeFileSync(deps.paths.plistPath, renderPlist(script));
   assert.equal(launcherHealth(), null);
@@ -168,13 +169,11 @@ test('launcherHealth resolves PATH-form script against stable bins', (t) => {
   const bin = path.join(tmp, 'stable-bin');
   fs.mkdirSync(bin, { recursive: true });
   const writeScript = () => {
-    const script = deps.paths.serviceScriptPath;
-    fs.writeFileSync(script,
-      `#!/bin/bash\nexport PATH="${bin}":"$PATH"\nexec cron-up run\n`);
+    const script = writeServiceScript({ pathDirs: [bin] });
     fs.writeFileSync(deps.paths.plistPath, renderPlist(script));
   };
-  // bin 里 cron-up 与 node 都在：健康。
-  for (const name of ['cron-up', 'node']) {
+  // bin 里 cron-up、node 与 hc 都在：健康。
+  for (const name of ['cron-up', 'node', 'hc']) {
     fs.writeFileSync(path.join(bin, name), '');
     fs.chmodSync(path.join(bin, name), 0o755);
   }
@@ -187,6 +186,9 @@ test('launcherHealth resolves PATH-form script against stable bins', (t) => {
   fs.chmodSync(path.join(bin, 'cron-up'), 0o755);
   fs.rmSync(path.join(bin, 'node'));
   assert.ok(launcherHealth()?.includes('找不到 node'));
+  fakeExecutable(path.join(bin, 'node'));
+  fs.rmSync(path.join(bin, 'hc'));
+  assert.ok(launcherHealth()?.includes('找不到 hc'));
 });
 
 test('renderPlist points ProgramArguments at the service script only', (t) => {
@@ -260,6 +262,9 @@ async function setupInstall(t) {
   const launchBin = path.join(tmp, 'launch-bin');
   fakeExecutable(path.join(launchBin, 'node'));
   fakeExecutable(path.join(launchBin, 'cron-up'));
+  const herdrBin = path.join(tmp, 'herdr-bin');
+  fakeExecutable(path.join(herdrBin, 'hc'));
+  deps.findHerdr = () => path.join(herdrBin, 'hc');
   deps.resolveLauncher = () => ({ pathDirs: [launchBin] });
   const launchCalls = [];
   deps.launchctl = (...a) => {
@@ -303,6 +308,17 @@ test('install writes roots-only config, plist, bootstraps and runs first patrol'
   assert.equal(LABEL, 'local.cron-up');
 });
 
+test('install adds the resolved Herdr bin directory to the launchd PATH', async (t) => {
+  const s = await setupInstall(t);
+  const herdrBin = path.join(s.tmp, 'custom-herdr-bin');
+  fakeExecutable(path.join(herdrBin, 'hc'));
+  s.deps.findHerdr = () => path.join(herdrBin, 'hc');
+  await s.install();
+  const script = fs.readFileSync(s.deps.paths.serviceScriptPath, 'utf-8');
+  assert.ok(script.includes(herdrBin));
+  assert.ok(script.includes(s.launchBin));
+});
+
 test('first patrol message matches what actually happened', async (t) => {
   const s = await setupInstall(t);
   s.setPatrolResult(true);
@@ -312,6 +328,15 @@ test('first patrol message matches what actually happened', async (t) => {
   s2.setPatrolResult(false);
   await s2.install();
   assert.ok(s2.lines.some((l) => l.includes('首轮巡检暂未执行')));
+});
+
+test('install requires Herdr before writing config or loading launchd', async (t) => {
+  const s = await setupInstall(t);
+  s.deps.findHerdr = () => null;
+  await assert.rejects(s.install(), (e) => e instanceof ExitError
+    && e.code === 2 && e.message.includes('Herdr'));
+  assert.equal(fs.existsSync(s.deps.paths.configPath), false);
+  assert.equal(s.launchCalls.length, 0);
 });
 
 test('install rejects --config instead of silently ignoring it', async (t) => {
@@ -367,7 +392,7 @@ test('explicit --roots overrides the existing config', async (t) => {
   assert.deepEqual(s.cfg().roots, [s.tmp]);
 });
 
-test('obsolete config keys are purged on reinstall', async (t) => {
+test('unknown config keys are purged on reinstall', async (t) => {
   const s = await setupInstall(t);
   writeJson(s.deps.paths.configPath, {
     roots: [s.tmp],
@@ -461,13 +486,12 @@ async function setupUninstall(t) {
     lockReleased += 1;
   };
   const stopped = [];
-  deps.stopSession = async (ent) => {
+  deps.stopSession = (ent) => {
     stopped.push(ent.pid);
     return true;
   };
   deps.trackedAlive = (ent) => Boolean(ent.pid);
   deps.procStartedAt = (pid) => `start-${pid}`;
-  deps.listScriptProcesses = () => [];
   const lines = [];
   deps.print = (m) => lines.push(m);
   deps.printErr = (m) => lines.push(`ERR:${m}`);
@@ -489,42 +513,31 @@ test('uninstall rejects --config instead of silently ignoring it', async (t) => 
   assert.deepEqual(s.stopped, []);
 });
 
-test('nested-state task warmups are stopped by default', async (t) => {
+test('uninstall stops Herdr terminals without consulting state', async (t) => {
   const s = await setupUninstall(t);
   writeJson(s.deps.paths.statePath, {
-    '/x': { '00000001': { pid: 11 }, '00000002': { pid: 12 } },
-    '/y': { '00000003': { pid: 22 } },
+    '/state-only': { '00000001': { pid: 11 } },
   });
-  await s.uninstall();
-  assert.deepEqual(s.stopped.sort(), [11, 12, 22]);
-  assert.equal(s.lockReleased(), 1);
-  assert.ok(s.lines.some((l) => l.includes('正在结束预热会话')));
-});
-
-test('legacy flat-state warmups are stopped too', async (t) => {
-  const s = await setupUninstall(t);
-  writeJson(s.deps.paths.statePath, {
-    '/x': { pid: 33, startedAt: 1 },
-    '/y': { pid: 44, startedAt: 1 },
-  });
-  await s.uninstall();
-  assert.deepEqual(s.stopped.sort(), [33, 44]);
-});
-
-test('orphan script sessions outside state are swept on uninstall', async (t) => {
-  const s = await setupUninstall(t);
-  const logDir = s.deps.paths.sessionLogDir;
-  s.deps.listScriptProcesses = () => [
-    // 新命名（任务级）与旧命名（目录级）的本工具孤儿都停。
-    [31, `/usr/bin/script -q ${logDir}/a_b--00000001.log /bin/zsh -lic x`],
-    [34, `/usr/bin/script -q ${logDir}/a_b.log /bin/zsh -lic x`],
-    // 别人的 script 会话：日志不在本工具目录、形态不同，都不动。
-    [32, '/usr/bin/script -q /other/place.log /bin/zsh -lic x'],
-    [33, '/usr/bin/script -q /somewhere /bin/bash -ic x'],
+  s.deps.listHerdrTerminals = () => [
+    { address: 't7', pid: 35, cwd: '/x', taskId: '00000001', state: 'live' },
+    { address: 't8', pid: 36, cwd: '/y', taskId: '00000002', state: 'live' },
   ];
   await s.uninstall();
-  assert.deepEqual(s.stopped.sort(), [31, 34]);
-  assert.ok(s.lines.some((l) => l.includes('state 已丢失')));
+  assert.deepEqual(s.stopped.sort(), [35, 36]);
+  assert.equal(s.lockReleased(), 1);
+  assert.ok(s.lines.some((l) => l.includes('Herdr t7')));
+  assert.ok(s.lines.some((l) => l.includes('Herdr t8')));
+});
+
+test('uninstall aborts destructive cleanup when the Herdr orphan scan fails', async (t) => {
+  const s = await setupUninstall(t);
+  fs.writeFileSync(s.deps.paths.plistPath, '<plist/>');
+  s.deps.listHerdrTerminals = () => { throw new ExitError(1, 'hc ls timed out'); };
+  await assert.rejects(s.uninstall({ purge: true }), /hc ls timed out/);
+  assert.equal(fs.existsSync(s.deps.paths.plistPath), true);
+  assert.equal(fs.existsSync(s.deps.paths.dataDir), true);
+  assert.equal(fs.existsSync(s.deps.paths.logDir), true);
+  assert.equal(s.lockReleased(), 1);
 });
 
 test('uninstall refuses to race an active patrol and releases no untaken lock', async (t) => {
@@ -615,18 +628,18 @@ test('successful bootout that still leaves a loaded service aborts cleanup', asy
 
 test('a live warmup that cannot be stopped safely aborts destructive cleanup', async (t) => {
   const s = await setupUninstall(t);
-  writeJson(s.deps.paths.statePath, {
-    '/x': { '00000001': { pid: 11 } },
-  });
+  s.deps.listHerdrTerminals = () => [{
+    address: 't7', pid: 11, cwd: '/x', taskId: '00000001', state: 'live',
+  }];
   fs.writeFileSync(s.deps.paths.plistPath, '<plist/>');
   const keepLog = path.join(s.deps.paths.logDir, 'keep.log');
   fs.writeFileSync(keepLog, 'keep');
-  s.deps.stopSession = async () => false;
+  s.deps.stopSession = () => false;
   await assert.rejects(s.uninstall({ purge: true }),
     (e) => e instanceof ExitError && e.code === 1);
   assert.ok(s.lines.some((l) => l.includes('无法安全停止')));
   assert.equal(fs.existsSync(s.deps.paths.plistPath), true);
-  assert.equal(fs.existsSync(s.deps.paths.statePath), true);
+  assert.equal(fs.existsSync(s.deps.paths.dataDir), true);
   assert.equal(fs.existsSync(keepLog), true);
   assert.equal(s.lockReleased(), 1);
 });

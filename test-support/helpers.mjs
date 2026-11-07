@@ -21,6 +21,14 @@ export function mkTmp(t) {
 export function mockDeps(t) {
   const snapshot = {};
   for (const k of Object.keys(deps)) snapshot[k] = deps[k];
+  // 默认使用隔离的 Herdr 替身，避免宿主机终端影响单元测试；专项用例再
+  // 替换 execFile 或这些业务依赖。活动时间在状态机测试中直接由字段计算。
+  deps.findHerdr = () => '/mock/hc';
+  deps.getHerdrTerminal = () => null;
+  deps.listHerdrTerminals = () => [];
+  deps.findHerdrOrphan = () => null;
+  deps.sessionIdleSeconds = (ent, cur) =>
+    Math.max(0, cur - (ent.herdrActivityAt ?? ent.startedAt ?? cur));
   t.after(() => {
     for (const k of Object.keys(deps)) delete deps[k];
     Object.assign(deps, snapshot);
@@ -87,7 +95,7 @@ export function cronAt(offsetSec, base = new Date()) {
 
 // ---- 会话登记夹具 ----
 
-// 构造一条会话登记详情（scanSessions 第三元素的成员形状）。
+// 构造一条会话登记详情（scanSessions 第二元素的成员形状）。
 export function sessionDetail(over = {}) {
   return {
     pid: over.pid ?? 100,
@@ -97,8 +105,7 @@ export function sessionDetail(over = {}) {
   };
 }
 
-// 给定 details 构造 scanSessions 的三元组（consumers 按 details 的键集
-// 合）；告警位置传 null。
+// 给定 details 构造 scanSessions 的二元组；告警位置传 null。
 export function scanFrom(details = new Map()) {
-  return [new Set(details.keys()), null, details];
+  return [null, details];
 }

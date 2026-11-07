@@ -52,7 +52,7 @@ export async function cmdList(args) {
   let total = 0;
   let filesSeen = 0;
   let unreadable = 0;
-  const [, , details] = await deps.scanSessions();
+  const [, details] = await deps.scanSessions({ ancestors: false });
   const state = loadState();
   for (const [ws] of deps.discover(cfg.roots)) {
     filesSeen += 1;

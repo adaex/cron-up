@@ -73,8 +73,8 @@ export function configFieldErrors(cfg) {
 // opts.missingOk：缺失文件把异常抛给调用方（总览页把「缺失」当页面内容的
 // 一部分）；opts.corruptOk：损坏 JSON/顶层不是对象/roots 类型错抛普通错
 // 误而非 exit（总览页把它们当页面内容展示）。launchd 的 run 入口两个都不
-// 要——它该死成一行原因而不是 traceback。配置里的其余键（旧版本留下的
-// intervalSeconds 等）一律忽略：行为已全部常量化，install 重写时纯化。
+// 要——它该死成一行原因而不是 traceback。配置里的其余键一律忽略：行为已
+// 全部常量化，install 重写时只保留 roots。
 export function loadConfig(file, opts = {}) {
   const fail = (message) => {
     if (opts.corruptOk) throw new Error(message);
@@ -109,57 +109,33 @@ export function loadConfig(file, opts = {}) {
 
 // ---- state.json：两级嵌套 {ws: {taskId: entry}} ----
 //
-// entry 字段：pid/procStart（script 层指纹）、claudePid/sessionId/
+// entry 字段：pid/procStart（根进程指纹）、claudePid/sessionId/
 // claudeProcStart（认亲后回填）、startedAt、fails、cooldownUntil、
-// deadSince、log、notified。pid 为 null 的条目是「当场没拉起/冷却中」的
-// 合法形态；未认亲时 claude* 三字段缺省。
-
-// 旧版顶层标记字段只用于识别「值仍是标量的扁平 entry」，不能单独拿键名
-// 判代：手工任务 id 也可以叫 pid/startedAt。新桶的自有值里会有任务 entry
-// 对象，旧扁平 entry 的字段值则是标量或 null，先看这个值结构再分代。
-const LEGACY_MARKERS = ['pid', 'startedAt', 'cooldownUntil', 'fails'];
-
+// deadSince、notified、herdr（终端地址）、herdrTitleAttempted（是否已尝试
+// 设置标题）、herdrActivity（界面摘要）与 herdrActivityAt。pid 为 null 的
+// 条目是「当场没拉起/冷却中」的合法形态；未认亲时 claude* 三字段缺省。
 function cleanEntry(raw, ws, taskId) {
   if (!isPlainObject(raw)) return null;
-  const ent = { ...raw };
-  ent.pid = parsePid(ent.pid);
-  if (ent.claudePid !== undefined) {
-    const claudePid = parsePid(ent.claudePid);
-    if (claudePid === null) delete ent.claudePid;
-    else ent.claudePid = claudePid;
-  }
+  const ent = { ws, taskId, pid: parsePid(raw.pid) };
+  const claudePid = parsePid(raw.claudePid);
+  if (claudePid !== null) ent.claudePid = claudePid;
   for (const k of ['startedAt', 'cooldownUntil', 'fails', 'deadSince',
-    'observedFiredAt']) {
-    if (ent[k] !== null && ent[k] !== undefined) {
-      try {
-        ent[k] = lenientInt(ent[k]);
-      } catch {
-        delete ent[k];
-      }
+    'herdrActivityAt']) {
+    if (raw[k] === null || raw[k] === undefined) continue;
+    try {
+      ent[k] = lenientInt(raw[k]);
+    } catch {
+      // 损坏字段按缺省处理。
     }
   }
-  // 身份字符串：存在就必须是非空字符串，否则删掉（ws/taskId 随即用键补
-  // 回）。
-  for (const k of ['ws', 'taskId', 'sessionId', 'log', 'procStart',
-    'claudeProcStart']) {
-    if (ent[k] !== undefined
-        && (typeof ent[k] !== 'string' || ent[k] === '')) {
-      delete ent[k];
-    }
+  for (const k of ['sessionId', 'procStart', 'claudeProcStart',
+    'herdr', 'herdrActivity']) {
+    if (typeof raw[k] === 'string' && raw[k] !== '') ent[k] = raw[k];
   }
-  if (typeof ent.notified !== 'boolean') delete ent.notified;
-  ent.ws = ws;
-  ent.taskId = taskId;
+  for (const k of ['notified', 'herdrTitleAttempted']) {
+    if (typeof raw[k] === 'boolean') ent[k] = raw[k];
+  }
   return ent;
-}
-
-function hasNestedEntries(v) {
-  return isPlainObject(v) && Object.values(v).some(isPlainObject);
-}
-
-function looksLegacyEntry(v) {
-  return isPlainObject(v) && !hasNestedEntries(v)
-    && LEGACY_MARKERS.some((k) => Object.hasOwn(v, k));
 }
 
 export function loadState() {
@@ -172,8 +148,7 @@ export function loadState() {
   if (!isPlainObject(state)) return {};
   const out = {};
   for (const [ws, bucket] of Object.entries(state)) {
-    // 旧版顶层 entry 不是桶：跳过（由 loadLegacyEntries 收口处理）。
-    if (!isPlainObject(bucket) || looksLegacyEntry(bucket)) continue;
+    if (!isPlainObject(bucket)) continue;
     const cleanBucket = {};
     for (const [taskId, raw] of Object.entries(bucket)) {
       const ent = cleanEntry(raw, ws, taskId);
@@ -184,32 +159,8 @@ export function loadState() {
   return out;
 }
 
-// 旧版扁平 state（{ws: 目录级单 entry}）：升级轮用它停掉旧预热后整体丢
-// 弃，不迁移任务归属（新流程按任务重拉）。与 loadState 读同一个文件，
-// 两个读取器按值结构与标记字段互斥，互不污染。
-export function loadLegacyEntries() {
-  let state;
-  try {
-    state = JSON.parse(fs.readFileSync(deps.paths.statePath, 'utf-8'));
-  } catch {
-    return [];
-  }
-  if (!isPlainObject(state)) return [];
-  const out = [];
-  for (const [ws, raw] of Object.entries(state)) {
-    if (!looksLegacyEntry(raw)) continue;
-    const ent = cleanEntry(raw, ws, null);
-    if (ent) {
-      delete ent.taskId; // 旧 entry 没有任务身份
-      out.push(ent);
-    }
-  }
-  return out;
-}
-
 // state 含工作区路径与 pid，目录按 ensurePrivateDir 收紧；文件以 0600 原
-// 子替换——state 每轮都写、config 每次 install 都写，老版本留下的宽松权
-// 限会自动跟进。
+// 子替换；已有文件的宽松权限也会随之收回。
 function atomicSave(file, doc) {
   ensurePrivateDir(path.dirname(file));
   const tmp = `${file}.tmp`;
@@ -232,7 +183,7 @@ export function saveState(state) {
 
 // 巡检心跳：每轮成功跑完覆盖写一次。轮首读它发现漏轮（距上次超过两个间
 // 隔），总览页读它报「服务在但巡检没在跑」。缺失/损坏/形状不对一律读作
-// 没有心跳——旧版本升级后的首轮、与总览读到半截文件都按此降级。
+// 没有心跳——总览读到半截文件也按此降级。
 export function loadHeartbeat() {
   let doc;
   try {

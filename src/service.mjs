@@ -4,11 +4,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
-import {
-  deps,
-  ExitError,
-  ensurePrivateDir,
-} from './internals.mjs';
+import { deps, ExitError, isExecutableFile } from './internals.mjs';
 import { paths, LABEL } from './paths.mjs';
 import {
   DEFAULT_CONFIG,
@@ -17,12 +13,10 @@ import {
 import {
   loadConfig,
   saveConfig,
-  loadState,
-  loadLegacyEntries,
   validateConfig,
   normalizeRoots,
 } from './config.mjs';
-import { scriptProcLogPath, shellQuote } from './sessions.mjs';
+import { requireHerdr, shellQuote } from './sessions.mjs';
 
 function guiTarget() {
   return `gui/${process.getuid()}`;
@@ -98,15 +92,6 @@ export function serviceLine(info, plistExists) {
 // 所在的 bin 目录」写进启动脚本的 PATH，之后每轮由脚本自己解析：npm 升
 // 级、切换默认版本都自动跟随。
 
-function isExecutable(p) {
-  try {
-    fs.accessSync(p, fs.constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 // 返回 {pathDirs}：启动脚本要写进 PATH 的 bin 目录。注入 home/execPath/
 // cronUpPath/systemPaths 仅为测试在临时 HOME 里伪造各安装形态。fnm 的
 // aliases/default/bin 是跟随 `fnm default` 切换的稳定 symlink（切勿
@@ -132,7 +117,7 @@ export function resolveLauncher(opts = {}) {
     path.join(home, '.volta', 'bin'),
     ...systemPaths.map((p) => path.dirname(p)),
   ];
-  const stableNodeDir = candidates.find((dir) => isExecutable(path.join(dir, 'node')));
+  const stableNodeDir = candidates.find((dir) => isExecutableFile(path.join(dir, 'node')));
   const nodeDir = stableNodeDir ?? path.dirname(execPath);
   // argv[1] 保留 npm 全局 bin symlink 的调用路径；不要 realpath 到包内
   // bin/cron-up.mjs，否则独立 npm prefix 的 shim 目录会丢。无 argv[1] 时
@@ -225,9 +210,8 @@ export function readPlistProgramArgs() {
   return parts.length > 0 ? parts : null;
 }
 
-// 解一个 POSIX shell word（不执行它）。覆盖 shellQuote 生成的单引号与
-// '"'"' 拼接，也兼容旧版脚本简单的双引号目录；含未引用空白、命令替换或
-// 变量展开的手改内容拒绝猜测。
+// 只解 shellQuote 生成的 shell word（不执行它）：安全字符、单引号与
+// '"'"' 拼接。其他写法按手改损坏处理，不猜测 shell 语义。
 function parseShellWord(source) {
   let value = '';
   for (let i = 0; i < source.length;) {
@@ -239,32 +223,13 @@ function parseShellWord(source) {
       i = end + 1;
       continue;
     }
-    if (ch === '"') {
-      i += 1;
-      let closed = false;
-      while (i < source.length) {
-        if (source[i] === '"') {
-          closed = true;
-          i += 1;
-          break;
-        }
-        if (source[i] === '$' || source[i] === '`') return null;
-        if (source[i] === '\\') {
-          if (i + 1 >= source.length) return null;
-          i += 1;
-        }
-        value += source[i];
-        i += 1;
-      }
-      if (!closed) return null;
+    if (source.startsWith(`"'"`, i)) {
+      value += "'";
+      i += 3;
       continue;
     }
-    if (/\s/.test(ch) || /[$`;&|<>()]/.test(ch)) return null;
-    if (ch === '\\') {
-      if (i + 1 >= source.length) return null;
-      i += 1;
-    }
-    value += source[i];
+    if (!/^[-@%+=:,./\w]$/.test(ch)) return null;
+    value += ch;
     i += 1;
   }
   return value;
@@ -288,7 +253,7 @@ function scriptPathDirs(scriptPath) {
 }
 
 // 总览页健康检查：launchd 每轮按启动脚本拉起巡检，脚本丢失、被手改或
-// PATH 目录里解析不到 cron-up/node 时都会静默拉不起来。
+// PATH 目录里解析不到 cron-up/node/hc 时都会静默拉不起来。
 export function launcherHealth() {
   if (!fs.existsSync(deps.paths.plistPath)) return null;
   const args = readPlistProgramArgs();
@@ -306,7 +271,7 @@ export function launcherHealth() {
     return `启动脚本 ${scriptPath} 内容无法解读（可能被手改），`
       + '重跑 cron-up install 覆盖重生成';
   }
-  const has = (name) => dirs.some((d) => isExecutable(path.join(d, name)));
+  const has = (name) => dirs.some((d) => isExecutableFile(path.join(d, name)));
   if (!has('cron-up')) {
     return `启动脚本的 PATH 目录（${dirs.join('、')}）里找不到 cron-up：切换`
       + '默认 Node 版本后要在新版本里重新 npm i -g cron-up，或重跑 '
@@ -315,6 +280,10 @@ export function launcherHealth() {
   if (!has('node')) {
     return `启动脚本的 PATH 目录（${dirs.join('、')}）里找不到 node，重跑 `
       + 'cron-up install 重新解析';
+  }
+  if (!has('hc')) {
+    return `启动脚本的 PATH 目录（${dirs.join('、')}）里找不到 hc，重跑 `
+      + 'cron-up install 重新解析；Herdr Core 是预热会话的必需依赖';
   }
   return null;
 }
@@ -350,11 +319,9 @@ export async function cmdInstall(args) {
     throw new ExitError(2, 'install 不支持 --config：配置与 LaunchAgent 固定'
       + `使用 ${deps.paths.configPath}`);
   }
-  fs.mkdirSync(deps.paths.dataDir, { recursive: true });
-  ensurePrivateDir(deps.paths.sessionLogDir);
-
-  // 每次 install 都重写配置（纯化旧版本留下的已废弃键）、脚本与 plist：
-  // 这也是升级 Node、改扫描范围后的统一修复入口。
+  const hc = requireHerdr();
+  // 每次 install 都重写 roots-only 配置、脚本与 plist：这也是升级 Node、
+  // 改扫描范围后的统一修复入口。
   const cfg = { roots: resolveRoots(args) };
   saveConfig(cfg);
   deps.print(`已写入配置：${deps.paths.configPath}（扫描目录：${cfg.roots.join('、')}）`);
@@ -372,6 +339,7 @@ export async function cmdInstall(args) {
   }
 
   const launcher = deps.resolveLauncher();
+  launcher.pathDirs = [...new Set([...launcher.pathDirs, path.dirname(hc)])];
   if (launcher.note) deps.print(`提示：${launcher.note}`);
 
   const script = writeServiceScript(launcher);
@@ -410,37 +378,6 @@ export async function cmdInstall(args) {
   } else {
     deps.print('首轮巡检暂未执行（已有一轮在进行），launchd 会在下个间隔自动'
       + '补跑；查看状态：cron-up');
-  }
-}
-
-// 遍历全部 tracked 预热：新版嵌套 state、旧版扁平 state、state 丢失时的
-// ps 孤儿（日志位于会话日志目录即可，不区分两代命名）。
-function* allTrackedWarmups() {
-  const handled = new Set();
-  for (const bucket of Object.values(loadState())) {
-    for (const [taskId, ent] of Object.entries(bucket)) {
-      if (deps.trackedAlive(ent)) {
-        handled.add(ent.pid);
-        yield { label: `${ent.ws} 任务 ${taskId}`, ent, orphan: false };
-      }
-    }
-  }
-  for (const ent of loadLegacyEntries()) {
-    if (ent.pid) handled.add(ent.pid);
-    if (deps.trackedAlive(ent)) {
-      yield { label: ent.ws, ent, orphan: false };
-    }
-  }
-  // state 丢失的兜底：没进登记的孤儿从进程表按日志目录认。
-  for (const [pid, procArgs] of deps.listScriptProcesses()) {
-    if (handled.has(pid)) continue;
-    const log = scriptProcLogPath(procArgs);
-    if (log === null
-        || !log.startsWith(`${deps.paths.sessionLogDir}${path.sep}`)) continue;
-    const ent = { pid, procStart: deps.procStartedAt(pid) };
-    if (deps.trackedAlive(ent)) {
-      yield { label: `pid=${pid}（state 已丢失）`, ent, orphan: true };
-    }
   }
 }
 
@@ -487,18 +424,24 @@ export async function cmdUninstall(args) {
       deps.print('已从 launchd 卸载');
     }
 
-    // 服务没了就没有回收者：默认结束全部预热会话，不留以 bypass 权限空转
-    // 的孤儿。各会话的停轮询（SIGTERM→等→SIGKILL）互不依赖，先逐个发信
-    // 号再并行等齐。
-    const stopping = [];
-    for (const { label, ent } of allTrackedWarmups()) {
+    // 服务没了就没有回收者：默认结束全部预热会话，不留无人回收的孤儿。
+    // Herdr 清单是唯一会话来源；state 是否保留都不影响停止。已经退出的
+    // 终端无需打印停止进度，活终端仍由 stopSession 再核验一次身份。
+    const unsafe = [];
+    for (const terminal of deps.listHerdrTerminals()) {
+      const ent = {
+        pid: terminal.pid,
+        procStart: deps.procStartedAt(terminal.pid),
+        herdr: terminal.address,
+        ws: terminal.cwd,
+        taskId: terminal.taskId,
+      };
+      if (!deps.trackedAlive(ent)) continue;
+      const label = `${terminal.cwd} 任务 ${terminal.taskId}`
+        + `（Herdr ${terminal.address}）`;
       deps.print(`正在结束预热会话 ${label}`);
-      stopping.push(deps.stopSession(ent).then(
-        (stopped) => stopped ? null : label,
-      ));
+      if (!deps.stopSession(ent)) unsafe.push(label);
     }
-    const unsafe = (await Promise.all(stopping))
-      .filter((label) => label !== null);
     if (unsafe.length > 0) {
       deps.printErr('警告：以下预热会话仍活着，本次无法安全停止：'
         + `${unsafe.join('、')}。已中止后续清理，`

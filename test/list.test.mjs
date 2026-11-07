@@ -134,7 +134,7 @@ test('each task gets its own row under the full workspace path', async (t) => {
   assert.ok(out.includes('5 0 * * *'));
   assert.ok(out.includes('0 10 * * 0'));
   assert.ok(out.includes('周期'));
-  assert.ok(!out.includes('交互会话：'), '旧版每目录消费者表头已删');
+  assert.ok(!out.includes('交互会话：'), '不显示另一张消费者表头');
 });
 
 test('malformed task is shown, not dropped', async (t) => {
@@ -237,7 +237,7 @@ test('warm tag: live creator session shows no tag even when wanted', async (t) =
   assert.ok(!out.includes('['));
 });
 
-test('warm tag: claimed live warmup shows its script pid', async (t) => {
+test('warm tag: claimed live warmup shows its root pid', async (t) => {
   const s = await setup(t);
   s.alive.add(4242);
   const out = await s.render([WARM_TASK()], {
@@ -268,7 +268,7 @@ test('warm tag: alive but unregistered shows spawning', async (t) => {
 
 test('warm tag: resumed bare claude shows terminal takeover', async (t) => {
   const s = await setup(t);
-  // script pid 已不在 alive（4242 不加入），同 sid 的裸 claude 在登记里。
+  // root pid 已不在 alive（4242 不加入），同 sid 的裸 claude 在登记里。
   const out = await s.render([WARM_TASK()], {
     state: {
       '00000001': {

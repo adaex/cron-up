@@ -22,9 +22,6 @@ export function makePaths({ home, dataDir, logDir, plistPath, sessionDir }) {
     plistPath,
     sessionDir,
 
-    get sessionLogDir() {
-      return path.join(this.logDir, 'sessions');
-    },
     get configPath() {
       return path.join(this.dataDir, 'config.json');
     },
@@ -45,7 +42,7 @@ export function makePaths({ home, dataDir, logDir, plistPath, sessionDir }) {
 }
 
 // 路径对象整体可替换（deps.paths）：测试把产物目录重定向到 tmp，不碰真实
-// HOME。getter 让 sessionLogDir/configPath/statePath 跟随替换后的前缀。
+// HOME。getter 让 configPath/statePath 等跟随替换后的前缀。
 export const paths = makePaths({
   home: HOME,
   // 数据目录用 XDG 风格的 ~/.local/share/cron-up：config、state 与启动脚本

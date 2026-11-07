@@ -2,7 +2,9 @@
 
 为 **Claude Code 的 durable 定时任务**在触发前按需预热交互会话，减少因原会话关闭、电脑上没有在线会话而造成的漏跑。每个需要 cron-up 预热且能唯一识别的任务使用独立后台会话，任务仍由 Claude Code 自己投递和执行
 
-目前仅支持 macOS，依赖 launchd、`script(1)` 和 zsh；不是通用命令行 AI agent 的调度器。会话按任务需要创建，满足回收条件后退出，短周期任务也可能持续复用现有会话
+目前仅支持 macOS，依赖 launchd、Herdr Core 和 zsh；不是通用命令行 AI agent 的调度器。会话按任务需要创建，满足回收条件后退出，短周期任务也可能持续复用现有会话
+
+所有预热会话都由 Herdr 管理，可以在 Herdr 中查看、接管和读取历史；`hc` 是必需依赖
 
 > [!WARNING]
 > cron-up 依赖 Claude Code 未公开且无稳定性承诺的内部实现。当前核心行为以 **2.1.302** 的本机核对结果为依据，其他版本不代表已经验证；不同机制的核对版本见[内部机制与兼容性](docs/internals.md)。升级 Claude Code 后，先运行 `cron-up` 查看告警，再确认任务能正常预热和投递
@@ -30,9 +32,10 @@ cron-up 不负责创作任务内容，也不能保证每个任务都执行成功
 
 ### 环境与兼容性
 
-- **macOS**：使用 launchd、`script(1)` 和 zsh，暂不支持其他系统
-- **Node.js 22 或更高版本**：cron-up 没有第三方运行时依赖
+- **macOS**：使用 launchd 和 zsh，暂不支持其他系统
+- **Node.js 22 或更高版本**：cron-up 没有 npm 第三方运行时依赖
 - **Claude Code**：核心行为已在 2.1.302 核对；更低或更高版本均应按未验证版本对待，不要仅凭版本号推断兼容
+- **Herdr Core**：`PATH` 或 `~/.local/bin/hc` 中必须有可执行的 `hc`；当前已在 0.1.18 核对，其他版本按未验证处理。install 会把实际找到的 `hc` 所在目录写入 cron-up 服务的 `PATH`
 - **可用的 `claude` 命令**：已完成登录和所需配置，并且能从交互登录 zsh 中启动；可先用 `zsh -lic 'command -v claude'` 检查
 - **目录信任与工具授权**：先在该工作目录手动启动一次 Claude Code，完成信任确认及无法在无人值守时回答的授权，否则预热可能停在提问界面，随后被判为卡死并进入失败流程
 
@@ -41,7 +44,7 @@ fnm、volta、Homebrew、官网 pkg 等 Node 安装方式均可用于提供 `nod
 ### 安全与自动修改
 
 > [!CAUTION]
-> `roots` 是**任务扫描与信任范围，不是沙箱**。后台会话通过 `claude --permission-mode bypassPermissions` 跳过工具权限确认，并以当前 macOS 用户身份运行；任务可以访问 roots 之外的位置，也可能通过模型、MCP 或任务工具联网
+> `roots` 是**任务扫描与信任范围，不是沙箱**。cron-up 不传 `--permission-mode`，后台会话以当前 macOS 用户身份运行，权限模式遵循 Claude Code 自身配置；配置为自动执行或跳过确认时，任务可在无人值守时调用工具。任务可以访问 roots 之外的位置，也可能通过模型、MCP 或任务工具联网
 
 只扫描你信任其**整个工作区内容**的目录，而不只是检查任务文件。预热会在工作区启动完整的 Claude Code，任务、`CLAUDE.md`、`.claude` 中的项目指令与配置，以及任务可能调用的脚本，都可能影响无人值守会话
 
@@ -102,11 +105,28 @@ cron-up                        # 总览：服务、配置、最近任务、预�
 cron-up list                   # 列出所有工作区的任务时间、摘要、模型配置与预热状态
 cron-up run                    # 立即手动巡检一次
 cron-up logs                   # 查看最近 100 行巡检日志
-cron-up logs team-space        # 按文件名片段选择后台会话日志
-cron-up logs team-space--00000002 -f
+cron-up logs team-space        # 查看匹配的后台会话
+cron-up logs 00000002 -f       # 接入活跃的匹配会话
 ```
 
-会话日志按文件名片段匹配，可以输入目录名、任务 id 或两者组合；命中多个日志时会列出候选，请补充更长的片段
+无参数时查看巡检日志。给出匹配片段时，会话可以按目录名、任务 id、Herdr 地址或显示标题查找；命中多个时会列出候选，请补充更长的片段。会话历史使用 `hc read`，`-f` 对活跃会话改为 `hc attach`
+
+### 在 Herdr 中查看预热会话
+
+每次预热都会创建一个独立的 Herdr 终端，地址（如 `t7`）记录在巡检日志中。cron-up 不设置自定义 `name`，可以用 `hc ls` 查看，用 `hc attach <地址>` 接入，按 `Ctrl+\` 脱离
+
+终端只有两个由 cron-up 维护的标签：
+
+| 标签 | 内容 | 用途 |
+| --- | --- | --- |
+| `cron-up=<任务键>` | 例如 `cron-up=00000002` | 机器识别、孤儿认领和停止前身份核对 |
+| `where=cron-up / <工作区名> / <任务说明>` | 例如 `cron-up / team-space / 汇总每日进展` | 在 Herdr 列表中直接看出会话用途 |
+
+任务说明取 prompt 的单行摘要，过长时截断；`where` 在 Claude 完成会话登记后设置，避免被 Herdr 启动时的自动命名覆盖
+
+Herdr 路径直接启动 `/bin/zsh -lic`，交互 zsh 中的函数、路由、模型和权限配置照常生效。终端通过 `--no-parent` 保持独立，不随发起巡检的终端退出；退出或被回收后，历史仍由 Herdr 保留，可以用 `hc read --lines 100 <地址>` 或 `cron-up logs <匹配片段>` 查看
+
+安装和巡检都会先检查 `hc`，缺失时明确失败。启动或身份查询失败按正常的预热失败流程处理；显示标签设置失败只记录一次告警，不影响已启动的会话
 
 ### 看懂总览和任务列表
 
@@ -201,7 +221,7 @@ claude --resume <sessionId>      # 或 claude -r 在列表中选择
 cron-up install --roots "$HOME/code,$HOME/work"
 ```
 
-重跑 install 会重写配置、启动脚本与 LaunchAgent，并移除旧版本遗留的废弃配置字段
+重跑 install 会重写配置、启动脚本与 LaunchAgent
 
 巡检间隔、提前量、扫描深度、失败退避等均为固定行为，完整常量和生命周期规则见[内部机制](docs/internals.md#巡检与会话生命周期)
 
@@ -242,12 +262,12 @@ cron-up install --roots "$HOME/code,$HOME/work"
 | LaunchAgent | `~/Library/LaunchAgents/local.cron-up.plist` |
 | 启动脚本 | `~/.local/share/cron-up/cron-up-service` |
 | 巡检日志 | `~/Library/Logs/cron-up/launchd.{out,err}.log` |
-| 各任务会话日志 | `~/Library/Logs/cron-up/sessions/<工作区折名>--<任务id>.log`，轮转保留一代 `.1` |
+| Herdr 会话界面与历史 | 由 Herdr Core 管理，cron-up 不另写会话日志 |
 | Claude Code 对话记录 | `~/.claude/projects/<目录编码>/<会话ID>.jsonl`，由 Claude Code 管理 |
 
-会话日志可能包含任务输出，文件权限为 0600、目录权限为 0700。日志文件名中的工作区折名由完整工作区路径生成，日常使用建议通过 `cron-up logs` 查找，不要手工猜文件名
+Herdr 会话的界面与历史可能包含任务输出，其保存位置和权限由 Herdr 管理；cron-up 的 `--purge` 不删除这些记录
 
-巡检日志会记录版本、进入窗口时不另拉会话的原因、登记对应的 sessionId 与进程、逐任务过户、当轮等待后仍未登记的情况，以及每次观察到的 `lastFiredAt` 变化。其中“观测到投递”只说明调度字段已更新，不代表任务执行成功；任务是否完成、是否等待人工回答，仍要结合对应会话日志与 Claude Code 对话记录判断
+巡检日志会记录版本、进入窗口时不另拉会话的原因、登记对应的 sessionId 与进程、逐任务过户，以及当轮等待后仍未登记的情况。这些日志只记录会话管理，不证明任务执行成功；任务是否完成、是否等待人工回答，仍要结合对应会话日志与 Claude Code 对话记录判断
 
 cron-up 自身的巡检和会话管理不主动访问 npm registry 或其他网络服务；安装和升级时由 npm 访问 registry。被启动的 Claude Code 会话仍可能联网，cron-up 不对其网络活动作限制
 
@@ -269,7 +289,7 @@ cron-up
 
 最后一步确认首行版本、launchd 状态、上次退出码和“需要留意”。刚发布新版本时 registry 与本机缓存可能有延迟，维护者发版后的逐机升级使用显式版本号，见[发布后的逐机升级与验收](docs/release.md#每次发版后的逐机升级与验收)
 
-launchd 的初始 PATH 很小，因此 install 会把 `node` 与 `cron-up` 所在 bin 目录写入 `~/.local/share/cron-up/cron-up-service`。预热中的 `claude` 则由 `/bin/zsh -lic` 启动，依赖登录交互 shell 的配置，而不是仅靠前述两个目录
+launchd 的初始 PATH 很小，因此 install 会把 `node`、`cron-up` 与实际找到的 `hc` 所在 bin 目录写入 `~/.local/share/cron-up/cron-up-service`。预热中的 `claude` 则由 Herdr 终端里的 `/bin/zsh -lic` 启动，依赖登录交互 shell 的配置，而不是仅靠前述目录
 
 出现以下情况后应重跑 `cron-up install`：
 
@@ -288,7 +308,8 @@ launchd 的初始 PATH 很小，因此 install 会把 `node` 与 `cron-up` 所�
 | 停止仍可安全跟踪的预热会话 | 是 | 是 |
 | 移除 LaunchAgent 和 plist | 是 | 是 |
 | 删除 `~/.local/share/cron-up` 中的配置、状态、心跳和启动脚本 | 否 | 是 |
-| 删除 `~/Library/Logs/cron-up` 中的巡检与会话日志 | 否 | 是 |
+| 删除 `~/Library/Logs/cron-up` 中的巡检日志 | 否 | 是 |
+| 删除 Herdr 保存的预热终端历史 | 否 | 否 |
 | 卸载 npm 全局 `cron-up` 命令 | 否 | 否 |
 | 删除 Claude Code 任务或 `~/.claude/projects` 对话记录 | 否 | 否 |
 | 删除各工作区的 `.claude/cron-up.json` | 否 | 否 |
@@ -307,15 +328,14 @@ Claude Code 任务和对话记录需要在 Claude Code 侧另行处理。卸载�
 
 | 现象 | 排查方法 |
 | --- | --- |
-| 总览提示“冷却中” | 运行 `cron-up logs <目录名>--<任务id>` 查看启动界面；常见原因是目录信任、工具授权、登录状态或 shell 环境，冷却结束不代表问题已经修复 |
+| 总览提示“冷却中” | 运行 `cron-up logs <目录名或任务id>` 查看启动界面；常见原因是目录信任、工具授权、登录状态或 shell 环境，冷却结束不代表问题已经修复 |
 | 设定时间到了但没有执行 | 先看 `cron-up list` 的预计投递时间，排除上游抖动；再看总览告警和对应会话日志，并确认当时电脑没有休眠 |
-| 总览提示“启动脚本已失效 / PATH 找不到 node” | 按[升级与启动链维护](#升级与启动链维护)检查并重跑 `cron-up install` |
+| 总览提示“启动脚本已失效 / PATH 找不到 node 或 hc” | 按[升级与启动链维护](#升级与启动链维护)检查并重跑 `cron-up install` |
 | 总览提示“巡检已沉默” | 先运行 `cron-up logs` 查看巡检和 stderr 提示，再检查启动链并重跑 install |
 | `last exit code=2` | 通常是配置损坏或 roots 类型不对；直接修复 `~/.local/share/cron-up/config.json`，或按[配置无法解读时](#配置无法解读时)的说明显式传入完整 roots 重跑 install |
 | 手动 `cron-up run` 正常、定时执行不正常 | 比较终端与 launchd／`zsh -lic` 的 PATH、Node 和 `claude` 环境；换过 Node 安装方式后重跑 install |
 | 任务表显示“已错过” | 对一次性任务检查后台会话是否启动及其日志；手写任务缺少有效 `createdAt` 时，cron-up 不会按错过待补处理 |
 | 日志里出现“卡死” | 表示超过登记宽限后由巡检终止，常见于人工作答界面，也可能是会话登记或启动形态变化；先看会话日志和总览的登记格式告警 |
-| 从旧版升级后仍有目录级预热 | 查看[旧版迁移](docs/migration.md)，核实是否因缺少进程指纹而需要人工处理 |
 
 ## 已知限制
 
@@ -330,7 +350,6 @@ Claude Code 任务和对话记录需要在 Claude Code 侧另行处理。卸载�
 ## 更多文档
 
 - [内部机制与兼容性](docs/internals.md)：任务归属、生命周期常量、投递算法、并发与版本证据
-- [旧版迁移](docs/migration.md)：从 26.10.30 及更早版本升级
 - [贡献指南](CONTRIBUTING.md)：开发、测试和文档同步要求
 - [发布流程](docs/release.md)：版本号、签名 tag、trusted publishing 与逐机升级
 

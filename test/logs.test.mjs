@@ -6,130 +6,48 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
 import { resolveLogPath, cmdLogs } from '../src/logs.mjs';
-import { sessionLogPath } from '../src/sessions.mjs';
 import { ExitError } from '../src/internals.mjs';
 import { mkTmp, mockDeps, tmpPaths } from '../test-support/helpers.mjs';
 
-async function setup(t) {
+function setup(t) {
   const tmp = mkTmp(t);
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp);
-  fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
   const notes = [];
   const errs = [];
-  const resolve = (workspace) => resolveLogPath(workspace, (m) => notes.push(m));
   deps.printErr = (m) => errs.push(m);
   const out = path.join(deps.paths.logDir, 'launchd.out.log');
   const err = path.join(deps.paths.logDir, 'launchd.err.log');
   return {
-    tmp, deps, notes, errs, resolve, out, err,
-    sessionLogDir: deps.paths.sessionLogDir,
+    tmp, deps, notes, errs, out, err,
+    resolve: () => resolveLogPath((m) => notes.push(m)),
   };
 }
 
-test('stale error does not hide the patrol log', async (t) => {
-  const s = await setup(t);
+test('stale error does not hide the patrol log', (t) => {
+  const s = setup(t);
   fs.writeFileSync(s.out, 'patrol ok\n');
   fs.writeFileSync(s.err, 'SyntaxError from days ago\n');
   assert.equal(s.resolve(), s.out);
   assert.ok(s.notes.some((n) => n.includes('巡检若异常先看它')));
 });
 
-test('empty error log is not mentioned', async (t) => {
-  const s = await setup(t);
+test('empty error log is not mentioned', (t) => {
+  const s = setup(t);
   fs.writeFileSync(s.out, 'patrol ok\n');
   fs.writeFileSync(s.err, '');
   assert.equal(s.resolve(), s.out);
   assert.deepEqual(s.notes, []);
 });
 
-test('falls back to stderr before the first patrol', async (t) => {
-  const s = await setup(t);
+test('falls back to stderr before the first patrol', (t) => {
+  const s = setup(t);
   fs.writeFileSync(s.err, 'boom\n');
   assert.equal(s.resolve(), s.err);
 });
 
-test('workspace fragment matches one task-level session log', async (t) => {
-  const s = await setup(t);
-  const file = path.join(s.sessionLogDir, 'Users_me_team-space--00000002.log');
-  fs.writeFileSync(file, '');
-  assert.equal(s.resolve('team-space--00000002'), file);
-  // 只给任务 id 片段也能命中（includes 匹配整个文件名）。
-  assert.equal(s.resolve('00000002'), file);
-});
-
-test('unmatched fragment returns null', async (t) => {
-  const s = await setup(t);
-  assert.equal(s.resolve('nothing-here'), null);
-});
-
-test('ambiguous fragment exits with the task-level candidates', async (t) => {
-  const s = await setup(t);
-  const f1 = path.join(s.sessionLogDir, 'Users_me_a-space--00000001.log');
-  const f2 = path.join(s.sessionLogDir, 'Users_me_b-space--00000001.log');
-  fs.writeFileSync(f1, '');
-  fs.writeFileSync(f2, '');
-  assert.throws(() => s.resolve('00000001'), (e) => {
-    assert.ok(e instanceof ExitError);
-    assert.equal(e.code, 1);
-    return true;
-  });
-  assert.ok(s.notes.some((n) => n.includes('a-space--00000001')));
-  assert.ok(s.notes.some((n) => n.includes('b-space--00000001')));
-});
-
-test('rotated .1 logs are not candidates', async (t) => {
-  const s = await setup(t);
-  const file = path.join(s.sessionLogDir, 'Users_me_proj--00000001.log');
-  fs.writeFileSync(file, '');
-  fs.writeFileSync(`${file}.1`, '');
-  assert.equal(s.resolve('proj'), file);
-});
-
-test('absolute path: single task log for the workspace is returned', async (t) => {
-  const s = await setup(t);
-  const root = fs.realpathSync(s.tmp);
-  const ws = path.join(root, 'MyProj');
-  fs.mkdirSync(ws);
-  const file = sessionLogPath(ws, '00000001');
-  fs.writeFileSync(file, '');
-  assert.equal(s.resolve(ws), file);
-});
-
-test('absolute path: multiple task logs for one workspace are ambiguous', async (t) => {
-  const s = await setup(t);
-  const root = fs.realpathSync(s.tmp);
-  const ws = path.join(root, 'team-space');
-  fs.mkdirSync(ws);
-  fs.writeFileSync(sessionLogPath(ws, '00000002'), '');
-  fs.writeFileSync(sessionLogPath(ws, '00000004'), '');
-  assert.throws(() => s.resolve(ws), (e) => e instanceof ExitError && e.code === 1);
-  assert.ok(s.notes.some((n) => n.includes('team-space--00000002')));
-  assert.ok(s.notes.some((n) => n.includes('team-space--00000004')));
-});
-
-test('absolute path: existing workspace without logs returns null', async (t) => {
-  const s = await setup(t);
-  const root = fs.realpathSync(s.tmp);
-  const ws = path.join(root, 'empty-ws');
-  fs.mkdirSync(ws);
-  assert.equal(s.resolve(ws), null);
-});
-
-test('absolute path recovers the on-disk case', async (t) => {
-  const s = await setup(t);
-  const root = fs.realpathSync(s.tmp);
-  const ws = path.join(root, 'MyProj');
-  fs.mkdirSync(ws);
-  const file = sessionLogPath(ws, '00000001');
-  fs.writeFileSync(file, '');
-  const typed = path.join(root, 'myproj');
-  if (!fs.existsSync(typed)) t.skip('大小写敏感的文件系统上无法构造该场景');
-  assert.equal(s.resolve(typed), file);
-});
-
-test('cmdLogs tails -F with the resolved file', async (t) => {
-  const s = await setup(t);
+test('cmdLogs tails -F with the resolved patrol file', (t) => {
+  const s = setup(t);
   fs.writeFileSync(s.out, 'patrol ok\n');
   let seen;
   s.deps.spawnSync = (file, args, opts) => {
@@ -142,8 +60,104 @@ test('cmdLogs tails -F with the resolved file', async (t) => {
   assert.equal(seen.opts.stdio, 'inherit');
 });
 
-test('real tail -F survives log rename and recreation', { timeout: 12000 }, async (t) => {
-  const s = await setup(t);
+test('cmdLogs defaults to tail -n 100', (t) => {
+  const s = setup(t);
+  fs.writeFileSync(s.out, 'patrol ok\n');
+  let seen;
+  s.deps.spawnSync = (file, args) => {
+    seen = { file, args };
+    return { status: 0 };
+  };
+  cmdLogs({});
+  assert.deepEqual(seen.args, ['-n', '100', s.out]);
+});
+
+test('cmdLogs resolves an exact Herdr address without listing history', (t) => {
+  const s = setup(t);
+  s.deps.getHerdrTerminal = (address) => {
+    assert.equal(address, 't7');
+    return {
+      address: 't7', taskId: '00000001', cwd: '/ws', title: '', state: 'finished',
+    };
+  };
+  s.deps.listHerdrTerminals = () => assert.fail('精确地址不应扫描全部历史');
+  let seen;
+  s.deps.spawnSync = (file, args) => {
+    seen = { file, args };
+    return { status: 0 };
+  };
+  cmdLogs({ workspace: 't7', follow: false });
+  assert.deepEqual(seen, {
+    file: '/mock/hc', args: ['read', '--lines', '100', 't7'],
+  });
+});
+
+test('cmdLogs reads Herdr history and only attaches to a live terminal', (t) => {
+  const s = setup(t);
+  s.deps.listHerdrTerminals = (taskId, includeFinished) => {
+    assert.equal(taskId, null);
+    assert.equal(includeFinished, true);
+    return [{
+      address: 't7', taskId: '00000001', cwd: '/ws',
+      title: 'cron-up / ws / 每日汇总', state: 'finished',
+    }];
+  };
+  let seen;
+  s.deps.spawnSync = (file, args) => {
+    seen = { file, args };
+    return { status: 0 };
+  };
+  cmdLogs({ workspace: '汇总', follow: false });
+  assert.deepEqual(seen, {
+    file: '/mock/hc', args: ['read', '--lines', '100', 't7'],
+  });
+  cmdLogs({ workspace: '汇总', follow: true });
+  assert.deepEqual(seen, {
+    file: '/mock/hc', args: ['read', '--lines', '100', 't7'],
+  }, '已结束的终端只读历史，不 attach');
+});
+
+test('cmdLogs follow attaches to a live Herdr terminal', (t) => {
+  const s = setup(t);
+  s.deps.listHerdrTerminals = () => [{
+    address: 't7', taskId: '00000001', cwd: '/ws', title: '', state: 'live',
+  }];
+  let seen;
+  s.deps.spawnSync = (file, args) => {
+    seen = { file, args };
+    return { status: 0 };
+  };
+  cmdLogs({ workspace: '00000001', follow: true });
+  assert.deepEqual(seen, { file: '/mock/hc', args: ['attach', 't7'] });
+});
+
+test('Herdr selector accepts an absolute workspace and reports ambiguous candidates', (t) => {
+  const s = setup(t);
+  const ws = path.join(s.tmp, 'MyProj');
+  fs.mkdirSync(ws);
+  s.deps.listHerdrTerminals = () => [
+    { address: 't7', taskId: '00000001', cwd: ws, title: '甲', state: 'finished' },
+    { address: 't8', taskId: '00000002', cwd: ws, title: '乙', state: 'finished' },
+  ];
+  assert.throws(() => cmdLogs({ workspace: ws }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 1);
+    return true;
+  });
+  assert.ok(s.errs.some((m) => m.includes('t7') && m.includes('00000001')));
+  assert.ok(s.errs.some((m) => m.includes('t8') && m.includes('00000002')));
+
+  let seen;
+  s.deps.spawnSync = (file, args) => {
+    seen = { file, args };
+    return { status: 0 };
+  };
+  cmdLogs({ workspace: 't8' });
+  assert.deepEqual(seen.args, ['read', '--lines', '100', 't8']);
+});
+
+test('real tail -F survives patrol log rename and recreation', { timeout: 12000 }, async (t) => {
+  const s = setup(t);
   fs.writeFileSync(s.out, 'before rename\n');
   const child = spawn('/usr/bin/tail', ['-F', s.out], {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -163,12 +177,8 @@ test('real tail -F survives log rename and recreation', { timeout: 12000 }, asyn
   const waitFor = async (marker) => {
     const deadline = Date.now() + 6000;
     while (!stdout.includes(marker)) {
-      if (!running()) {
-        throw new Error(`tail 提前退出：${stderr}\n${stdout}`);
-      }
-      if (Date.now() >= deadline) {
-        throw new Error(`等待 ${marker} 超时：${stderr}\n${stdout}`);
-      }
+      if (!running()) throw new Error(`tail 提前退出：${stderr}\n${stdout}`);
+      if (Date.now() >= deadline) throw new Error(`等待 ${marker} 超时：${stderr}`);
       await sleep(50);
     }
   };
@@ -189,31 +199,17 @@ test('real tail -F survives log rename and recreation', { timeout: 12000 }, asyn
   assert.match(stdout, /after recreate/);
 });
 
-test('cmdLogs defaults to tail -n 100', async (t) => {
-  const s = await setup(t);
-  fs.writeFileSync(s.out, 'patrol ok\n');
-  let seen;
-  s.deps.spawnSync = (file, args) => {
-    seen = { file, args };
-    return { status: 0 };
-  };
-  cmdLogs({});
-  assert.deepEqual(seen.args, ['-n', '100', s.out]);
-});
-
-test('cmdLogs does not report success when tail dies by signal', async (t) => {
-  const s = await setup(t);
+test('cmdLogs does not report success when the viewer dies by signal', (t) => {
+  const s = setup(t);
   fs.writeFileSync(s.out, 'patrol ok\n');
   s.deps.spawnSync = () => ({ status: null, signal: 'SIGTERM' });
   assert.throws(() => cmdLogs({}), (e) => e instanceof ExitError
     && e.code === 1 && e.message.includes('SIGTERM'));
 });
 
-test('cmdLogs on an unmatched fragment exits 1', async (t) => {
-  const s = await setup(t);
-  s.deps.spawnSync = () => {
-    throw new Error('不该走到 tail');
-  };
+test('cmdLogs on an unmatched Herdr selector exits 1', (t) => {
+  const s = setup(t);
+  s.deps.spawnSync = () => assert.fail('不该走到日志查看进程');
   assert.throws(() => cmdLogs({ workspace: 'nope' }),
     (e) => e instanceof ExitError && e.code === 1);
   assert.ok(s.errs.some((m) => m.includes('nope')));

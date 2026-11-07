@@ -7,7 +7,7 @@
 // 模块注册。
 
 import fs from 'node:fs';
-import { spawn, spawnSync, execFileSync } from 'node:child_process';
+import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { paths } from './paths.mjs';
 
@@ -24,6 +24,15 @@ export class ExitError extends Error {
 // （如拒绝类实例）只改这一处。
 export function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
+}
+
+export function isExecutableFile(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
 }
 
 // state 的桶键来自外部任务 id。普通对象的 __proto__ 赋值会改原型而不是
@@ -83,9 +92,8 @@ function terminalWidth() {
   return Math.max(60, process.stdout.columns ?? 100);
 }
 
-// 自产物目录（state/config、会话日志）含工作区路径与会话记录，按私密收紧：
-// 建好后 chmod 0700，顺带收回老版本留下的宽松权限；失败维持现状。三处写入
-// 点共用这一条纪律。
+// 自产物目录（state/config）含工作区路径与会话记录，按私密收紧：建好后
+// chmod 0700，已有目录的宽松权限也一并收回；失败维持现状。
 export function ensurePrivateDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
   try {
@@ -113,6 +121,5 @@ export const deps = {
   printErr: (...args) => process.stderr.write(`${args.join(' ')}\n`),
   terminalWidth,
   execFile,
-  spawn,
   spawnSync,
 };

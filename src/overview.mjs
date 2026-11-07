@@ -25,6 +25,7 @@ import {
   readWorkspaceConfig,
 } from './tasks.mjs';
 import { serviceLine, launcherHealth } from './service.mjs';
+import { sessionDebugCommand } from './sessions.mjs';
 import {
   humanDelta,
   clip,
@@ -38,7 +39,7 @@ import {
   sameMinute,
 } from './display.mjs';
 
-// entry 此刻是否算「正在承接任务」：script 活（启动中或已认亲），或用户
+// entry 此刻是否算「正在承接任务」：根进程活着（启动中或已认亲），或用户
 // --resume 接管后 sid 仍活。冷却/死条目不报「没有会话」。
 function entryHolds(ent, details, ws) {
   if (!ent) return false;
@@ -106,7 +107,7 @@ function overviewTasks(cfg, cols, details, state) {
         alerts.push(
           `${ws} 任务 ${key} 即将执行（或错过待补执行），但预热连续失败 `
           + `${ent.fails ?? '?'} 次正处冷却中，约 ${eta} 分钟后才会重试；`
-          + `请运行 cron-up logs ${path.basename(ws)}--${key} 排查`);
+          + `请运行 ${sessionDebugCommand(ent)} 排查`);
         coolingWarned.add(`${ws}\0${key}`);
       } else if (!workspaceConfig.error) {
         const fails = ent?.fails ?? 0;
@@ -199,7 +200,7 @@ function overviewSessions(cols, state, details, suppressCooling, discovered) {
 
 const COMMANDS = [
   ['list', '列出所有扫描工作区的任务时间、模型配置与预热状态'],
-  ['logs [目录片段] [-f]', '查看巡检日志或后台会话记录'],
+  ['logs [会话片段] [-f]', '查看巡检日志或后台会话记录'],
   ['run', '立即手动巡检一轮'],
   ['install --roots ~/a,~/b', '更新扫描目录并重新安装（不带参数沿用有效配置）'],
 ];
@@ -226,8 +227,8 @@ export async function cmdOverview(args) {
   const alerts = [];
   const health = launcherHealth();
   if (health) alerts.push(health);
-  // 祖先链恒拍：总览要同时给出逐任务的活创建者/预热承接判定。
-  const [, registryAlert, details] = await deps.scanSessions();
+  // 总览只消费 cwd 与 sessionId，不需要认亲祖先链。
+  const [registryAlert, details] = await deps.scanSessions({ ancestors: false });
   if (registryAlert) alerts.push(registryAlert);
   const state = loadState();
   const curOv = Math.floor(Date.now() / 1000);

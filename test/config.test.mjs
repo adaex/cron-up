@@ -7,7 +7,6 @@ import {
   normalizeRoots,
   loadConfig,
   loadState,
-  loadLegacyEntries,
   saveState,
   validateConfig,
   configFieldErrors,
@@ -46,7 +45,7 @@ test('validateConfig warns on empty roots and missing dirs only', () => {
   assert.deepEqual(validateConfig({ roots: ['/tmp'] }), []);
   assert.deepEqual(validateConfig({ roots: [] }, () => {}).length, 1);
 
-  // 旧版本的间隔/提前量字段不再被读取：带在配置里也不产生警告。
+  // 未识别的行为字段不再被读取：带在配置里也不产生警告。
   const w3 = validateConfig(
     { roots: ['/tmp'], intervalSeconds: 300, leadSeconds: 60 }, () => {});
   assert.deepEqual(w3, []);
@@ -158,7 +157,7 @@ test('roots non-array variants are all rejected', (t) => {
   }
 });
 
-test('legacy keys are silently ignored and absent from the returned config', (t) => {
+test('unknown keys are silently ignored and absent from the returned config', (t) => {
   const tmp = mkTmp(t);
   mockDeps(t);
   const file = path.join(tmp, 'cfg.json');
@@ -215,7 +214,6 @@ test('damaged state shapes read as empty', (t) => {
   for (const text of ['[]', 'null', '42', '"text"', '{ truncated']) {
     fs.writeFileSync(deps.paths.statePath, text);
     assert.deepEqual(loadState(), {}, text);
-    assert.deepEqual(loadLegacyEntries(), [], text);
   }
 });
 
@@ -224,7 +222,6 @@ test('missing state file reads as empty', (t) => {
   const deps = mockDeps(t);
   deps.paths = tmpPaths(tmp);
   assert.deepEqual(loadState(), {});
-  assert.deepEqual(loadLegacyEntries(), []);
 });
 
 test('nested state: non-dict buckets and entries are dropped', (t) => {
@@ -250,18 +247,23 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
     '/a': {
       '00000002': {
         pid: '123', startedAt: '456', cooldownUntil: '789', fails: 2,
-        claudePid: '100', sessionId: 'sid-1', log: '/l',
+        claudePid: '100', sessionId: 'sid-1', unknownField: 'drop',
         procStart: 'Mon Jan 1 00:00:00 2026',
         claudeProcStart: 'Tue Jan 2 00:00:00 2026',
         notified: true, deadSince: 55,
+        herdr: 't7', herdrTitleAttempted: true,
+        herdrActivity: 'hash',
+        herdrActivityAt: '99',
       },
     },
     '/b': {
       // 坏值字段该删的删：非法 pid→null、非法 claudePid→删字段、布尔冒
-      // 充整型→删字段、空串/非字符串身份字段→删字段、notified 非布尔→删。
+      // 充整型→删字段、空串/非字符串身份字段→删字段、布尔标记非布尔→删。
       '00000003': {
         pid: -5, claudePid: 'abc', startedAt: true, fails: 1.7,
-        sessionId: '', log: 9, procStart: '', notified: 'yes',
+        sessionId: '', procStart: '', notified: 'yes',
+        herdr: '', herdrTitleAttempted: 9,
+        herdrActivity: [], herdrActivityAt: 'bad',
       },
     },
   }));
@@ -273,9 +275,13 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
   assert.equal(a.fails, 2);
   assert.equal(a.claudePid, 100);
   assert.equal(a.sessionId, 'sid-1');
-  assert.equal(a.log, '/l');
+  assert.equal('unknownField' in a, false, '未识别字段不进入当前 state');
   assert.equal(a.deadSince, 55);
   assert.equal(a.notified, true);
+  assert.equal(a.herdr, 't7');
+  assert.equal(a.herdrTitleAttempted, true);
+  assert.equal(a.herdrActivity, 'hash');
+  assert.equal(a.herdrActivityAt, 99);
   assert.equal(a.ws, '/a');
   assert.equal(a.taskId, '00000002');
   const b = st['/b']['00000003'];
@@ -284,9 +290,12 @@ test('nested state: fields are sanitised and ws/taskId forced from keys', (t) =>
   assert.equal('startedAt' in b, false);
   assert.equal(Math.trunc(b.fails), 1);
   assert.equal('sessionId' in b, false);
-  assert.equal('log' in b, false);
   assert.equal('procStart' in b, false);
   assert.equal('notified' in b, false);
+  assert.equal('herdr' in b, false);
+  assert.equal('herdrTitleAttempted' in b, false);
+  assert.equal('herdrActivity' in b, false);
+  assert.equal('herdrActivityAt' in b, false);
   assert.equal(b.ws, '/b');
   assert.equal(b.taskId, '00000003');
 });
@@ -313,82 +322,6 @@ test('parsePid accepts integer numbers and decimal strings, never truncates', ()
   for (const bad of [1.5, -1.5, NaN, Infinity, '1.5', '1e2', '0x10', '12x']) {
     assert.equal(parsePid(bad), null, String(bad));
   }
-});
-
-// ---- 旧版扁平 state：loadState 与 loadLegacyEntries 互斥 ----
-
-test('new nested and legacy flat shapes are mutually exclusive across loaders', (t) => {
-  const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
-
-  // 新形状：state 有内容，legacy 为空。
-  writeJson(deps.paths.statePath, {
-    '/ws': {
-      '00000001': { pid: 111, procStart: 's1', startedAt: 1, fails: 0 },
-      '00000002': { pid: 222, procStart: 's2', startedAt: 2, fails: 0 },
-    },
-  });
-  const fresh = loadState();
-  assert.deepEqual(Object.keys(fresh['/ws']).sort(),
-    ['00000001', '00000002']);
-  assert.deepEqual(loadLegacyEntries(), []);
-
-  // 旧形状：state 为空，legacy 读出两条，ws 补回、taskId 删除。
-  writeJson(deps.paths.statePath, {
-    '/ws': { pid: 111, procStart: 's1', startedAt: 1, fails: 0 },
-    '/ws2': { pid: null, cooldownUntil: 999, fails: 3 },
-  });
-  assert.deepEqual(loadState(), {});
-  const legacy = loadLegacyEntries();
-  assert.equal(legacy.length, 2);
-  const byWs = Object.fromEntries(legacy.map((e) => [e.ws, e]));
-  assert.equal(byWs['/ws'].pid, 111);
-  assert.equal(byWs['/ws'].ws, '/ws');
-  assert.equal('taskId' in byWs['/ws'], false);
-  assert.equal(byWs['/ws2'].pid, null);
-  assert.equal(byWs['/ws2'].cooldownUntil, 999);
-  assert.equal(byWs['/ws2'].fails, 3);
-});
-
-test('legacy markers: any of pid/startedAt/cooldownUntil/fails flags a flat entry', (t) => {
-  const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
-  writeJson(deps.paths.statePath, {
-    '/a': { startedAt: 7 },
-    '/b': { cooldownUntil: 0 },
-    '/c': { fails: 0 },
-    // 新形状桶：内层 taskId 条目带标记不影响顶层判定。
-    '/d': { '00000001': { pid: 1 } },
-  });
-  const legacy = loadLegacyEntries().map((e) => e.ws).sort();
-  assert.deepEqual(legacy, ['/a', '/b', '/c']);
-  assert.deepEqual(Object.keys(loadState()), ['/d']);
-});
-
-test('legacy marker names are valid manual task ids beside ordinary siblings', (t) => {
-  const tmp = mkTmp(t);
-  const deps = mockDeps(t);
-  deps.paths = tmpPaths(tmp);
-  writeJson(deps.paths.statePath, {
-    '/ws': {
-      pid: { pid: 101, startedAt: 1 },
-      startedAt: { pid: 102, startedAt: 2 },
-      cooldownUntil: { pid: 103, startedAt: 3 },
-      fails: { pid: 104, startedAt: 4 },
-      '00000001': { pid: 105, startedAt: 5 },
-    },
-  });
-  const state = loadState();
-  assert.deepEqual(Object.keys(state['/ws']).sort(),
-    ['00000001', 'cooldownUntil', 'fails', 'pid', 'startedAt']);
-  for (const [taskId, pid] of [['pid', 101], ['startedAt', 102],
-    ['cooldownUntil', 103], ['fails', 104], ['00000001', 105]]) {
-    assert.equal(state['/ws'][taskId].pid, pid);
-    assert.equal(state['/ws'][taskId].taskId, taskId);
-  }
-  assert.deepEqual(loadLegacyEntries(), [], '新桶不能因任务键名被旧读取器拿走');
 });
 
 // ---- 保存权限 ----

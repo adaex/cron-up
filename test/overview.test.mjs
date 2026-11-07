@@ -25,6 +25,7 @@ async function setup(t) {
   // details 场景可按用例改：默认空（无任何活会话）。
   const scene = { details: new Map() };
   deps.scanSessions = async () => scanFrom(scene.details);
+  deps.procStartedAt = (pid) => pid === process.pid ? 'self-start' : 'other-start';
   deps.launchctlInfo = () => ({
     state: 'running', 'last exit code': '0', interval: INTERVAL_SECONDS,
   });
@@ -132,7 +133,10 @@ test('wanted task with live creator session is not an alert', async (t) => {
 test('wanted task already held by a tracked warm entry is not an alert', async (t) => {
   const s = await setup(t);
   const out = await s.render([soonOneshot()], {
-    [WS]: { '00000001': { pid: process.pid, startedAt: Math.floor(Date.now() / 1000) } },
+    [WS]: { '00000001': {
+      pid: process.pid, procStart: 'self-start',
+      startedAt: Math.floor(Date.now() / 1000),
+    } },
   });
   assert.ok(!out.includes('下轮巡检会自动启动预热'));
   assert.ok(out.includes('预热会话：1 个'));
@@ -210,7 +214,7 @@ test('roots wrong type is the only field-level fatal config error', async (t) =>
   assert.ok(out.includes('roots'));
 });
 
-test('obsolete config keys are silently ignored, not fatal', async (t) => {
+test('unknown config keys are silently ignored, not fatal', async (t) => {
   const s = await setup(t);
   writeJson(s.cfgPath, {
     roots: [s.tmp],
@@ -254,7 +258,7 @@ test('live warmup outside scan scope is flagged', async (t) => {
   s.deps.discover = () => [];
   const me = process.pid;
   const out = await s.render(null, {
-    [WS]: { '00000001': { pid: me,
+    [WS]: { '00000001': { pid: me, procStart: 'self-start',
       startedAt: Math.floor(Date.now() / 1000) - 60 } },
   });
   assert.ok(out.includes('已不在巡检范围'));
@@ -264,7 +268,7 @@ test('live warmup inside scan scope is not flagged', async (t) => {
   const s = await setup(t);
   const me = process.pid;
   const out = await s.render(null, {
-    [WS]: { '00000001': { pid: me,
+    [WS]: { '00000001': { pid: me, procStart: 'self-start',
       startedAt: Math.floor(Date.now() / 1000) - 60 } },
   });
   assert.ok(!out.includes('已不在巡检范围'));
@@ -276,7 +280,8 @@ test('live warmups show task id, pid and age; dead entries counted', async (t) =
   // 630 而非 600：渲染前会流逝几毫秒，避开分钟边界。
   const out = await s.render(null, {
     [WS]: {
-      '00000001': { pid: me, startedAt: Math.floor(Date.now() / 1000) - 630 },
+      '00000001': { pid: me, procStart: 'self-start',
+        startedAt: Math.floor(Date.now() / 1000) - 630 },
       '00000002': { pid: null, fails: 1 },
     },
   });

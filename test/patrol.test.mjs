@@ -9,7 +9,6 @@ import {
   patrolWorkspace,
   releaseRunLock,
 } from '../src/patrol.mjs';
-import { sessionLogPath, isTaskSessionLogName } from '../src/sessions.mjs';
 import {
   WARMUP_GRACE_SECONDS,
   FAIL_LIMIT,
@@ -35,11 +34,10 @@ const T0 = Math.floor(Date.now() / 1000);
 const nowAt = (sec = T0) => new Date(sec * 1000);
 const LEAD_MS = 360_000;
 
-// 一台完整的进程/登记机器：
-//  - spawnSession 分配三代 pid（script、zsh），claim() 后登记里才出现孙
-//    代 claude（祖先链含 script）；
-//  - kill() 整组消失；resume() 模拟用户终端 --resume（script 死、同 sid
-//    的裸 claude 活，祖先链不再含 script）；
+// 一台完整的 Herdr/登记机器：
+//  - spawnSession 分配根 zsh pid 与终端地址，claim() 后登记里才出现 claude；
+//  - kill() 结束整代；resume() 模拟用户终端 --resume（根进程死、同 sid 的
+//    裸 claude 活，祖先链不再含根进程）；
 //  - 外部创建者会话用 userSessions 配置。
 async function setupMachine(t, { realDiscover = false } = {}) {
   const tmp = mkTmp(t);
@@ -47,7 +45,6 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   deps.paths = tmpPaths(tmp, {
     statePath: path.join(tmp, 'state.json'),
   });
-  fs.mkdirSync(deps.paths.sessionLogDir, { recursive: true });
   const WS = path.join(tmp, 'ws');
   fs.mkdirSync(WS);
   const taskfile = path.join(WS, '.claude', 'scheduled_tasks.json');
@@ -60,7 +57,6 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   const byTask = new Map();
   const userSessions = [];
   const resumed = new Map(); // sid → bare claude pid
-  const scriptProcs = []; // ps 孤儿表：[pid, args]
   const logs = [];
   const patrolLogs = [];
   // 每个任务独立的 spawn 成败/行为钩子。
@@ -71,27 +67,22 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   deps.spawnSession = (wsArg, taskId, model) => {
     logs.push(taskId);
     if (hooks.get(taskId)?.failSpawn) return null;
-    const scriptPid = nextPid++;
-    const zshPid = nextPid++;
-    alive.add(scriptPid);
+    const rootPid = nextPid++;
+    alive.add(rootPid);
     const rec = {
-      ws: wsArg, taskId, model, scriptPid, zshPid,
+      ws: wsArg, taskId, model, rootPid, herdr: `t${rootPid}`,
       claimed: false, sid: null, claudePid: null,
     };
     spawns.push(rec);
     byTask.set(taskId, rec);
-    return { pid: scriptPid, procStart: `start-${scriptPid}` };
+    return { pid: rootPid, procStart: `start-${rootPid}`, herdr: rec.herdr };
   };
-  deps.stopSession = async (ent) => {
-    const rec = spawns.find((r) => r.scriptPid === ent.pid);
+  deps.stopSession = (ent) => {
+    const rec = spawns.find((r) => r.rootPid === ent.pid);
     alive.delete(ent.pid);
-    if (rec) {
-      alive.delete(rec.zshPid);
-      if (rec.claudePid !== null) alive.delete(rec.claudePid);
-    }
+    if (rec && rec.claudePid !== null) alive.delete(rec.claudePid);
     return true;
   };
-  deps.listScriptProcesses = () => scriptProcs;
   deps.acquireRunLock = () => ({ lockPath: null });
   deps.rotatePatrolLogs = () => {};
   deps.log = (msg) => patrolLogs.push(msg);
@@ -108,13 +99,13 @@ async function setupMachine(t, { realDiscover = false } = {}) {
   function buildDetails() {
     const list = [];
     for (const r of spawns) {
-      if (!alive.has(r.scriptPid)) continue;
+      if (!alive.has(r.rootPid)) continue;
       if (r.claimed && r.claudePid !== null && alive.has(r.claudePid)) {
         list.push({
           pid: r.claudePid,
           sessionId: r.sid,
           procStart: `cstart-${r.claudePid}`,
-          ancestors: [r.zshPid, r.scriptPid, 1],
+          ancestors: [r.rootPid, 1],
         });
       }
     }
@@ -155,7 +146,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
     });
   };
 
-  const claim = (rec, sid = `sid-${rec.scriptPid}`) => {
+  const claim = (rec, sid = `sid-${rec.rootPid}`) => {
     rec.claimed = true;
     rec.sid = sid;
     rec.claudePid = nextPid++;
@@ -163,13 +154,11 @@ async function setupMachine(t, { realDiscover = false } = {}) {
     return rec;
   };
   const kill = (rec) => {
-    alive.delete(rec.scriptPid);
-    alive.delete(rec.zshPid);
+    alive.delete(rec.rootPid);
     if (rec.claudePid !== null) alive.delete(rec.claudePid);
   };
   const resume = (rec) => {
-    alive.delete(rec.scriptPid);
-    alive.delete(rec.zshPid);
+    alive.delete(rec.rootPid);
     if (rec.claudePid !== null) alive.delete(rec.claudePid);
     const bare = nextPid++;
     alive.add(bare);
@@ -189,26 +178,19 @@ async function setupMachine(t, { realDiscover = false } = {}) {
     userSessions.push({ sid, pid });
     return pid;
   };
-  const touchLog = (taskId, ageSec, cur = T0) => {
-    const f = sessionLogPath(WS, taskId);
-    fs.mkdirSync(path.dirname(f), { recursive: true });
-    fs.writeFileSync(f, 'x');
-    fs.utimesSync(f, new Date((cur - ageSec) * 1000),
-      new Date((cur - ageSec) * 1000));
-    return f;
-  };
-
   const m = {
     tmp, deps, WS, taskfile, cfgPath, alive, spawns, byTask, hooks,
-    claim, kill, resume, closeResume, addUser, touchLog, buildDetails,
+    claim, kill, resume, closeResume, addUser, buildDetails,
     claimAt, killAt,
     polls: () => polls,
     scans: () => scanCount,
     state: () => (fs.existsSync(deps.paths.statePath)
       ? readJson(deps.paths.statePath) : {}),
-    scriptProcs,
     spawnLog: logs,
     patrolLogs,
+  };
+  m.setIdle = (taskId, ageSec, cur = T0) => {
+    m.bucket[taskId].herdrActivityAt = cur - ageSec;
   };
 
   if (realDiscover) {
@@ -225,7 +207,7 @@ async function setupMachine(t, { realDiscover = false } = {}) {
       if (taskOverride !== null) writeTaskFile(WS, taskOverride);
       return patrolWorkspace(
         WS, bucket, taskfile, nowAt(curSec), LEAD_MS, curSec,
-        buildDetails(), { value: null }, null);
+        buildDetails(), null);
     };
   }
   return m;
@@ -244,14 +226,13 @@ test('two same-time dead-owner tasks get two separate warm sessions and stamps',
   const b = makeTask({ id: '00000004', cron: soon, prompt: '乙日报' });
   writeTaskFile(m.WS, [a, b]);
 
-  // 轮 1：各拉各的，两条日志、两个 script pid；两条都挂起等待认亲。
+  // 轮 1：各拉各的，两条启动记录、两个 Herdr 根 pid；两条都挂起等待认亲。
   const r1 = await m.patrol();
   assert.equal(m.spawns.length, 2);
   assert.equal(m.spawnLog[0], '00000002');
   assert.equal(m.spawnLog[1], '00000004');
-  assert.notEqual(m.spawns[0].scriptPid, m.spawns[1].scriptPid);
-  assert.ok(m.spawnLog.every((id) =>
-    isTaskSessionLogName(path.basename(sessionLogPath(m.WS, id)))));
+  assert.notEqual(m.spawns[0].rootPid, m.spawns[1].rootPid);
+  assert.notEqual(m.spawns[0].herdr, m.spawns[1].herdr);
   assert.deepEqual(r1.map((p) => p.key).sort(),
     ['00000002', '00000004']);
   // 未认亲不盖印。
@@ -323,7 +304,7 @@ test('cross-round reown refreshes process identity under the same session id', a
   m.claim(rec, 'sid-warm');
   await m.patrol(T0 + 1);
 
-  // 同一 script 下的 claude 进程换了 pid，但 sessionId 保持不变。
+  // 同一 Herdr 终端下的 claude 进程换了 pid，但 sessionId 保持不变。
   m.alive.delete(rec.claudePid);
   m.claim(rec, 'sid-warm');
   await m.patrol(T0 + 2);
@@ -335,13 +316,67 @@ test('cross-round reown refreshes process identity under the same session id', a
   assert.equal(m.spawns.length, 1);
 });
 
+test('Herdr display label is set once after the session is claimed', async (t) => {
+  const m = await setupMachine(t);
+  writeTaskFile(m.WS, [makeTask()]);
+  const calls = [];
+  m.deps.setHerdrTitle = (address, title) => {
+    calls.push([address, title]);
+    return null;
+  };
+  await m.patrol();
+  assert.equal(calls.length, 0, '未登记时不与 Herdr 的自动命名竞争');
+  m.claim(m.spawns[0]);
+  await m.patrol();
+  const address = m.spawns[0].herdr;
+  assert.equal(m.bucket['00000001'].herdr, address);
+  assert.equal(m.bucket['00000001'].herdrTitleAttempted, true);
+  assert.deepEqual(calls, [[address, 'cron-up / ws / 做一件事']]);
+  await m.patrol();
+  assert.equal(calls.length, 1, '后续巡检不重复设置显示标签');
+});
+
+test('Herdr display label waits until a claimed task has a usable prompt', async (t) => {
+  const m = await setupMachine(t);
+  const task = makeTask();
+  writeTaskFile(m.WS, [task]);
+  const calls = [];
+  m.deps.setHerdrTitle = (address, title) => {
+    calls.push([address, title]);
+    return null;
+  };
+  await m.patrol();
+  m.claim(m.spawns[0]);
+  writeTaskFile(m.WS, [task, { ...task }]);
+  await m.patrol();
+  assert.equal(sidOf(m, '00000001'), undefined, '重复键不盖印');
+  assert.equal(m.bucket['00000001'].sessionId, `sid-${m.spawns[0].rootPid}`);
+  assert.deepEqual(calls, [], '没有唯一 prompt 时不设置标题');
+  writeTaskFile(m.WS, [task]);
+  await m.patrol();
+  assert.deepEqual(calls, [[m.spawns[0].herdr, 'cron-up / ws / 做一件事']]);
+});
+
+test('Herdr display label failure does not block claiming or reowning', async (t) => {
+  const m = await setupMachine(t);
+  writeTaskFile(m.WS, [makeTask()]);
+  m.deps.setHerdrTitle = () => 'label unsupported';
+  await m.patrol();
+  m.claim(m.spawns[0], 'sid-warm');
+  await m.patrol();
+  assert.equal(sidOf(m, '00000001'), 'sid-warm');
+  assert.equal(m.bucket['00000001'].herdrTitleAttempted, true);
+  assert.ok(m.patrolLogs.some((line) => line.includes('label unsupported')
+    && line.includes('会话仍照常运行')));
+});
+
 test('a __proto__ task id persists as an own entry without duplicate spawns', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   writeTaskFile(m.WS, [makeTask({ id: '__proto__' })]);
   await m.patrol();
   const first = m.state();
   assert.ok(Object.hasOwn(first[m.WS], '__proto__'));
-  assert.equal(first[m.WS].__proto__.pid, m.spawns[0].scriptPid);
+  assert.equal(first[m.WS].__proto__.pid, m.spawns[0].rootPid);
   await m.patrol();
   assert.equal(m.spawns.length, 1, '落盘再读取后仍应复用同一代预热');
   assert.ok(Object.hasOwn(m.state()[m.WS], '__proto__'));
@@ -435,8 +470,8 @@ test('identical-content tasks with different ids stamp their own warm sessions',
   await m.patrol(T0 + 1);
   assert.equal(sidOf(m, '00000002'), 'sid-A');
   assert.equal(sidOf(m, '00000004'), 'sid-B');
-  assert.ok(m.alive.has(m.spawns[0].scriptPid));
-  assert.ok(m.alive.has(m.spawns[1].scriptPid));
+  assert.ok(m.alive.has(m.spawns[0].rootPid));
+  assert.ok(m.alive.has(m.spawns[1].rootPid));
 });
 
 // ---- 卡死 ----
@@ -452,9 +487,9 @@ test('warmup alive but unregistered past grace is retired and respawned', async 
   // 超宽限仍未认亲：杀掉并同轮重拉。
   await m.patrol(T0 + WARMUP_GRACE_SECONDS + 1);
   assert.equal(m.spawns.length, 2);
-  assert.ok(!m.alive.has(first.scriptPid));
+  assert.ok(!m.alive.has(first.rootPid));
   assert.equal(m.bucket['00000001'].fails, 1);
-  assert.equal(m.bucket['00000001'].pid, m.spawns[1].scriptPid);
+  assert.equal(m.bucket['00000001'].pid, m.spawns[1].rootPid);
 });
 
 test('stuck warmup with a live creator is killed but not respawned', async (t) => {
@@ -478,32 +513,6 @@ test('stuck warmup with a live creator is killed but not respawned', async (t) =
   assert.equal(m.bucket['00000001'], undefined);
 });
 
-test('missing fingerprint makes stop return false: keep entry, warn, no respawn', async (t) => {
-  const m = await setupMachine(t);
-  const lines = [];
-  m.deps.log = (msg) => lines.push(msg);
-  writeTaskFile(m.WS, [makeTask()]);
-  const pid = 900;
-  m.alive.add(pid);
-  m.bucket['00000001'] = {
-    ws: m.WS, taskId: '00000001', pid,
-    startedAt: T0 - WARMUP_GRACE_SECONDS - 1, fails: 0,
-    // 旧条目没有 procStart；新版 stopSession 无法确认身份时返回 false。
-  };
-  const prevStop = m.deps.stopSession;
-  m.deps.stopSession = async (ent) => {
-    if (!ent.procStart) return false;
-    return prevStop(ent);
-  };
-  await m.patrol(T0);
-  assert.equal(m.bucket['00000001'].pid, pid);
-  assert.ok(m.alive.has(pid));
-  assert.equal(m.spawns.length, 0, '停止失败不能再拉重复会话');
-  assert.equal(m.bucket['00000001'].fails, 0, '未停止不记启动失败');
-  assert.ok(lines.some((l) => l.includes('无法安全停止')
-    && l.includes('保留跟踪')));
-});
-
 // ---- resume 脱离 ----
 
 test('resume in terminal detaches: no respawn, no kill; closes → fails reset and respawn', async (t) => {
@@ -515,7 +524,7 @@ test('resume in terminal detaches: no respawn, no kill; closes → fails reset a
   await m.patrol(T0 + 1); // 盖印
   assert.equal(sidOf(m, '00000001'), 'sid-warm');
 
-  // 用户在终端 --resume：script 死、裸 claude 持同 sid 活。
+  // 用户在终端 --resume：Herdr 根进程死、裸 claude 持同 sid 活。
   const bare = m.resume(rec);
   await m.patrol(T0 + 2);
   assert.equal(m.spawns.length, 1, '不双开');
@@ -554,13 +563,12 @@ const NEXT_WARMUP = T0 + 540;
 function seedWarm(m, task, { startedAt = T0 - 1000, claimed = true,
   sid = 'sid-warm' } = {}) {
   writeTaskFile(m.WS, [task]);
-  const scriptPid = 500;
-  const zshPid = 501;
+  const rootPid = 500;
   const claudePid = claimed ? 502 : null;
-  for (const p of [scriptPid, zshPid]) m.alive.add(p);
+  m.alive.add(rootPid);
   if (claudePid !== null) m.alive.add(claudePid);
   const rec = {
-    ws: m.WS, taskId: '00000001', scriptPid, zshPid,
+    ws: m.WS, taskId: '00000001', rootPid, herdr: 't500',
     claimed, sid: claimed ? sid : null, claudePid,
   };
   m.spawns.push(rec);
@@ -568,11 +576,11 @@ function seedWarm(m, task, { startedAt = T0 - 1000, claimed = true,
   const ent = {
     ws: m.WS,
     taskId: '00000001',
-    pid: scriptPid,
-    procStart: `start-${scriptPid}`,
+    pid: rootPid,
+    procStart: `start-${rootPid}`,
     startedAt,
     fails: 0,
-    log: sessionLogPath(m.WS, '00000001'),
+    herdr: rec.herdr,
   };
   if (claimed) {
     ent.sessionId = sid;
@@ -586,39 +594,39 @@ function seedWarm(m, task, { startedAt = T0 - 1000, claimed = true,
 test('a fired generation is retained until the next warmup window', async (t) => {
   const m = await setupMachine(t);
   const rec = seedWarm(m, recycleTask());
-  m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10);
+  m.setIdle('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10);
   await m.patrol(T0);
-  assert.ok(m.alive.has(rec.scriptPid));
+  assert.ok(m.alive.has(rec.rootPid));
   assert.equal(m.spawns.length, 1, '执行后不能按固定静默时长提前换代');
 });
 
 test('next warmup stops the old generation and starts its replacement in the same round', async (t) => {
   const m = await setupMachine(t);
   const rec = seedWarm(m, recycleTask());
-  m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10, NEXT_WARMUP);
+  m.setIdle('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10, NEXT_WARMUP);
   const pending = await m.patrol(NEXT_WARMUP);
-  assert.ok(!m.alive.has(rec.scriptPid));
+  assert.ok(!m.alive.has(rec.rootPid));
   assert.equal(m.spawns.length, 2);
   const replacement = m.spawns[1];
-  assert.ok(m.alive.has(replacement.scriptPid));
-  assert.equal(m.bucket['00000001'].pid, replacement.scriptPid);
-  assert.deepEqual(pending.map((p) => p.pid), [replacement.scriptPid]);
+  assert.ok(m.alive.has(replacement.rootPid));
+  assert.equal(m.bucket['00000001'].pid, replacement.rootPid);
+  assert.deepEqual(pending.map((p) => p.pid), [replacement.rootPid]);
   assert.ok(m.patrolLogs.some((line) => line.includes('已进入下一次预热窗口')));
 });
 
 for (const [name, over, logAge] of [
   ['the previous generation never fired',
     { lastFiredAt: (T0 - 5000) * 1000 }, SESSION_RECYCLE_IDLE_SECONDS + 10],
-  ['the session log is fresh', {}, 10],
+  ['the Herdr screen is fresh', {}, 10],
   ['there is no separate warmup gap',
     { cron: '*/5 * * * *' }, SESSION_RECYCLE_IDLE_SECONDS + 10],
 ]) {
   test(`no replacement when ${name}`, async (t) => {
     const m = await setupMachine(t);
     const rec = seedWarm(m, recycleTask(over));
-    m.touchLog('00000001', logAge, NEXT_WARMUP);
+    m.setIdle('00000001', logAge, NEXT_WARMUP);
     await m.patrol(NEXT_WARMUP);
-    assert.ok(m.alive.has(rec.scriptPid));
+    assert.ok(m.alive.has(rec.rootPid));
     assert.equal(m.spawns.length, 1);
   });
 }
@@ -626,23 +634,9 @@ for (const [name, over, logAge] of [
 test('unregistered spawning session is never recycled by the generation path', async (t) => {
   const m = await setupMachine(t);
   const rec = seedWarm(m, recycleTask(), { claimed: false });
-  m.touchLog('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10, T0);
+  m.setIdle('00000001', SESSION_RECYCLE_IDLE_SECONDS + 10, T0);
   await m.patrol(T0);
-  assert.ok(m.alive.has(rec.scriptPid));
-});
-
-test('delivery observation is logged once per lastFiredAt, not as success', async (t) => {
-  const m = await setupMachine(t);
-  seedWarm(m, recycleTask());
-  await m.patrol(T0);
-  await m.patrol(T0 + 1);
-  const deliveries = () => m.patrolLogs.filter((line) =>
-    line.includes('观测到投递'));
-  assert.equal(deliveries().length, 1);
-  assert.ok(deliveries()[0].includes('不代表任务已执行成功'));
-
-  await m.patrol(T0 + 2, [recycleTask({ lastFiredAt: T0 * 1000 })]);
-  assert.equal(deliveries().length, 2);
+  assert.ok(m.alive.has(rec.rootPid));
 });
 
 // ---- 任务消失 / 清空 / 损坏 ----
@@ -661,15 +655,15 @@ test('deleting one task reaps only its entry; empty file reaps the bucket', asyn
   // 删甲，留乙。
   writeTaskFile(m.WS, [makeTask({ id: '00000004', prompt: '乙' })]);
   await m.patrol(T0 + 2);
-  assert.ok(!m.alive.has(m.byTask.get('00000002').scriptPid));
-  assert.ok(m.alive.has(m.byTask.get('00000004').scriptPid));
+  assert.ok(!m.alive.has(m.byTask.get('00000002').rootPid));
+  assert.ok(m.alive.has(m.byTask.get('00000004').rootPid));
   assert.equal(m.bucket['00000002'], undefined);
   assert.ok(m.bucket['00000004']);
 
   // 清空：乙也收。
   writeTaskFile(m.WS, []);
   await m.patrol(T0 + 3);
-  assert.ok(!m.alive.has(m.byTask.get('00000004').scriptPid));
+  assert.ok(!m.alive.has(m.byTask.get('00000004').rootPid));
   assert.deepEqual(m.bucket, {});
 });
 
@@ -677,7 +671,7 @@ test('unreadable task file freezes every entry', async (t) => {
   const m = await setupMachine(t);
   writeTaskFile(m.WS, [makeTask()]);
   await m.patrol();
-  const pid = m.spawns[0].scriptPid;
+  const pid = m.spawns[0].rootPid;
   fs.writeFileSync(m.taskfile, '{ broken');
   await m.patrol(T0 + 1);
   assert.ok(m.alive.has(pid));
@@ -686,17 +680,43 @@ test('unreadable task file freezes every entry', async (t) => {
 
 // ---- 孤儿认领 ----
 
-test('orphan script process is adopted by its task-specific log path', async (t) => {
+test('orphan Herdr terminal is adopted by its task identity without respawning', async (t) => {
   const m = await setupMachine(t);
-  writeTaskFile(m.WS, [makeTask()]);
+  writeTaskFile(m.WS, [makeTask({ prompt: '可读任务' })]);
   const orphanPid = 777;
   m.alive.add(orphanPid);
-  const orphanLog = sessionLogPath(m.WS, '00000001');
-  m.scriptProcs.push([orphanPid,
-    `/usr/bin/script -q ${orphanLog} /bin/zsh -lic 'cd x && claude'`]);
-  await m.patrol();
-  assert.equal(m.spawns.length, 0, '认回孤儿，不新拉');
+  m.deps.findHerdrOrphan = (ws, taskId) => {
+    assert.equal(ws, m.WS);
+    assert.equal(taskId, '00000001');
+    return { pid: orphanPid, procStart: 'start', herdr: 't7' };
+  };
+  const pending = await m.patrol();
+  assert.equal(m.spawns.length, 0, '认回 Herdr 孤儿，不新拉');
   assert.equal(m.bucket['00000001'].pid, orphanPid);
+  assert.equal(m.bucket['00000001'].herdr, 't7');
+  assert.deepEqual(pending.map((p) => [p.pid, p.prompt]), [[orphanPid, '可读任务']]);
+});
+
+test('failed-start entry still adopts its live Herdr terminal before respawning', async (t) => {
+  const m = await setupMachine(t);
+  writeTaskFile(m.WS, [makeTask()]);
+  m.bucket['00000001'] = {
+    ws: m.WS, taskId: '00000001', pid: null, startedAt: T0, fails: 1,
+  };
+  m.alive.add(777);
+  m.deps.findHerdrOrphan = () => ({ pid: 777, procStart: 'start-777', herdr: 't7' });
+  await m.patrol();
+  assert.equal(m.spawns.length, 0, 'pid=null 不代表 Herdr 中没有存活终端');
+  assert.equal(m.bucket['00000001'].pid, 777);
+  assert.equal(m.bucket['00000001'].fails, 0);
+});
+
+test('orphan query failure blocks a replacement spawn', async (t) => {
+  const m = await setupMachine(t);
+  writeTaskFile(m.WS, [makeTask()]);
+  m.deps.findHerdrOrphan = () => { throw new Error('hc ls timed out'); };
+  await assert.rejects(m.patrol(), /hc ls timed out/);
+  assert.equal(m.spawns.length, 0);
 });
 
 // ---- 病态重复任务键 ----
@@ -743,49 +763,7 @@ test('cmdRun end-to-end: two tasks, two sessions, nested state persisted', async
   assert.ok(st[m.WS]['00000002']);
   assert.ok(st[m.WS]['00000004']);
   assert.notEqual(st[m.WS]['00000002'].pid, st[m.WS]['00000004'].pid);
-});
-
-test('cmdRun: legacy flat state sessions are stopped and state replaced', async (t) => {
-  const m = await setupMachine(t, { realDiscover: true });
-  writeTaskFile(m.WS, [makeTask()]);
-  const oldPid = 222;
-  m.alive.add(oldPid);
-  writeJson(m.deps.paths.statePath, {
-    [m.WS]: {
-      pid: oldPid, procStart: `start-${oldPid}`, startedAt: T0 - 10,
-      fails: 0, log: path.join(m.deps.paths.sessionLogDir, 'old-style.log'),
-    },
-  });
-  // ps 里还有一个 state 丢失的旧命名孤儿。
-  const orphanPid = 333;
-  m.alive.add(orphanPid);
-  m.scriptProcs.push([orphanPid,
-    `/usr/bin/script -q ${path.join(m.deps.paths.sessionLogDir, 'old-style.log')} /bin/zsh -lic x`]);
-  await m.patrol();
-  assert.ok(!m.alive.has(oldPid));
-  assert.ok(!m.alive.has(orphanPid));
-  // state 已被新形状整体替换：legacy 条目消失，新任务正常拉起。
-  const st = m.state();
-  assert.ok(st[m.WS]['00000001']);
-  assert.equal(st[m.WS]['00000001'].pid, m.spawns[0].scriptPid);
-});
-
-test('cmdRun: failed legacy stop preserves the old state for a later retry', async (t) => {
-  const m = await setupMachine(t, { realDiscover: true });
-  writeTaskFile(m.WS, [makeTask()]);
-  const oldPid = 222;
-  m.alive.add(oldPid);
-  writeJson(m.deps.paths.statePath, {
-    [m.WS]: {
-      pid: oldPid, procStart: `start-${oldPid}`, startedAt: T0 - 10,
-      fails: 0, log: path.join(m.deps.paths.sessionLogDir, 'old-style.log'),
-    },
-  });
-  m.deps.stopSession = async () => false;
-  await m.patrol();
-  const preserved = m.state();
-  assert.equal(preserved[m.WS].pid, oldPid,
-    '未停掉的旧条目不能被新形状状态覆盖遗忘');
+  assert.deepEqual(Object.keys(readJson(m.deps.paths.heartbeatPath)), ['ranAt']);
 });
 
 test('cmdRun: passive death between rounds is reported with task id', async (t) => {
@@ -794,7 +772,7 @@ test('cmdRun: passive death between rounds is reported with task id', async (t) 
   m.deps.log = (msg) => lines.push(msg);
   writeTaskFile(m.WS, [makeTask()]);
   await m.patrol();
-  const pid = m.spawns[0].scriptPid;
+  const pid = m.spawns[0].rootPid;
   m.kill(m.spawns[0]);
   lines.length = 0;
   await m.patrol();
@@ -859,11 +837,11 @@ test('cmdRun: unregistered warm session is waited out but not killed or counted'
   assert.equal(m.polls(), 8);
   assert.equal(m.scans(), 10);
   const rec = m.byTask.get('00000002');
-  assert.ok(m.alive.has(rec.scriptPid));
+  assert.ok(m.alive.has(rec.rootPid));
   assert.equal(m.spawns.length, 1);
   assert.equal(sidOf(m, '00000002'), undefined);
   const ent = m.state()[m.WS]['00000002'];
-  assert.equal(ent.pid, rec.scriptPid);
+  assert.equal(ent.pid, rec.rootPid);
   assert.equal(ent.fails, 0);
   assert.equal(ent.sessionId, undefined);
   assert.ok(m.patrolLogs.some((line) => line.includes('等待登记')
@@ -974,6 +952,14 @@ test('cmdRun: stamp write lost to a concurrent task-file change is skipped', asy
   assert.equal(m.state()[m.WS]['00000002'].sessionId, 'sid-A');
 });
 
+test('cmdRun requires Herdr before taking the patrol lock', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  m.deps.findHerdr = () => null;
+  m.deps.acquireRunLock = () => assert.fail('缺少必需依赖时不应开始巡检');
+  await assert.rejects(m.patrol(), (e) => e.code === 2
+    && e.message.includes('Herdr'));
+});
+
 test('cmdRun skipped when the lock is held elsewhere', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   m.deps.acquireRunLock = () => null;
@@ -1057,20 +1043,6 @@ test('run lock gives a fresh empty file an initialization grace period', (t) => 
   fs.utimesSync(lockPath, old, old);
   const handle = acquireRunLock();
   assert.ok(handle, '超过初始化宽限的半成品才可清理');
-  releaseRunLock(handle);
-});
-
-test('run lock preserves a live legacy pid lock until its holder dies', (t) => {
-  const { lockPath, living, writeLock } = lockFixture(t);
-  living.add(4242);
-  writeLock('4242\n');
-  const old = new Date(Date.now() - 11_000);
-  fs.utimesSync(lockPath, old, old); // 活旧锁即使超过无效文件宽限也不能删。
-  assert.equal(acquireRunLock(), null);
-  assert.equal(fs.readFileSync(lockPath, 'utf-8'), '4242\n');
-  living.delete(4242);
-  const handle = acquireRunLock();
-  assert.ok(handle, '旧版 holder 明确死亡后才回收纯 pid 锁');
   releaseRunLock(handle);
 });
 

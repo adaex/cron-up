@@ -3,12 +3,10 @@
 // 存在」，巡检就会反复重拉。scanSessions 因此内置三枚烟雾告警，分别盯住
 // 三种漂移形态。
 //
-// 除「某目录有哪些活会话」外，它回报每个会话的进程祖先链：cron-up 拉起
-// 的预热会话是三层结构 script(S) → zsh(Z) → claude(C)（claude 在交互
-// shell 里是函数，函数帧不做 tail-exec），state 只记得到 S，登记里却是
-// C，pgid 又被交互 shell 的作业控制改过——唯一稳定的认亲方式是沿 ppid
-// 上溯。祖先链每轮恒拍（一次全机 ps，毫秒级）：任务级模型下每个预热都
-// 要靠它把 script pid 认成登记里的 sessionId，没有「不需要认亲」的轮次。
+// 除「某目录有哪些活会话」外，认亲扫描还回报每个会话的进程祖先链：
+// Herdr 预热是 zsh(Z) → claude(C)，state 记根进程 Z，登记里却是 C，pgid 又被
+// 交互 shell 的作业控制改过——稳定的认亲方式是沿 ppid 上溯。祖先链与进程
+// 形态共用一张全机 ps 快照；展示命令不需要祖先时可跳过该快照。
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -34,42 +32,40 @@ function ps(pid, fmt) {
   }
 }
 
-// 一次 ps 同时拿进程名与父 pid：{isClaude, ppid}。ppid 按「末尾空白+
-// 数字」取——comm 可能是含空格的路径，但不会以「空白+数字」结尾；列缺
-// 失（ps 失败/输出漂移）时 ppid 为 null。
-export function processShape(pid) {
-  const line = ps(pid, 'comm=,ppid=');
-  const m = line.match(/^(.*\S)\s+(\d+)\s*$/);
-  const comm = path.basename((m ? m[1] : line).trim()).toLowerCase();
-  const ppid = m ? parseInt(m[2], 10) : null;
-  let isClaude = comm.includes('claude');
-  if (!isClaude && INTERPRETER_COMMS.has(comm)) {
-    isClaude = CLAUDE_ENTRY_RE.test(ps(pid, 'args=').toLowerCase());
-  }
-  return { isClaude, ppid };
+// 原生安装的 comm 包含 claude；解释器安装再检查完整命令行。认亲扫描从
+// 全机快照传入 comm，避免每个原生进程再单独执行一次 ps。
+export function isClaudeProcess(pid, comm) {
+  const name = path.basename(comm ?? ps(pid, 'comm=')).toLowerCase();
+  return name.includes('claude') || (INTERPRETER_COMMS.has(name)
+    && CLAUDE_ENTRY_RE.test(ps(pid, 'args=').toLowerCase()));
 }
 
-// 全机进程父子表：一次 ps -axo pid=,ppid= 拍快照，Map<pid, ppid>。任何
-// 异常都返回 null（祖先链一律按空链处理：认亲下轮再试，不阻断 spawn）。
-export function processParentMap() {
-  const r = deps.execFile('/bin/ps', ['-axo', 'pid=,ppid='], { timeout: 5000 });
+// 全机进程快照：一次 ps 同时取得 ppid 与 comm，Map<pid, {ppid, comm}>。
+// 异常返回 null；祖先链按空链处理，进程形态退回逐 pid 查询。
+export function processTable() {
+  const r = deps.execFile('/bin/ps', ['-axo', 'pid=,ppid=,comm='], { timeout: 5000 });
   if (r.status !== 0) return null;
-  const map = new Map();
+  const table = new Map();
   for (const line of (r.stdout ?? '').split('\n')) {
-    const m = line.match(/^\s*(\d+)\s+(\d+)\s*$/);
-    if (m) map.set(parseInt(m[1], 10), parseInt(m[2], 10));
+    const m = line.match(/^\s*(\d+)\s+(\d+)\s+(\S.*)$/);
+    if (m) {
+      table.set(parseInt(m[1], 10), {
+        ppid: parseInt(m[2], 10),
+        comm: m[3],
+      });
+    }
   }
-  return map.size > 0 ? map : null;
+  return table.size > 0 ? table : null;
 }
 
-// 沿父子表上溯（不含 pid 自身），直到 launchd(1；其父记为 0)、父 pid 在
+// 沿进程快照上溯（不含 pid 自身），直到 launchd(1；其父记为 0)、父 pid 在
 // 快照里缺失或成环。调用方只消费祖先列表；断链时保留已读到的部分即可。
-export function ancestorChain(pid, parentMap) {
+export function ancestorChain(pid, table) {
   const ancestors = [];
   const seen = new Set([pid]);
   let cur = pid;
   for (;;) {
-    const parent = parentMap?.get(cur);
+    const parent = table?.get(cur)?.ppid;
     if (parent === undefined) return ancestors;
     ancestors.push(parent);
     if (parent <= 1) return ancestors; // 0/1 即根
@@ -95,19 +91,19 @@ export function creatorSessionAlive(task, liveSids) {
     && liveSids.has(task.createdBySessionId);
 }
 
-// 认亲：我们 spawn 的 script pid 是不是本目录某个活登记会话的祖先。命中
-// 即该预热已完成登记、是健康会话，返回登记详情（claude 的 pid/sessionId/
-// procStart）；认不到返回 null（会话还在启动，或卡在提问界面）。
-export function claimWarm(details, ws, scriptPid) {
+// 认亲：我们启动的根 pid 是不是本目录某个活登记会话的祖先。命中即该预热
+// 已完成登记、是健康会话，返回登记详情（claude 的 pid/sessionId/procStart）；
+// 认不到返回 null（会话还在启动，或卡在提问界面）。
+export function claimWarm(details, ws, rootPid) {
   const list = details?.get(ws) ?? [];
-  return list.find((d) => d.ancestors.includes(scriptPid)) ?? null;
+  return list.find((d) => d.ancestors.includes(rootPid)) ?? null;
 }
 
 // 轻量单会话存活检查：按 sessionId 找登记、pid 活、cwd 匹配。轮末死亡复
-// 核用——轮初还活的预热 script 轮中死去时，要区分「真的死了」与「用户在
+// 核用——轮初还活的预热根进程轮中死去时，要区分「真的死了」与「用户在
 // 终端 --resume 接管成裸 claude」（同一 sessionId、新 pid），后者不算会
-// 话退出。不给 ws 时只看 sid 活不活。
-export function sessionAliveNow(sid, ws = null) {
+// 话退出。
+export function sessionAliveNow(sid, ws) {
   if (typeof sid !== 'string') return false;
   let files = [];
   try {
@@ -127,10 +123,8 @@ export function sessionAliveNow(sid, ws = null) {
     if (!isPlainObject(s) || s.sessionId !== sid) continue;
     const pid = parsePid(s.pid);
     if (pid === null || !deps.alive(pid)) continue;
-    if (ws !== null) {
-      if (typeof s.cwd !== 'string' || !path.isAbsolute(s.cwd)
-          || lexReal(s.cwd) !== ws) continue;
-    }
+    if (typeof s.cwd !== 'string' || !path.isAbsolute(s.cwd)
+        || lexReal(s.cwd) !== ws) continue;
     return true;
   }
   return false;
@@ -158,11 +152,11 @@ async function readSessionFile(file) {
   return null;
 }
 
-// 返回 [拥有活消费者会话的工作区集合, 告警字符串|null, 会话详情 Map]。
-// 第三个元素是 Map<cwd, Array<{pid, sessionId, procStart, ancestors}>>。
-// 祖先链恒拍：快照失败给空链，相关预热本轮认不到亲、下轮自动重试；
-// consumers 判定不受影响。
-export async function scanSessions() {
+// 返回 [告警字符串|null, 会话详情 Map]。
+// 第二个元素是 Map<cwd, Array<{pid, sessionId, procStart, ancestors}>>；键集
+// 合就是拥有活消费者会话的工作区。认亲调用保留 ancestors；展示调用传
+// {ancestors:false}，不拍全机进程表。快照失败给空链，消费者判定不受影响。
+export async function scanSessions({ ancestors: needAncestors = true } = {}) {
   let files = [];
   try {
     files = fs.readdirSync(deps.paths.sessionDir)
@@ -179,18 +173,19 @@ export async function scanSessions() {
     }
   }
 
-  // 全轮一张父子表快照：所有会话的祖先链取自同一时刻，且只付一次全机
-  // ps。失败给 null，祖先链一律按断链处理（本轮认不到亲）。
-  let parentMap = null;
-  try {
-    parentMap = deps.processParentMap();
-  } catch {
-    parentMap = null;
-  }
+  // 只有遇到活登记才拍快照；同轮所有会话共享 ppid 与 comm。
+  let table;
+  const getTable = () => {
+    if (table !== undefined) return table;
+    try {
+      table = needAncestors ? deps.processTable() : null;
+    } catch {
+      table = null;
+    }
+    return table;
+  };
 
-  const consumers = new Set();
   const details = new Map();
-  const shapeCache = new Map();
   let liveOther = 0;
   // interactive 认得出来，却读不出有效 pid 或工作目录的条目数：pid/cwd
   // 字段改名就是这种形态，而下面两条自检只看 kind 与进程形态，兜不住。
@@ -206,18 +201,14 @@ export async function scanSessions() {
       continue;
     }
     if (!deps.alive(pid)) continue; // 陈旧登记（崩溃留下）：正常，不计
-    if (!shapeCache.has(pid)) {
-      shapeCache.set(pid, deps.processShape(pid)); // ps 调用按 pid 缓存
-    }
-    const shape = shapeCache.get(pid);
-    if (shape.isClaude) {
+    const snapshot = getTable();
+    if (deps.isClaudeProcess(pid, snapshot?.get(pid)?.comm)) {
       // cwd 同样不可信：非字符串当定位不到工作区；空串与相对路径会被
       // resolve 拼到巡检进程自己的 cwd 下，凭空造出消费者目录。
       const cwd = s.cwd;
       if (typeof cwd === 'string' && path.isAbsolute(cwd)) {
         const ws = lexReal(cwd);
-        consumers.add(ws);
-        const ancestors = parentMap ? ancestorChain(pid, parentMap) : [];
+        const ancestors = snapshot ? ancestorChain(pid, snapshot) : [];
         const list = details.get(ws) ?? [];
         list.push({
           pid,
@@ -241,21 +232,20 @@ export async function scanSessions() {
     alert = `会话登记目录 ${deps.paths.sessionDir} 下有 ${files.length} 个登记文件，`
       + '但没有一个是 interactive 会话；Claude Code 的会话登记格式可能已变更，'
       + 'cron-up 将识别不到任何现有会话';
-  } else if (liveOther > 0 && consumers.size === 0) {
+  } else if (liveOther > 0 && details.size === 0) {
     alert = '会话登记中的存活进程都不是 claude 命令；Claude Code 的启动形态可能'
       + '已变更，cron-up 可能反复重拉会话';
-  } else if (suspect > 0 && consumers.size === 0) {
+  } else if (suspect > 0 && details.size === 0) {
     alert = '会话登记中的 interactive 会话都读不出有效的 pid 或工作目录；'
       + 'Claude Code 的会话登记字段可能已变更，cron-up 会把已有会话误判为'
       + '不存在，重复拉起预热会话';
   }
-  return [consumers, alert, details];
+  return [alert, details];
 }
 
 Object.assign(deps, {
-  processShape,
-  processParentMap,
-  ancestorChain,
+  isClaudeProcess,
+  processTable,
   liveSessionIds,
   creatorSessionAlive,
   claimWarm,

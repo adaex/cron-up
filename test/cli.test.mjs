@@ -79,28 +79,6 @@ test('prototype property names are not commands', () => {
   }
 });
 
-test('renew subcommand has been removed', () => {
-  assert.throws(() => parseCli(['renew']), exit2);
-});
-
-test('removed install flags are all unknown options now', () => {
-  for (const args of [
-    ['install', '--force'],
-    ['install', '--interval', '600'],
-    ['install', '--lead', '0'],
-    ['install', '--auto-renew'],
-    ['install', '--no-auto-renew'],
-    ['install', '--auto-renew=false'],
-    ['install', '--auto-min-id'],
-    ['install', '--no-auto-min-id'],
-    ['install', '--session-retain', 'always'],
-    ['install', '--stamp-owner'],
-    ['install', '--no-stamp-owner'],
-  ]) {
-    assert.throws(() => parseCli(args), exit2, args.join(' '));
-  }
-});
-
 test('install accepts only --roots', () => {
   const p = parseCli(['install', '--roots', '/a,~/b']);
   assert.equal(p.command, 'install');
@@ -111,9 +89,8 @@ test('install --roots without a value exits 2', () => {
   assert.throws(() => parseCli(['install', '--roots']), exit2);
 });
 
-test('uninstall accepts --purge only; --keep-sessions is gone', () => {
+test('uninstall accepts --purge', () => {
   assert.equal(parseCli(['uninstall', '--purge']).opts.purge, true);
-  assert.throws(() => parseCli(['uninstall', '--keep-sessions']), exit2);
 });
 
 test('bool options reject every =value form instead of becoming true', () => {
@@ -124,13 +101,6 @@ test('bool options reject every =value form instead of becoming true', () => {
   ]) {
     assert.throws(() => parseCli(args), exit2, args.join(' '));
   }
-});
-
-test('legacy --stop-sessions flag is gone (exit 2)', async (t) => {
-  mockDeps(t);
-  await assert.rejects(
-    main(['node', 'cron-up', 'uninstall', '--stop-sessions']),
-    (e) => e instanceof ExitError && e.code === 2);
 });
 
 test('logs -f maps to follow and captures positional workspace', () => {

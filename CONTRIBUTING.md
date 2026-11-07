@@ -4,9 +4,9 @@
 
 ## 开发环境
 
-- macOS，便于验证 launchd、`script(1)`、zsh 和进程行为
+- macOS，便于验证 launchd、Herdr Core、zsh 和进程行为
 - Node.js 22 或更高版本
-- 无第三方运行时依赖，测试直接使用 `node:test`
+- Node.js 代码没有 npm 第三方运行时依赖，测试直接使用 `node:test`；实际运行另需 Herdr Core
 
 ```bash
 git clone git@github.com:adaex/cron-up.git
@@ -30,7 +30,7 @@ node --test
 | `src/patrol.mjs` | 巡检主状态机 |
 | `src/tasks.mjs` | 工作区发现、任务读取、工作区模型配置、续期与归属写入 |
 | `src/cron.mjs` | cron 解析、预热窗口与预计投递时间 |
-| `src/sessions.mjs`、`src/registry.mjs` | 预热进程生命周期、会话日志与 Claude Code 会话登记识别 |
+| `src/sessions.mjs`、`src/registry.mjs` | Herdr 会话生命周期与 Claude Code 会话登记识别 |
 | `src/config.mjs` | 配置、状态与心跳的读写和校验 |
 | `src/service.mjs` | install、uninstall、launchd 与启动链健康检查 |
 | `src/overview.mjs`、`src/list.mjs`、`src/logs.mjs`、`src/display.mjs` | 总览、任务列表、日志命令与终端展示 |
@@ -49,7 +49,6 @@ node --test
 | 命令、选项、升级步骤或帮助文案 | `src/cli.mjs`，必要时包括 `src/overview.mjs` |
 | npm 包定位 | `package.json` 的 `description` |
 | 内部机制、生命周期常量、兼容性证据或投递算法 | `docs/internals.md` |
-| 跨版本行为与旧安装收尾 | `docs/migration.md` |
 | 版本号、工作流或发布验收 | `docs/release.md` |
 
 根目录 `CLAUDE.md` 只保留 Agent 必须始终知道的边界和文档地图；具体开发做法、内部机制与成文流程分别留在对应主题文档，不要抄回入口
