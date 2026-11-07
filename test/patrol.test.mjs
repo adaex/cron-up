@@ -317,60 +317,6 @@ test('cross-round reown refreshes process identity under the same session id', a
   assert.equal(m.spawns.length, 1);
 });
 
-test('Herdr display label is set once after the session is claimed', async (t) => {
-  const m = await setupMachine(t);
-  writeTaskFile(m.WS, [makeTask()]);
-  const calls = [];
-  m.deps.setHerdrTitle = (address, title) => {
-    calls.push([address, title]);
-    return null;
-  };
-  await m.patrol();
-  assert.equal(calls.length, 0, '未登记时不与 Herdr 的自动命名竞争');
-  m.claim(m.spawns[0]);
-  await m.patrol();
-  const address = m.spawns[0].herdr;
-  assert.equal(m.bucket['00000001'].herdr, address);
-  assert.equal(m.bucket['00000001'].herdrTitleAttempted, true);
-  assert.deepEqual(calls, [[address, 'cron-up / ws / 做一件事']]);
-  await m.patrol();
-  assert.equal(calls.length, 1, '后续巡检不重复设置显示标签');
-});
-
-test('Herdr display label waits until a claimed task has a usable prompt', async (t) => {
-  const m = await setupMachine(t);
-  const task = makeTask();
-  writeTaskFile(m.WS, [task]);
-  const calls = [];
-  m.deps.setHerdrTitle = (address, title) => {
-    calls.push([address, title]);
-    return null;
-  };
-  await m.patrol();
-  m.claim(m.spawns[0]);
-  writeTaskFile(m.WS, [task, { ...task }]);
-  await m.patrol();
-  assert.equal(sidOf(m, '00000001'), undefined, '重复键不盖印');
-  assert.equal(m.bucket['00000001'].sessionId, `sid-${m.spawns[0].rootPid}`);
-  assert.deepEqual(calls, [], '没有唯一 prompt 时不设置标题');
-  writeTaskFile(m.WS, [task]);
-  await m.patrol();
-  assert.deepEqual(calls, [[m.spawns[0].herdr, 'cron-up / ws / 做一件事']]);
-});
-
-test('Herdr display label failure does not block claiming or reowning', async (t) => {
-  const m = await setupMachine(t);
-  writeTaskFile(m.WS, [makeTask()]);
-  m.deps.setHerdrTitle = () => 'label unsupported';
-  await m.patrol();
-  m.claim(m.spawns[0], 'sid-warm');
-  await m.patrol();
-  assert.equal(sidOf(m, '00000001'), 'sid-warm');
-  assert.equal(m.bucket['00000001'].herdrTitleAttempted, true);
-  assert.ok(m.patrolLogs.some((line) => line.includes('label unsupported')
-    && line.includes('会话仍照常运行')));
-});
-
 test('large recurring ids migrate task state, pending keys and Herdr labels together', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   const synced = [];
@@ -812,7 +758,7 @@ test('unreadable task file freezes every entry', async (t) => {
 
 test('orphan Herdr terminal is adopted by its task identity without respawning', async (t) => {
   const m = await setupMachine(t);
-  writeTaskFile(m.WS, [makeTask({ prompt: '可读任务' })]);
+  writeTaskFile(m.WS, [makeTask()]);
   const orphanPid = 777;
   m.alive.add(orphanPid);
   m.deps.findHerdrOrphan = (ws, taskId) => {
@@ -824,7 +770,7 @@ test('orphan Herdr terminal is adopted by its task identity without respawning',
   assert.equal(m.spawns.length, 0, '认回 Herdr 孤儿，不新拉');
   assert.equal(m.bucket['00000001'].pid, orphanPid);
   assert.equal(m.bucket['00000001'].herdr, 't7');
-  assert.deepEqual(pending.map((p) => [p.pid, p.prompt]), [[orphanPid, '可读任务']]);
+  assert.deepEqual(pending.map((p) => p.pid), [orphanPid]);
 });
 
 test('failed-start entry still adopts its live Herdr terminal before respawning', async (t) => {
@@ -1048,6 +994,42 @@ test('cmdRun: partial claim of identical-content tasks stamps only the claimed i
   const st = m.state()[m.WS];
   assert.equal(st['00000002'].sessionId, 'sid-A');
   assert.equal(st['00000004'].sessionId, undefined);
+});
+
+test('cmdRun ensures the naming anchor once and failure does not block spawning', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [
+    makeTask({ id: '00000002' }),
+    makeTask({ id: '00000004' }),
+  ]);
+  let calls = 0;
+  m.deps.ensureHerdrAnchor = (hc) => {
+    assert.equal(hc, '/mock/hc');
+    calls += 1;
+    throw new Error('hc unavailable');
+  };
+  assert.equal(await m.patrol(), true);
+  assert.equal(calls, 1);
+  assert.equal(m.spawns.length, 2);
+  assert.ok(m.patrolLogs.some((line) => line.includes('hc unavailable')
+    && line.includes('下轮巡检重试锚点')));
+});
+
+test('cmdRun checks the anchor each round and logs only an actual launch', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, []);
+  let calls = 0;
+  m.deps.ensureHerdrAnchor = () => {
+    calls += 1;
+    return calls === 1
+      ? { pid: 4242, procStart: 'start', herdr: 'ta' } : null;
+  };
+  assert.equal(await m.patrol(), true);
+  assert.equal(await m.patrol(), true);
+  assert.equal(calls, 2);
+  const starts = m.patrolLogs.filter((line) => line.includes('已启动 Herdr 命名锚点 ta'));
+  assert.equal(starts.length, 1);
+  assert.ok(starts[0].includes('cwd=/tmp/cron-tasks'));
 });
 
 test('cmdRun: no pending sessions means no extra scans or sleeps', async (t) => {

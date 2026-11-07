@@ -24,6 +24,7 @@ export function mockDeps(t) {
   // 默认使用隔离的 Herdr 替身，避免宿主机终端影响单元测试；专项用例再
   // 替换 execFile 或这些业务依赖。活动时间在状态机测试中直接由字段计算。
   deps.findHerdr = () => '/mock/hc';
+  deps.ensureHerdrAnchor = () => null;
   deps.getHerdrTerminal = () => null;
   deps.listHerdrTerminals = () => [];
   deps.findHerdrOrphan = () => null;

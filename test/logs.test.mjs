@@ -138,6 +138,7 @@ test('Herdr selector accepts an absolute workspace and reports ambiguous candida
   s.deps.listHerdrTerminals = () => [
     { address: 't7', taskId: '00000001', cwd: ws, title: '甲', state: 'finished' },
     { address: 't8', taskId: '00000002', cwd: ws, title: '乙', state: 'finished' },
+    { address: 'ta', kind: 'anchor', cwd: ws, title: '', state: 'live' },
   ];
   assert.throws(() => cmdLogs({ workspace: ws }), (e) => {
     assert.ok(e instanceof ExitError);
@@ -146,6 +147,8 @@ test('Herdr selector accepts an absolute workspace and reports ambiguous candida
   });
   assert.ok(s.errs.some((m) => m.includes('t7') && m.includes('00000001')));
   assert.ok(s.errs.some((m) => m.includes('t8') && m.includes('00000002')));
+  assert.ok(s.errs.some((m) => m.includes('ta') && m.includes('命名锚点')
+    && !m.includes('undefined')));
 
   let seen;
   s.deps.spawnSync = (file, args) => {

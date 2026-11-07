@@ -2,10 +2,17 @@
 // 历史读取。state 保存根 pid 和启动指纹，供 Claude 登记认亲、低开销存活
 // 检查及停止前身份核验使用。
 
+import fs from 'node:fs';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 
 import { deps, ExitError, isExecutableFile } from './internals.mjs';
+import {
+  HERDR_SPACE_ID,
+  HERDR_ANCHOR_CWD,
+  HERDR_ANCHOR_TAB_ID,
+  HERDR_ANCHOR_KEY,
+} from './constants.mjs';
 
 // pid 是否对应活进程。走到这儿的 pid 已经过入口范围校验。
 export function alive(pid) {
@@ -67,19 +74,6 @@ export function requireHerdr() {
   return hc;
 }
 
-function oneLine(value) {
-  return String(value ?? '').replace(/[\u0000-\u001f\u007f]+/g, ' ')
-    .trim().replace(/\s+/g, ' ');
-}
-
-// where 是给人看的：工作区加任务 prompt，不展示无意义的哈希名称。
-export function herdrDisplayTitle(ws, prompt) {
-  const chars = [...oneLine(prompt)];
-  const summary = chars.length > 40
-    ? `${chars.slice(0, 40).join('')}…` : chars.join('');
-  return `cron-up / ${oneLine(path.basename(ws) || ws)} / ${summary || '未命名任务'}`;
-}
-
 export function herdrSessionArgv(hc, ws, taskId, model) {
   // Herdr 使用 core 的登录会话环境，不继承巡检调用方。-lic 按 zsh 自己的
   // 规则加载完整配置，让 claude 函数与路由生效，无需手工 source 或清理环境。
@@ -89,7 +83,19 @@ export function herdrSessionArgv(hc, ws, taskId, model) {
     hc, 'run', '--json', '--bg', '--no-parent',
     '--cwd', ws,
     '--label', `cron-up=${taskId}`,
+    '--label', `herdr.space=${HERDR_SPACE_ID}`,
     '/bin/zsh', '-lic', `claude${modelPart}`,
+  ];
+}
+
+export function herdrAnchorArgv(hc, cwd = HERDR_ANCHOR_CWD) {
+  return [
+    hc, 'run', '--json', '--bg', '--no-parent',
+    '--cwd', cwd,
+    '--label', `${HERDR_ANCHOR_KEY}=1`,
+    '--label', `herdr.space=${HERDR_SPACE_ID}`,
+    '--label', `herdr.tab=${HERDR_ANCHOR_TAB_ID}`,
+    '/bin/zsh', '-il',
   ];
 }
 
@@ -98,12 +104,16 @@ function herdrResultDetail(result) {
     || `退出码 ${result?.status ?? '未知'}`;
 }
 
-export function setHerdrTitle(address, title) {
-  const hc = deps.findHerdr();
-  if (!hc) return '未找到 hc 命令';
-  const result = deps.execFile(hc, ['label', address, `where=${title}`],
-    { timeout: 5000 });
-  return result.status === 0 ? null : herdrResultDetail(result);
+// 每轮按独立标签检查锚点：任一存活锚点存在就复用，绝不重复启动；确认
+// 缺失后才创建目录并启动普通 zsh。查询失败直接抛出，避免把证据不足当成
+// 缺失。返回 null 表示复用，启动成功返回终端身份。这里不查询或调整 tab
+// 顺序，默认显示名只是尽力效果。
+export function ensureHerdrAnchor(hc, cwd = HERDR_ANCHOR_CWD) {
+  const existing = queryHerdrTerminals(hc, `${HERDR_ANCHOR_KEY}=1`)
+    .find((t) => t.kind === 'anchor' && deps.alive(t.pid));
+  if (existing) return null;
+  fs.mkdirSync(cwd, { recursive: true });
+  return launchHerdrTerminal(herdrAnchorArgv(hc, cwd));
 }
 
 // 周期任务 id 改小后，把既有 Herdr 终端的机器标签同步到新 taskId。state
@@ -150,19 +160,11 @@ function herdrTerminal(hc, command, address, timeout = 5000) {
   }
 }
 
-// 启动一个 Herdr 终端。失败不直拉第二个会话，避免启动结果不明时双开。
-export function spawnSession(ws, taskId, model) {
-  const hc = deps.findHerdr();
-  if (!hc) {
-    deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：未找到 hc 命令`);
-    return null;
-  }
-  const argv = herdrSessionArgv(hc, ws, taskId, model);
+// 启动一个 Herdr 终端。成功返回扁平身份；失败抛错。已经拿到地址后的任何
+// 失败都先尝试清理刚创建的终端，调用方不直拉第二个，避免启动结果不明时双开。
+function launchHerdrTerminal(argv) {
   const run = deps.execFile(argv[0], argv.slice(1), { timeout: 15000 });
-  if (run.status !== 0) {
-    deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：${herdrResultDetail(run)}`);
-    return null;
-  }
+  if (run.status !== 0) throw new Error(herdrResultDetail(run));
 
   let launched;
   try {
@@ -172,18 +174,16 @@ export function spawnSession(ws, taskId, model) {
   }
   const address = launched?.address;
   if (typeof address !== 'string' || address === '') {
-    deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：hc run 未返回终端地址`);
-    return null;
+    throw new Error('hc run 未返回终端地址');
   }
 
+  const hc = argv[0];
   const fail = (reason) => {
     const { result, terminal } = herdrTerminal(hc, 'kill', address, 10000);
     const cleanup = terminal?.state === 'finished'
       ? '已清理刚创建的 Herdr 终端'
       : `清理 Herdr 终端失败：${herdrResultDetail(result)}`;
-    deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}（终端 ${address}）：`
-      + `${reason}；${cleanup}`);
-    return null;
+    throw new Error(`终端 ${address}：${reason}；${cleanup}`);
   };
 
   const { result: get, terminal } = herdrTerminal(hc, 'get', address, 15000);
@@ -208,6 +208,20 @@ export function spawnSession(ws, taskId, model) {
   return { pid, procStart, herdr: address };
 }
 
+export function spawnSession(ws, taskId, model) {
+  const hc = deps.findHerdr();
+  if (!hc) {
+    deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：未找到 hc 命令`);
+    return null;
+  }
+  try {
+    return launchHerdrTerminal(herdrSessionArgv(hc, ws, taskId, model));
+  } catch (e) {
+    deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：${e?.message ?? e}`);
+    return null;
+  }
+}
+
 // 核对当前进程指纹与 Herdr 元数据后用 hc kill。pid 必须大于 1，避免
 // 0/-1 等广播语义。detached（用户 resume 接管）时 trackedAlive 为 false，
 // 绝不碰用户的裸 claude。
@@ -218,11 +232,14 @@ export function stopSession(ent) {
   const hc = deps.findHerdr();
   if (!hc) return false;
   const { terminal } = herdrTerminal(hc, 'get', ent.herdr);
-  // 地址、pid、工作区和任务标签必须同时吻合，根 pid 指纹已在上面核验。
-  // 自动改小任务 id 后标签同步可能失败，此时仍以最后确认的旧标签为准。
+  // 地址、pid、工作区和机器标签必须同时吻合，根 pid 指纹已在上面核验。
+  // 自动改小任务 id 后标签同步可能失败，此时仍以最后确认的旧标签为准；
+  // 锚点不是任务，使用独立标签，不占用任务 id。
   const taskId = ent.herdrTaskId ?? ent.taskId;
-  if (!terminal || terminal.pid !== pid || terminal.cwd !== ent.ws
-      || terminal.labels?.['cron-up'] !== taskId) {
+  const labelMatches = ent.kind === 'anchor'
+    ? terminal?.labels?.[HERDR_ANCHOR_KEY] === '1'
+    : terminal?.labels?.['cron-up'] === taskId;
+  if (!terminal || terminal.pid !== pid || terminal.cwd !== ent.ws || !labelMatches) {
     return !deps.alive(pid);
   }
   const { terminal: killed } = herdrTerminal(hc, 'kill', ent.herdr, 10000);
@@ -257,16 +274,23 @@ export function sessionIdleSeconds(ent, cur) {
 }
 
 function terminalRecord(address, terminal) {
-  const taskId = terminal?.labels?.['cron-up'];
-  if (typeof taskId !== 'string'
+  const labels = terminal?.labels;
+  // 同时带两种身份时按任务处理，停止核验仍会要求任务标签吻合；锚点标签
+  // 不会让一个已有任务终端改走锚点停止分支。kind 与 taskId 分开，锚点
+  // 不需要伪造一个任务 id。
+  const anchor = labels?.[HERDR_ANCHOR_KEY] === '1'
+    && typeof labels?.['cron-up'] !== 'string';
+  const taskId = labels?.['cron-up'];
+  if ((!anchor && typeof taskId !== 'string')
       || !Number.isSafeInteger(terminal?.pid) || terminal.pid <= 1) return null;
   return {
     address,
     cwd: terminal.cwd,
     pid: terminal.pid,
-    taskId,
+    kind: anchor ? 'anchor' : 'task',
+    ...(anchor ? {} : { taskId }),
     state: terminal.state,
-    title: terminal.labels?.where ?? '',
+    title: labels?.where ?? '',
   };
 }
 
@@ -277,13 +301,12 @@ export function getHerdrTerminal(address) {
   return terminalRecord(address, terminal);
 }
 
-// 列出由 cron-up 标记的 Herdr 终端。taskId 存在时让 core 先按标签过滤；
-// 全量形式用于卸载与日志查询，逐终端 get 核对完整标签和 pid。
-export function listHerdrTerminals(taskId = null, includeFinished = false) {
-  const hc = requireHerdr();
+// run/ls 的 JSON 只是摘要，逐终端 get 核对完整标签和 pid。label 为空时
+// 返回任务与锚点，供卸载和日志查询；查询失败不能降级成空清单。
+function queryHerdrTerminals(hc, label = null, includeFinished = false) {
   const args = ['ls', '--json'];
   if (includeFinished) args.push('--all');
-  if (taskId !== null) args.push('--label', `cron-up=${taskId}`);
+  if (label !== null) args.push('--label', label);
   const listed = deps.execFile(hc, args, { timeout: 5000 });
   if (listed.status !== 0) {
     throw new ExitError(1, `Herdr 终端列表查询失败：${herdrResultDetail(listed)}`);
@@ -308,10 +331,18 @@ export function listHerdrTerminals(taskId = null, includeFinished = false) {
         + herdrResultDetail(result));
     }
     const record = terminalRecord(summary.address, terminal);
-    if (record === null || (taskId !== null && record.taskId !== taskId)) continue;
-    out.push(record);
+    if (record !== null) out.push(record);
   }
   return out;
+}
+
+// taskId 存在时让 core 先按任务标签过滤，返回后再核对一次完整身份。
+export function listHerdrTerminals(taskId = null, includeFinished = false) {
+  const hc = requireHerdr();
+  return queryHerdrTerminals(
+    hc, taskId === null ? null : `cron-up=${taskId}`, includeFinished,
+  ).filter((record) => taskId === null
+    || (record.kind === 'task' && record.taskId === taskId));
 }
 
 export function findHerdrOrphan(ws, taskId) {
@@ -340,7 +371,7 @@ Object.assign(deps, {
   procStartedAt,
   trackedAlive,
   findHerdr,
-  setHerdrTitle,
+  ensureHerdrAnchor,
   syncHerdrTaskId,
   spawnSession,
   stopSession,

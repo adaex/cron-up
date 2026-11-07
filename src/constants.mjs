@@ -9,6 +9,14 @@ export const DEFAULT_CONFIG = {
   roots: ['~/space', '~/workspace', '~/tasks'],
 };
 
+// 所有预热会话共用固定 space ID。cron-up 只通过 hc 操作 Core，不调用 App
+// 能力。普通 zsh 锚点用于尽力获得 cron-tasks 默认显示名；不保证 tab 顺序，
+// 手动移位或关闭后名称变化属于可接受行为。
+export const HERDR_SPACE_ID = 'cron-tasks';
+export const HERDR_ANCHOR_CWD = '/tmp/cron-tasks';
+export const HERDR_ANCHOR_TAB_ID = 'cron-tasks-anchor';
+export const HERDR_ANCHOR_KEY = 'cron-up-anchor';
+
 // launchd 两轮巡检之间的秒数（plist 的 StartInterval）。
 export const INTERVAL_SECONDS = 300;
 // 提前多少秒为窗口内任务备好会话。任务相对巡检网格的相位任意：最迟在落

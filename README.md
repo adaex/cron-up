@@ -116,18 +116,23 @@ cron-up logs 00000002 -f       # 接入活跃的匹配会话
 
 每次预热都会创建一个独立的 Herdr 终端，地址（如 `t7`）记录在巡检日志中。cron-up 不设置自定义 `name`，可以用 `hc ls` 查看，用 `hc attach <地址>` 接入，按 `Ctrl+\` 脱离
 
-终端只有两个由 cron-up 维护的标签：
+新终端启动时固定携带 `herdr.space=cron-tasks`，统一使用 space ID `cron-tasks`，不需要手工查询或配置 ID。每个预热会话仍是独立的 Herdr Core 终端；cron-up 不设置任务终端的 `herdr.tab`，不手工维护任务 tab ID
+
+每轮巡检还会检查一个命名锚点：已有存活锚点时不重复启动；确认缺失后，才在 `/tmp/cron-tasks` 启动普通交互 zsh，不启动 Claude。锚点使用独立机器标签，不进入任务状态机
 
 | 标签 | 内容 | 用途 |
 | --- | --- | --- |
-| `cron-up=<任务键>` | 例如 `cron-up=00000002` | 机器识别、孤儿认领和停止前身份核对 |
-| `where=cron-up / <工作区名> / <任务说明>` | 例如 `cron-up / team-space / 汇总每日进展` | 在 Herdr 列表中直接看出会话用途 |
+| `cron-up=<任务键>` | 例如 `cron-up=00000002`，仅任务终端 | 机器识别、孤儿认领和停止前身份核对 |
+| `herdr.space=cron-tasks` | 固定值，任务终端与锚点共用 | 统一的 space 归组标识 |
+| `cron-up-anchor=1` | 固定值，仅命名锚点 | 检查存活、避免重复启动和卸载清理 |
 
-任务说明取 prompt 的单行摘要，过长时截断；`where` 在 Claude 完成会话登记后设置，避免被 Herdr 启动时的自动命名覆盖
+锚点使用固定 `herdr.tab=cron-tasks-anchor`，用于尽力让 space 默认显示为 `cron-tasks`。cron-up 不修改已有显式名称，也不查询或调整 tab 顺序；手动移位、关闭后补开未能回到第一位等情况导致名称变化，属于可接受的显示效果。可靠行为是固定归组、每轮检查锚点以及避免重复启动，不是保证名称永远不变
 
-Herdr 路径直接启动 `/bin/zsh -lic`，交互 zsh 中的函数、路由、模型和权限配置照常生效。终端通过 `--no-parent` 保持独立，不随发起巡检的终端退出；退出或被回收后，历史仍由 Herdr 保留，可以用 `hc read --lines 100 <地址>` 或 `cron-up logs <匹配片段>` 查看
+cron-up 只通过 `hc` 操作 Herdr Core，不调用 App 能力，不读写 App 文档，也不从任务 prompt 生成标题摘要或设置 `where`。已有终端如需换组，可执行 `hc label <地址> herdr.space=cron-tasks`，不必重启会话
 
-安装和巡检都会先检查 `hc`，缺失时明确失败。启动或身份查询失败按正常的预热失败流程处理；显示标签设置失败只记录一次告警，不影响已启动的会话
+任务终端直接启动 `/bin/zsh -lic`，交互 zsh 中的函数、路由、模型和权限配置照常生效。终端通过 `--no-parent` 保持独立，不随发起巡检的终端退出；退出或被回收后，历史仍由 Herdr 保留，可以用 `hc read --lines 100 <地址>` 或 `cron-up logs <匹配片段>` 查看
+
+安装和巡检都会先检查 `hc`，缺失时明确失败。任务启动或身份查询失败按正常的预热失败流程处理；锚点查询或启动失败只记录告警，不阻塞任务会话启动，下轮巡检会重试
 
 ### 看懂总览和任务列表
 
@@ -312,8 +317,9 @@ launchd 的初始 PATH 很小，因此 install 会把 `node`、`cron-up` 与实�
 
 | 操作或数据 | `cron-up uninstall` | `cron-up uninstall --purge` |
 | --- | --- | --- |
-| 停止仍可安全跟踪的预热会话 | 是 | 是 |
+| 停止仍可安全跟踪的预热会话与命名锚点 | 是 | 是 |
 | 移除 LaunchAgent 和 plist | 是 | 是 |
+| 删除 `/tmp/cron-tasks` 锚点目录 | 否 | 否，由系统按临时目录规则清理 |
 | 删除 `~/.local/share/cron-up` 中的配置、状态、心跳和启动脚本 | 否 | 是 |
 | 删除 `~/Library/Logs/cron-up` 中的巡检日志 | 否 | 是 |
 | 删除 Herdr 保存的预热终端历史 | 否 | 否 |

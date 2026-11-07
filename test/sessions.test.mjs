@@ -7,9 +7,9 @@ import {
   spawnSession,
   stopSession,
   findHerdr,
-  herdrDisplayTitle,
+  ensureHerdrAnchor,
   herdrSessionArgv,
-  setHerdrTitle,
+  herdrAnchorArgv,
   syncHerdrTaskId,
   sessionIdleSeconds,
   getHerdrTerminal,
@@ -41,27 +41,6 @@ test('findHerdr searches PATH and the documented per-user install location', (t)
   fs.chmodSync(defaultHc, 0o644);
   assert.equal(findHerdr({ PATH: path.join(tmp, 'missing') }), null);
   assert.equal(findHerdr({ PATH: '' }), null, '空 PATH 不读取当前目录');
-});
-
-test('Herdr display title uses a bounded single-line prompt instead of a hash', () => {
-  assert.equal(herdrDisplayTitle('/work/a', '  每日\n汇总  '), 'cron-up / a / 每日 汇总');
-  assert.equal(herdrDisplayTitle('/work/a', ''), 'cron-up / a / 未命名任务');
-  assert.ok(herdrDisplayTitle('/work/a', 'x'.repeat(80))
-    .endsWith(`${'x'.repeat(40)}…`));
-  assert.equal(herdrDisplayTitle('/work/a', '一行\u0000\u001f\u007f任务'),
-    'cron-up / a / 一行 任务');
-});
-
-test('setHerdrTitle returns a compact backend error', (t) => {
-  const deps = mockDeps(t);
-  deps.execFile = (file, args) => {
-    assert.equal(file, '/mock/hc');
-    assert.deepEqual(args, ['label', 't7', 'where=cron-up / ws / 任务']);
-    return { status: 1, stdout: '', stderr: 'label unsupported\n' };
-  };
-  assert.equal(setHerdrTitle('t7', 'cron-up / ws / 任务'), 'label unsupported');
-  deps.execFile = () => ({ status: 0, stdout: '', stderr: '' });
-  assert.equal(setHerdrTitle('t7', 'title'), null);
 });
 
 test('syncHerdrTaskId moves a verified terminal label and accepts an already moved label', (t) => {
@@ -116,12 +95,82 @@ test('Herdr argv is the complete minimal native launch command', () => {
     '/opt/herdr/hc', 'run', '--json', '--bg', '--no-parent',
     '--cwd', ws,
     '--label', 'cron-up=00000001',
+    '--label', 'herdr.space=cron-tasks',
     '/bin/zsh', '-lic', 'claude',
   ]);
   assert.equal(
     herdrSessionArgv('/opt/herdr/hc', ws, '00000001', "model; printf 'bad'").at(-1),
     `claude --model 'model; printf '"'"'bad'"'"''`,
   );
+});
+
+test('Herdr anchor argv keeps a plain zsh at the fixed naming directory', () => {
+  assert.deepEqual(herdrAnchorArgv('/opt/herdr/hc'), [
+    '/opt/herdr/hc', 'run', '--json', '--bg', '--no-parent',
+    '--cwd', '/tmp/cron-tasks',
+    '--label', 'cron-up-anchor=1',
+    '--label', 'herdr.space=cron-tasks',
+    '--label', 'herdr.tab=cron-tasks-anchor',
+    '/bin/zsh', '-il',
+  ]);
+});
+
+test('ensureHerdrAnchor reuses a live anchor without another launch', (t) => {
+  const deps = mockDeps(t);
+  const cwd = path.join(mkTmp(t), 'anchor');
+  deps.findHerdr = () => assert.fail('已传入 hc 时不应重复解析');
+  deps.alive = () => true;
+  const calls = [];
+  deps.execFile = (file, args) => {
+    calls.push(args);
+    if (args[0] === 'ls') {
+      assert.deepEqual(args, ['ls', '--json', '--label', 'cron-up-anchor=1']);
+      return { status: 0, stdout: '{"terminals":[{"address":"ta","state":"live"}]}' };
+    }
+    assert.deepEqual(args, ['get', '--json', 'ta']);
+    return { status: 0, stdout: JSON.stringify({
+      pid: 4242, cwd, state: 'live', labels: { 'cron-up-anchor': '1' },
+    }) };
+  };
+  assert.equal(ensureHerdrAnchor('/mock/hc', cwd), null);
+  assert.deepEqual(calls.map((args) => args[0]), ['ls', 'get']);
+  assert.equal(fs.existsSync(cwd), false, '已有锚点时无需创建目录');
+});
+
+test('ensureHerdrAnchor creates the directory and starts only after a confirmed miss', (t) => {
+  const deps = mockDeps(t);
+  const cwd = path.join(mkTmp(t), 'anchor');
+  deps.procStartedAt = () => 'start';
+  const calls = [];
+  deps.execFile = (file, args) => {
+    calls.push(args);
+    if (args[0] === 'ls') {
+      assert.deepEqual(args, ['ls', '--json', '--label', 'cron-up-anchor=1']);
+      return { status: 0, stdout: '{"terminals":[]}' };
+    }
+    if (args[0] === 'run') {
+      return { status: 0, stdout: '{"address":"ta"}', stderr: '' };
+    }
+    assert.deepEqual(args, ['get', '--json', 'ta']);
+    return { status: 0, stdout: JSON.stringify({ pid: 4242 }) };
+  };
+  assert.deepEqual(ensureHerdrAnchor('/mock/hc', cwd), {
+    pid: 4242, procStart: 'start', herdr: 'ta',
+  });
+  assert.deepEqual(calls.map((args) => args[0]), ['ls', 'run', 'get']);
+  assert.equal(fs.statSync(cwd).isDirectory(), true);
+});
+
+test('ensureHerdrAnchor does not turn a query failure into a duplicate launch', (t) => {
+  const deps = mockDeps(t);
+  const cwd = path.join(mkTmp(t), 'anchor');
+  let calls = 0;
+  deps.execFile = () => {
+    calls += 1;
+    return { status: 1, stdout: '', stderr: 'core unavailable\n' };
+  };
+  assert.throws(() => ensureHerdrAnchor('/mock/hc', cwd), /core unavailable/);
+  assert.equal(calls, 1, '列表失败时不继续 run');
 });
 
 test('shellQuote leaves safe values alone and quotes shell-special values', () => {
@@ -213,6 +262,28 @@ test('stop kills a Herdr terminal using the last confirmed task label', (t) => {
     taskId: '00000001', herdrTaskId: '554e2879',
   };
   assert.equal(stopSession(ent), true);
+  assert.deepEqual(commands.map((args) => args[0]), ['get', 'kill']);
+});
+
+test('stop kills a naming anchor by its independent machine label', (t) => {
+  const deps = mockDeps(t);
+  deps.alive = () => true;
+  deps.procStartedAt = () => 'start';
+  const commands = [];
+  deps.execFile = (file, args) => {
+    commands.push(args);
+    if (args[0] === 'get') {
+      return { status: 0, stdout: JSON.stringify({
+        pid: 4242, cwd: '/tmp/cron-tasks', labels: { 'cron-up-anchor': '1' },
+      }) };
+    }
+    assert.deepEqual(args, ['kill', '--json', 'ta']);
+    return { status: 0, stdout: '{"state":"finished"}' };
+  };
+  assert.equal(stopSession({
+    pid: 4242, procStart: 'start', herdr: 'ta', ws: '/tmp/cron-tasks',
+    kind: 'anchor',
+  }), true);
   assert.deepEqual(commands.map((args) => args[0]), ['get', 'kill']);
 });
 
@@ -338,8 +409,16 @@ test('exact Herdr lookup returns only a labelled terminal', (t) => {
     }) };
   };
   assert.deepEqual(getHerdrTerminal('t7'), {
-    address: 't7', pid: 4242, cwd: '/ws', taskId: '00000001',
+    address: 't7', pid: 4242, cwd: '/ws', kind: 'task', taskId: '00000001',
     state: 'finished', title: 'title',
+  });
+  deps.execFile = () => ({ status: 0, stdout: JSON.stringify({
+    pid: 4243, cwd: '/tmp/cron-tasks', state: 'live',
+    labels: { 'cron-up-anchor': '1' },
+  }) });
+  assert.deepEqual(getHerdrTerminal('ta'), {
+    address: 'ta', pid: 4243, cwd: '/tmp/cron-tasks', kind: 'anchor',
+    state: 'live', title: '',
   });
   deps.execFile = () => ({ status: 0, stdout: '{"pid":4242,"labels":{}}' });
   assert.equal(getHerdrTerminal('t7'), null);
@@ -376,7 +455,7 @@ test('Herdr terminal listing can include finished history for logs', (t) => {
     }) };
   };
   assert.deepEqual(listHerdrTerminals(null, true), [{
-    address: 't7', pid: 4242, cwd: '/ws', taskId: '00000001',
+    address: 't7', pid: 4242, cwd: '/ws', kind: 'task', taskId: '00000001',
     state: 'finished', title: 'title',
   }]);
 });

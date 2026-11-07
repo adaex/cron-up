@@ -424,9 +424,9 @@ export async function cmdUninstall(args) {
       deps.print('已从 launchd 卸载');
     }
 
-    // 服务没了就没有回收者：默认结束全部预热会话，不留无人回收的孤儿。
-    // Herdr 清单是唯一会话来源；state 是否保留都不影响停止。已经退出的
-    // 终端无需打印停止进度，活终端仍由 stopSession 再核验一次身份。
+    // 服务没了就没有回收者：默认结束全部预热会话和命名锚点，不留无人回收
+    // 的孤儿。Herdr 清单是唯一终端来源；state 是否保留都不影响停止。已经
+    // 退出的终端无需打印停止进度，活终端仍由 stopSession 再核验一次身份。
     const unsafe = [];
     for (const terminal of deps.listHerdrTerminals()) {
       const ent = {
@@ -434,16 +434,18 @@ export async function cmdUninstall(args) {
         procStart: deps.procStartedAt(terminal.pid),
         herdr: terminal.address,
         ws: terminal.cwd,
+        kind: terminal.kind,
         taskId: terminal.taskId,
       };
       if (!deps.trackedAlive(ent)) continue;
-      const label = `${terminal.cwd} 任务 ${terminal.taskId}`
-        + `（Herdr ${terminal.address}）`;
-      deps.print(`正在结束预热会话 ${label}`);
+      const label = terminal.kind === 'anchor'
+        ? `Herdr 命名锚点 ${terminal.address}（${terminal.cwd}）`
+        : `预热会话 ${terminal.cwd} 任务 ${terminal.taskId}（Herdr ${terminal.address}）`;
+      deps.print(`正在结束${label}`);
       if (!deps.stopSession(ent)) unsafe.push(label);
     }
     if (unsafe.length > 0) {
-      deps.printErr('警告：以下预热会话仍活着，本次无法安全停止：'
+      deps.printErr('警告：以下 Herdr 终端仍活着，本次无法安全停止：'
         + `${unsafe.join('、')}。已中止后续清理，`
         + '不会继续删除 LaunchAgent、配置或日志；请人工核对后重试');
       throw new ExitError(1);

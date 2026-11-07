@@ -43,7 +43,8 @@ export function resolveHerdrTerminal(workspace, announce) {
   if (matches.length === 1) return matches[0];
   say('匹配到多个 Herdr 会话，请给出更长的片段：');
   for (const t of matches) {
-    say(`  ${t.address}  ${t.cwd} 任务 ${t.taskId}  ${t.title}`);
+    const identity = t.kind === 'anchor' ? '命名锚点' : `任务 ${t.taskId}`;
+    say(`  ${t.address}  ${t.cwd} ${identity}  ${t.title}`);
   }
   throw new ExitError(1);
 }

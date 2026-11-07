@@ -529,6 +529,24 @@ test('uninstall stops Herdr terminals without consulting state', async (t) => {
   assert.ok(s.lines.some((l) => l.includes('Herdr t8')));
 });
 
+test('uninstall stops the naming anchor with its independent identity', async (t) => {
+  const s = await setupUninstall(t);
+  s.deps.listHerdrTerminals = () => [{
+    address: 'ta', pid: 37, cwd: '/tmp/cron-tasks', state: 'live', kind: 'anchor',
+  }];
+  let stopped;
+  s.deps.stopSession = (ent) => {
+    stopped = ent;
+    return true;
+  };
+  await s.uninstall();
+  assert.equal(stopped.kind, 'anchor');
+  assert.equal(stopped.taskId, undefined);
+  assert.equal(stopped.ws, '/tmp/cron-tasks');
+  assert.equal(stopped.herdr, 'ta');
+  assert.ok(s.lines.some((l) => l.includes('正在结束Herdr 命名锚点 ta')));
+});
+
 test('uninstall aborts destructive cleanup when the Herdr orphan scan fails', async (t) => {
   const s = await setupUninstall(t);
   fs.writeFileSync(s.deps.paths.plistPath, '<plist/>');

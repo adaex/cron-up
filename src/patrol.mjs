@@ -28,6 +28,7 @@ import {
   HEARTBEAT_STALE_FACTOR,
   INTERVAL_SECONDS,
   LEAD_SECONDS,
+  HERDR_ANCHOR_CWD,
 } from './constants.mjs';
 import {
   loadConfig,
@@ -49,11 +50,7 @@ import {
   configuredModel,
 } from './tasks.mjs';
 import { taskWanted, nextWarmupAfterMs } from './cron.mjs';
-import {
-  herdrDisplayTitle,
-  sessionDebugCommand,
-  requireHerdr,
-} from './sessions.mjs';
+import { sessionDebugCommand, requireHerdr } from './sessions.mjs';
 import { TASK_REL } from './paths.mjs';
 import { elapsedZh, pad2 } from './display.mjs';
 
@@ -260,23 +257,9 @@ function noteClaimed(ws, taskId, ent) {
     + `claudePid=${ent.claudePid}，rootPid=${ent.pid}`);
 }
 
-// Herdr Core 0.1.18 会在启动后异步覆盖 where，等到 Claude 完成登记再设置。
-// 已尝试标记避免后续每轮重复调用；失败只告警一次。
-function labelClaimedHerdr(ent, ws, prompt) {
-  if (!entryClaimed(ent) || typeof ent.herdr !== 'string'
-      || ent.herdrTitleAttempted || typeof prompt !== 'string') return;
-  const title = herdrDisplayTitle(ws, prompt);
-  ent.herdrTitleAttempted = true;
-  const detail = deps.setHerdrTitle(ent.herdr, title);
-  if (detail) {
-    deps.log(`Herdr 显示标签设置失败 ${ws} 任务 ${ent.taskId}：${detail}；`
-      + '会话仍照常运行');
-  }
-}
-
 // 沿登记快照把一个活根 pid 认成登记里的 claude 后代：认到则回填身份、清零
 // 失败计数并返回登记详情，否则返回 null。轮初认亲与轮内等待认亲共用这份回填。
-function claimEntry(ent, details, ws, prompt) {
+function claimEntry(ent, details, ws) {
   const identity = JSON.stringify(reownTarget(ent));
   const d = deps.claimWarm(details, ws, ent.pid);
   if (!d) return null;
@@ -289,7 +272,6 @@ function claimEntry(ent, details, ws, prompt) {
   if (entryClaimed(ent) && JSON.stringify(reownTarget(ent)) !== identity) {
     noteClaimed(ws, ent.taskId, ent);
   }
-  labelClaimedHerdr(ent, ws, prompt);
   return d;
 }
 
@@ -326,7 +308,7 @@ function moveTaskEntry(bucket, from, to) {
 
 // 保证一个工作区里每个死主窗口任务都有专属预热，并完成本文件的续期/盖印
 // 维护。bucket 是 state[ws]（原地修改）。返回 pending：本轮新启动或认领、
-// 尚未认亲的 {ws,key,pid,prompt} 列表，cmdRun 据此轮内等待登记并补盖印。
+// 尚未认亲的 {ws,key,pid} 列表，cmdRun 据此轮内等待登记并补盖印。
 // previousNow 是上一轮成功巡检时刻，只用于在进入窗口的首轮记录跳过原因，
 // 避免高频任务每轮重复刷诊断日志；没有历史时刻时把当前窗口当作首次进入。
 export function patrolWorkspace(
@@ -428,10 +410,8 @@ export function patrolWorkspace(
   // 轮新 spawn 的不在快照里，认亲由 cmdRun 的轮内等待补做；其余条目认
   // 不到下轮再认，不阻断任何决策。
   for (const ent of Object.values(bucket)) {
-    const group = taskGroups.get(ent.taskId);
-    const prompt = group?.length === 1 ? group[0].prompt : undefined;
     if (deps.trackedAlive(ent)) {
-      claimEntry(ent, details, ws, prompt);
+      claimEntry(ent, details, ws);
       syncTaskLabel(ent);
     }
   }
@@ -651,7 +631,7 @@ export function patrolWorkspace(
         + `${model ? `，模型 ${model}` : ''}，Herdr ${spawned.herdr}`
         + `（连续失败计数 ${fails}）`);
     }
-    pending.push({ ws, key, pid: spawned.pid, prompt: t.prompt });
+    pending.push({ ws, key, pid: spawned.pid });
   }
 
   // 第三步：任务文件维护（续期 + 周期任务 id 改小 + 盖印）合并为一次带
@@ -753,7 +733,7 @@ async function awaitWarmups(pending, state, cur, stats) {
         died.push(p);
         continue;
       }
-      if (claimEntry(ent, details, p.ws, p.prompt)) {
+      if (claimEntry(ent, details, p.ws)) {
         if (!claimedByWs.has(p.ws)) claimedByWs.set(p.ws, []);
         claimedByWs.get(p.ws).push(ent);
       } else {
@@ -856,6 +836,19 @@ export async function cmdRun(args) {
       bump(stats, 'warn');
       deps.log('警告：扫描目录 roots 为空，巡检不会发现任何工作区；'
         + '请检查配置文件或用 cron-up install --roots 指定');
+    }
+
+    try {
+      const anchor = deps.ensureHerdrAnchor(hc);
+      if (anchor) {
+        bump(stats, 'spawn');
+        deps.log(`已启动 Herdr 命名锚点 ${anchor.herdr}：`
+          + `pid=${anchor.pid}，cwd=${HERDR_ANCHOR_CWD}`);
+      }
+    } catch (e) {
+      bump(stats, 'warn');
+      deps.log(`Herdr 命名锚点准备失败：${e?.message ?? e}；`
+        + '新会话仍带固定归组标签，下轮巡检重试锚点');
     }
 
     // 登记轮初读一次（含祖先链快照）：认亲与活创建者判定都靠它。有新

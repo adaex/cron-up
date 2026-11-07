@@ -177,9 +177,13 @@ delay = min(h × 0.5 × period, 30 分钟)
 
 ### Herdr 启动层
 
-Herdr 是必需依赖。安装与巡检先检查 `PATH` 和 `~/.local/bin/hc`，找不到就明确失败；新会话统一使用 `hc run --json --bg --no-parent --cwd <工作区> --label cron-up=<任务键>`。`--no-parent` 让终端不归属发起方，也不随父终端退出，不再设置自定义 `name` 或使用 `--rm`
+Herdr 是必需依赖。安装与巡检先检查 `PATH` 和 `~/.local/bin/hc`，找不到就明确失败；新会话统一使用 `hc run --json --bg --no-parent --cwd <工作区> --label cron-up=<任务键> --label herdr.space=cron-tasks`。`--no-parent` 让终端不归属发起方，也不随父终端退出，不设置自定义 `name` 或使用 `--rm`
 
-终端只有两个由 cron-up 维护的标签：`cron-up=<任务键>` 是机器身份，`where=cron-up / <工作区名> / <任务说明>` 是可读标题，任务说明取 prompt 的单行摘要。Herdr Core 0.1.18 会异步覆盖启动阶段的 `where`，因此该标签改在 Claude 完成登记后通过 `hc label` 设置。state 只保存终端地址与是否已尝试设置标题的布尔标记，标题正文在设置时按当前工作区和 prompt 生成；设置失败只告警一次，不影响会话
+每轮巡检通过 `hc ls --json --label cron-up-anchor=1` 检查命名锚点，并对候选逐个执行 `hc get --json` 核对完整标签和根 pid。任一存活锚点存在就复用，不重复启动；确认缺失后才创建 `/tmp/cron-tasks`，执行 `hc run --json --bg --no-parent --cwd /tmp/cron-tasks --label cron-up-anchor=1 --label herdr.space=cron-tasks --label herdr.tab=cron-tasks-anchor /bin/zsh -il`。锚点不启动 Claude，也不写入任务 state。列表或身份查询失败会告警并跳过本次锚点启动，不能把证据不足当成缺失而双开；锚点失败不阻塞任务预热，下轮重试
+
+锚点用于尽力让 space 默认显示为 `cron-tasks`，不是名称或布局保证。cron-up 不修改已有显式名称，不查询或调整 tab 顺序；手动移位、关闭后补开未能回到第一位等情况导致名称变化，属于可接受的显示效果。可靠边界是固定归组、每轮检查锚点和避免重复启动。cron-up 只使用 `hc` 操作 Core，不调用 App 命令，也不通过 `hc connect` 读写 App 私有文档
+
+`cron-up=<任务键>` 是任务机器身份，供孤儿认领和停止前身份核对；`cron-up-anchor=1` 是独立的锚点身份，不占用任务 id。任务终端不传 `herdr.tab`，锚点使用固定 tab id。cron-up 不生成任务标题摘要，也不设置 `where`。卸载通过全量 Herdr 清单同时停止任务终端与锚点，两者都核对根 pid、启动指纹、cwd 和各自机器标签。已有终端不会被批量换组，需要时用 `hc label <地址> herdr.space=cron-tasks` 手动补充
 
 `hc` 使用 core 的登录会话环境，而不是调用方 `execFile` 的环境。启动命令直接执行 `/bin/zsh -lic <claude 命令>`，由 zsh 按正常规则加载登录与交互配置，让 `claude` 函数、路由和模型配置生效；不再叠加第二层 zsh、手工 `source ~/.zshrc`、清理 `CLAUDE_CODE_*` 或构造调用方环境。只透传显式配置的 `--model`，不传 `--permission-mode`，权限模式及其余行为遵循 Claude Code 自身配置
 
