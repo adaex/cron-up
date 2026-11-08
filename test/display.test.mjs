@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  dispWidth, clip, pad, displayPath, fmtFire, taskView,
+  dispWidth, clip, pad, displayPath, fmtFire, taskView, taskSummary,
 } from '../src/display.mjs';
 import { mockDeps } from '../test-support/helpers.mjs';
 
@@ -34,6 +34,12 @@ test('fmtFire keeps a single predicted time without dropping seconds', () => {
     '10-02 05:15:37');
   assert.equal(fmtFire(new Date(2026, 9, 2, 5, 15, 0)),
     '10-02 05:15');
+});
+
+test('taskSummary reuses the first non-empty prompt line as a single-line session name', () => {
+  assert.equal(taskSummary({ prompt: '\n  每日\t 汇总  \n后续说明' }), '每日 汇总');
+  assert.equal(taskSummary({ prompt: ' \n\t' }), '（无任务描述）');
+  assert.equal(taskSummary(null), '（无任务描述）');
 });
 
 test('taskView carries a predicted fire time', () => {

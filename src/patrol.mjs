@@ -52,7 +52,7 @@ import {
 import { taskWanted, nextWarmupAfterMs } from './cron.mjs';
 import { sessionDebugCommand, requireHerdr } from './sessions.mjs';
 import { TASK_REL } from './paths.mjs';
-import { elapsedZh, pad2 } from './display.mjs';
+import { elapsedZh, pad2, taskSummary } from './display.mjs';
 
 // 事件类型 → 轮末汇总里的中文标签。平静轮也会打出「本轮无动作」。
 const EVENT_LABELS = [
@@ -591,7 +591,7 @@ export function patrolWorkspace(
     // 本次启动，不能把证据不足当成没有孤儿。
     const model = configuredModel(workspaceConfig, key);
     const adopted = deps.findHerdrOrphan(ws, key);
-    const spawned = adopted ?? deps.spawnSession(ws, key, model);
+    const spawned = adopted ?? deps.spawnSession(ws, key, model, taskSummary(t));
     if (spawned?.pid == null) {
       const newFails = fails + 1;
       if (newFails >= FAIL_LIMIT) {
@@ -844,6 +844,11 @@ export async function cmdRun(args) {
         bump(stats, 'spawn');
         deps.log(`已启动 Herdr 命名锚点 ${anchor.herdr}：`
           + `pid=${anchor.pid}，cwd=${HERDR_ANCHOR_CWD}`);
+        if (anchor.titleError) {
+          bump(stats, 'warn');
+          deps.log(`Herdr 命名锚点 ${anchor.herdr} 标题设置失败：`
+            + `${anchor.titleError}；锚点继续复用，不影响任务预热`);
+        }
       }
     } catch (e) {
       bump(stats, 'warn');

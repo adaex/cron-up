@@ -74,9 +74,9 @@ export function humanDelta(ms) {
   return `${Math.floor(secs / 86400)} 天后`;
 }
 
-// list/总览上代表任务身份的一句话：prompt 的首个非空行。真实任务第一行
+// list/总览与新会话名称共用的一句话：prompt 的首个非空行。真实任务第一行
 // 通常自带标题；取不到时如实标注，不留空白格。
-function taskSummary(task) {
+export function taskSummary(task) {
   const prompt = task?.prompt;
   if (typeof prompt !== 'string' || !prompt.trim()) return '（无任务描述）';
   const first = prompt.split('\n').map((l) => l.trim()).find((l) => l) ?? '';

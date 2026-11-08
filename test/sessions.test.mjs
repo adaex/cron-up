@@ -89,18 +89,22 @@ test('syncHerdrTaskId refuses to relabel a terminal owned by another task', (t) 
   assert.equal(ent.herdrTaskId, '554e2879');
 });
 
-test('Herdr argv is the complete minimal native launch command', () => {
+test('Herdr argv passes the task summary to Claude without changing the native launch', () => {
   const ws = '/Users/aex/My Proj';
-  assert.deepEqual(herdrSessionArgv('/opt/herdr/hc', ws, '00000001'), [
+  assert.deepEqual(herdrSessionArgv('/opt/herdr/hc', ws, '00000001', undefined, '每日 汇总'), [
     '/opt/herdr/hc', 'run', '--json', '--bg', '--no-parent',
     '--cwd', ws,
     '--label', 'cron-up=00000001',
     '--label', 'herdr.space=cron-tasks',
-    '/bin/zsh', '-lic', 'claude',
+    '/bin/zsh', '-lic', "claude --name '每日 汇总'",
   ]);
   assert.equal(
-    herdrSessionArgv('/opt/herdr/hc', ws, '00000001', "model; printf 'bad'").at(-1),
-    `claude --model 'model; printf '"'"'bad'"'"''`,
+    herdrSessionArgv('/opt/herdr/hc', ws, '00000001', "model; printf 'bad'", '每日 汇总').at(-1),
+    `claude --name '每日 汇总' --model 'model; printf '"'"'bad'"'"''`,
+  );
+  assert.equal(
+    herdrSessionArgv('/opt/herdr/hc', ws, '00000001', undefined, "task; printf 'bad'").at(-1),
+    `claude --name 'task; printf '"'"'bad'"'"''`,
   );
 });
 
@@ -137,29 +141,44 @@ test('ensureHerdrAnchor reuses a live anchor without another launch', (t) => {
   assert.equal(fs.existsSync(cwd), false, '已有锚点时无需创建目录');
 });
 
-test('ensureHerdrAnchor creates the directory and starts only after a confirmed miss', (t) => {
-  const deps = mockDeps(t);
-  const cwd = path.join(mkTmp(t), 'anchor');
-  deps.procStartedAt = () => 'start';
-  const calls = [];
-  deps.execFile = (file, args) => {
-    calls.push(args);
-    if (args[0] === 'ls') {
-      assert.deepEqual(args, ['ls', '--json', '--label', 'cron-up-anchor=1']);
-      return { status: 0, stdout: '{"terminals":[]}' };
-    }
-    if (args[0] === 'run') {
-      return { status: 0, stdout: '{"address":"ta"}', stderr: '' };
-    }
-    assert.deepEqual(args, ['get', '--json', 'ta']);
-    return { status: 0, stdout: JSON.stringify({ pid: 4242 }) };
-  };
-  assert.deepEqual(ensureHerdrAnchor('/mock/hc', cwd), {
-    pid: 4242, procStart: 'start', herdr: 'ta',
+for (const [scenario, sendResult, expected] of [
+  [
+    'creates the directory and starts only after a confirmed miss',
+    { status: 0, stdout: '', stderr: '' },
+    { pid: 4242, procStart: 'start', herdr: 'ta' },
+  ],
+  [
+    'keeps the launched anchor when its title command fails',
+    { status: 1, stdout: '', stderr: 'send failed' },
+    { pid: 4242, procStart: 'start', herdr: 'ta', titleError: 'send failed' },
+  ],
+]) {
+  test(`ensureHerdrAnchor ${scenario}`, (t) => {
+    const deps = mockDeps(t);
+    const cwd = path.join(mkTmp(t), 'anchor');
+    deps.procStartedAt = () => 'start';
+    const calls = [];
+    deps.execFile = (file, args) => {
+      calls.push(args);
+      if (args[0] === 'ls') {
+        assert.deepEqual(args, ['ls', '--json', '--label', 'cron-up-anchor=1']);
+        return { status: 0, stdout: '{"terminals":[]}' };
+      }
+      if (args[0] === 'run') {
+        return { status: 0, stdout: '{"address":"ta"}', stderr: '' };
+      }
+      if (args[0] === 'send') {
+        assert.deepEqual(args, ['send', 'ta', "printf '\\033]0;%s\\a' cron-tasks-anchor"]);
+        return sendResult;
+      }
+      assert.deepEqual(args, ['get', '--json', 'ta']);
+      return { status: 0, stdout: JSON.stringify({ pid: 4242 }) };
+    };
+    assert.deepEqual(ensureHerdrAnchor('/mock/hc', cwd), expected);
+    assert.deepEqual(calls.map((args) => args[0]), ['ls', 'run', 'get', 'send']);
+    assert.equal(fs.statSync(cwd).isDirectory(), true);
   });
-  assert.deepEqual(calls.map((args) => args[0]), ['ls', 'run', 'get']);
-  assert.equal(fs.statSync(cwd).isDirectory(), true);
-});
+}
 
 test('ensureHerdrAnchor does not turn a query failure into a duplicate launch', (t) => {
   const deps = mockDeps(t);
@@ -192,10 +211,11 @@ test('spawn returns one flat Herdr session identity without a caller env or log'
     assert.deepEqual(args, ['get', '--json', 't7']);
     return { status: 0, stdout: '{"pid":4242}', stderr: '' };
   };
-  assert.deepEqual(spawnSession('/ws', '00000001'), {
+  assert.deepEqual(spawnSession('/ws', '00000001', undefined, '每日 汇总'), {
     pid: 4242, procStart: 'start', herdr: 't7',
   });
   assert.equal(calls.length, 2);
+  assert.equal(calls[0].args.at(-1), "claude --name '每日 汇总'");
   assert.equal('env' in calls[0].opts, false, 'Herdr 使用 core 环境，不构造调用方 env');
 });
 

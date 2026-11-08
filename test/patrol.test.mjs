@@ -65,13 +65,13 @@ async function setupMachine(t, { realDiscover = false } = {}) {
 
   deps.alive = (p) => alive.has(p);
   deps.procStartedAt = (p) => (alive.has(p) ? `start-${p}` : null);
-  deps.spawnSession = (wsArg, taskId, model) => {
+  deps.spawnSession = (wsArg, taskId, model, name) => {
     logs.push(taskId);
     if (hooks.get(taskId)?.failSpawn) return null;
     const rootPid = nextPid++;
     alive.add(rootPid);
     const rec = {
-      ws: wsArg, taskId, model, rootPid, herdr: `t${rootPid}`,
+      ws: wsArg, taskId, model, name, rootPid, herdr: `t${rootPid}`,
       claimed: false, sid: null, claudePid: null,
     };
     spawns.push(rec);
@@ -272,6 +272,8 @@ test('workspace and task model config flow into each task spawn', async (t) => {
   await m.patrol();
   assert.equal(m.byTask.get('00000002').model, 'sonnet');
   assert.equal(m.byTask.get('00000004').model, 'claude-opus-5-5');
+  assert.equal(m.byTask.get('00000002').name, '任务级模型');
+  assert.equal(m.byTask.get('00000004').name, '工作区模型');
   assert.ok(m.patrolLogs.some((line) =>
     line.includes('任务 00000002') && line.includes('模型 sonnet')));
 
@@ -1022,7 +1024,7 @@ test('cmdRun checks the anchor each round and logs only an actual launch', async
   m.deps.ensureHerdrAnchor = () => {
     calls += 1;
     return calls === 1
-      ? { pid: 4242, procStart: 'start', herdr: 'ta' } : null;
+      ? { pid: 4242, procStart: 'start', herdr: 'ta', titleError: 'send failed' } : null;
   };
   assert.equal(await m.patrol(), true);
   assert.equal(await m.patrol(), true);
@@ -1030,6 +1032,8 @@ test('cmdRun checks the anchor each round and logs only an actual launch', async
   const starts = m.patrolLogs.filter((line) => line.includes('已启动 Herdr 命名锚点 ta'));
   assert.equal(starts.length, 1);
   assert.ok(starts[0].includes('cwd=/tmp/cron-tasks'));
+  assert.ok(m.patrolLogs.some((line) => line.includes('标题设置失败')
+    && line.includes('send failed') && line.includes('不影响任务预热')));
 });
 
 test('cmdRun: no pending sessions means no extra scans or sleeps', async (t) => {

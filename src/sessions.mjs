@@ -74,17 +74,19 @@ export function requireHerdr() {
   return hc;
 }
 
-export function herdrSessionArgv(hc, ws, taskId, model) {
+export function herdrSessionArgv(hc, ws, taskId, model, name) {
   // Herdr 使用 core 的登录会话环境，不继承巡检调用方。-lic 按 zsh 自己的
   // 规则加载完整配置，让 claude 函数与路由生效，无需手工 source 或清理环境。
-  // 只透传显式配置的模型；权限模式及其余行为服从 Claude Code 自身配置。
+  // Claude 原生 --name 同时命名会话与终端标题；只透传显式配置的模型，
+  // 权限模式及其余行为服从 Claude Code 自身配置。
+  const namePart = name ? ` --name ${shellQuote(name)}` : '';
   const modelPart = model ? ` --model ${shellQuote(model)}` : '';
   return [
     hc, 'run', '--json', '--bg', '--no-parent',
     '--cwd', ws,
     '--label', `cron-up=${taskId}`,
     '--label', `herdr.space=${HERDR_SPACE_ID}`,
-    '/bin/zsh', '-lic', `claude${modelPart}`,
+    '/bin/zsh', '-lic', `claude${namePart}${modelPart}`,
   ];
 }
 
@@ -104,16 +106,30 @@ function herdrResultDetail(result) {
     || `退出码 ${result?.status ?? '未知'}`;
 }
 
+function nameHerdrAnchor(hc, address) {
+  const command = `printf '\\033]0;%s\\a' ${shellQuote(HERDR_ANCHOR_TAB_ID)}`;
+  try {
+    const sent = deps.execFile(hc, ['send', address, command], { timeout: 15000 });
+    return sent.status === 0 ? null : herdrResultDetail(sent);
+  } catch (e) {
+    return e?.message ?? String(e);
+  }
+}
+
 // 每轮按独立标签检查锚点：任一存活锚点存在就复用，绝不重复启动；确认
 // 缺失后才创建目录并启动普通 zsh。查询失败直接抛出，避免把证据不足当成
-// 缺失。返回 null 表示复用，启动成功返回终端身份。这里不查询或调整 tab
-// 顺序，默认显示名只是尽力效果。
+// 缺失。返回 null 表示复用，启动成功返回终端身份；命名失败附带 titleError，
+// 由巡检单独告警。这里不查询或调整 tab 顺序，默认显示名只是尽力效果。
 export function ensureHerdrAnchor(hc, cwd = HERDR_ANCHOR_CWD) {
   const existing = queryHerdrTerminals(hc, `${HERDR_ANCHOR_KEY}=1`)
     .find((t) => t.kind === 'anchor' && deps.alive(t.pid));
   if (existing) return null;
   fs.mkdirSync(cwd, { recursive: true });
-  return launchHerdrTerminal(herdrAnchorArgv(hc, cwd));
+  const launched = launchHerdrTerminal(herdrAnchorArgv(hc, cwd));
+  // 只给本轮新锚点命名：启动后由 zsh 输出一次 OSC，既不把命令塞回启动
+  // 参数，也不在后续巡检反复打扰这个可供人使用的交互 shell。
+  const titleError = nameHerdrAnchor(hc, launched.herdr);
+  return { ...launched, ...(titleError ? { titleError } : {}) };
 }
 
 // 周期任务 id 改小后，把既有 Herdr 终端的机器标签同步到新 taskId。state
@@ -208,14 +224,14 @@ function launchHerdrTerminal(argv) {
   return { pid, procStart, herdr: address };
 }
 
-export function spawnSession(ws, taskId, model) {
+export function spawnSession(ws, taskId, model, name) {
   const hc = deps.findHerdr();
   if (!hc) {
     deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：未找到 hc 命令`);
     return null;
   }
   try {
-    return launchHerdrTerminal(herdrSessionArgv(hc, ws, taskId, model));
+    return launchHerdrTerminal(herdrSessionArgv(hc, ws, taskId, model, name));
   } catch (e) {
     deps.log(`Herdr 会话启动失败 ${ws} 任务 ${taskId}：${e?.message ?? e}`);
     return null;

@@ -34,7 +34,7 @@ cron-up 不负责创作任务内容，也不能保证每个任务都执行成功
 
 - **macOS**：使用 launchd 和 zsh，暂不支持其他系统
 - **Node.js 22 或更高版本**：cron-up 没有 npm 第三方运行时依赖
-- **Claude Code**：核心行为已在 2.1.302 核对；更低或更高版本均应按未验证版本对待，不要仅凭版本号推断兼容
+- **Claude Code**：核心行为已在 2.1.302 核对；更低或更高版本均应按未验证版本对待，不要仅凭版本号推断兼容。`--name` 会话命名与终端标题链路已在 2.1.319 单独核对，详见[内部机制与兼容性](docs/internals.md)
 - **Herdr Core**：`PATH` 或 `~/.local/bin/hc` 中必须有可执行的 `hc`；当前已在 0.1.18 核对，其他版本按未验证处理。install 会把实际找到的 `hc` 所在目录写入 cron-up 服务的 `PATH`
 - **可用的 `claude` 命令**：已完成登录和所需配置，并且能从交互登录 zsh 中启动；可先用 `zsh -lic 'command -v claude'` 检查
 - **目录信任与工具授权**：先在该工作目录手动启动一次 Claude Code，完成信任确认及无法在无人值守时回答的授权，否则预热可能停在提问界面，随后被判为卡死并进入失败流程
@@ -114,11 +114,13 @@ cron-up logs 00000002 -f       # 接入活跃的匹配会话
 
 ### 在 Herdr 中查看预热会话
 
-每次预热都会创建一个独立的 Herdr 终端，地址（如 `t7`）记录在巡检日志中。cron-up 不设置自定义 `name`，可以用 `hc ls` 查看，用 `hc attach <地址>` 接入，按 `Ctrl+\` 脱离
+每次预热都会创建一个独立的 Herdr 终端，地址（如 `t7`）记录在巡检日志中。cron-up 不设置 Herdr 终端的自定义 `name`，可以用 `hc ls` 查看，用 `hc attach <地址>` 接入，按 `Ctrl+\` 脱离
 
 新终端启动时固定携带 `herdr.space=cron-tasks`，统一使用 space ID `cron-tasks`，不需要手工查询或配置 ID。每个预热会话仍是独立的 Herdr Core 终端；cron-up 不设置任务终端的 `herdr.tab`，不手工维护任务 tab ID
 
 每轮巡检还会检查一个命名锚点：已有存活锚点时不重复启动；确认缺失后，才在 `/tmp/cron-tasks` 启动普通交互 zsh，不启动 Claude。锚点使用独立机器标签，不进入任务状态机
+
+新建锚点后，cron-up 通过一次 `hc send` 让 zsh 输出 OSC 0，把 Core 的 `terminal.title` 设为 `cron-tasks-anchor`。复用已有锚点时不会重复发送命名命令；命名失败只告警，不影响任务预热。这里维护的是 Core 元数据，App 与 Layout 是否展示该标题取决于各自的支持情况
 
 | 标签 | 内容 | 用途 |
 | --- | --- | --- |
@@ -128,7 +130,9 @@ cron-up logs 00000002 -f       # 接入活跃的匹配会话
 
 锚点使用固定 `herdr.tab=cron-tasks-anchor`，用于尽力让 space 默认显示为 `cron-tasks`。cron-up 不修改已有显式名称，也不查询或调整 tab 顺序；手动移位、关闭后补开未能回到第一位等情况导致名称变化，属于可接受的显示效果。可靠行为是固定归组、每轮检查锚点以及避免重复启动，不是保证名称永远不变
 
-cron-up 只通过 `hc` 操作 Herdr Core，不调用 App 能力，不读写 App 文档，也不从任务 prompt 生成标题摘要或设置 `where`。已有终端如需换组，可执行 `hc label <地址> herdr.space=cron-tasks`，不必重启会话
+新会话会把任务 prompt 的首个非空行整理成单行摘要，通过 Claude Code 原生 `--name` 设置会话名，由 Claude Code 自己上报终端标题。这不会额外调用模型生成 AI 摘要，也只影响新启动的会话，不会重启或重命名已有会话
+
+cron-up 只通过 `hc` 操作 Herdr Core，不调用 App 能力，不读写 App 文档，也不设置 `where`。已有终端如需换组，可执行 `hc label <地址> herdr.space=cron-tasks`，不必重启会话
 
 任务终端直接启动 `/bin/zsh -lic`，交互 zsh 中的函数、路由、模型和权限配置照常生效。终端通过 `--no-parent` 保持独立，不随发起巡检的终端退出；退出或被回收后，历史仍由 Herdr 保留，可以用 `hc read --lines 100 <地址>` 或 `cron-up logs <匹配片段>` 查看
 
