@@ -5,7 +5,7 @@ import path from 'node:path';
 
 import { cmdList } from '../src/list.mjs';
 import { maintainWorkspace } from '../src/tasks.mjs';
-import { dispWidth, fmtMDHM, fmtFire } from '../src/display.mjs';
+import { dispWidth, fmtMDHM } from '../src/display.mjs';
 import {
   mkTmp, mockDeps, tmpPaths, writeJson,
   writeTaskFile, makeTask, sessionDetail, scanFrom,
@@ -159,6 +159,16 @@ test('task without prompt gets a placeholder', async (t) => {
   assert.ok(out.includes('（无任务描述）'));
 });
 
+test('task without an id stays visible and is marked as unschedulable', async (t) => {
+  const s = await setup(t);
+  const task = makeTask({ prompt: '无 ID 手写任务' });
+  delete task.id;
+  const out = await s.render([task]);
+  assert.ok(out.includes('无 ID 手写任务'), out);
+  assert.ok(out.includes('无ID不调度'), out);
+  assert.ok(!out.includes('待预热'), out);
+});
+
 test('permanent recurring is labeled', async (t) => {
   const s = await setup(t);
   const out = await s.render([
@@ -170,18 +180,18 @@ test('permanent recurring is labeled', async (t) => {
   assert.ok(out.includes('普通周期'));
 });
 
-test('status shows only the predicted delivery time for a jittered task', async (t) => {
+test('status shows the cron slot rather than a predicted delivery time', async (t) => {
   const s = await setup(t);
   s.deps.terminalWidth = () => 120;
-  // 尚未经过巡检改号时也不展示双时间区间，只显示预计的 13:30。
   const out = await s.render([
     makeTask({ id: 'c1363d8b', cron: '0 13 * * *', prompt: 'Trae 成本刷新' }),
   ]);
-  assert.ok(out.includes('13:30'), out);
+  assert.ok(out.includes('13:00'), out);
+  assert.ok(!out.includes('13:30'), out);
   assert.ok(!out.includes('→'), out);
 });
 
-test('status retains nonzero seconds in the single predicted time', async (t) => {
+test('one-shot status keeps the grid slot instead of an early predicted time', async (t) => {
   const s = await setup(t);
   const slot = new Date(Date.now() + 60 * 86400_000);
   slot.setMinutes(30, 0, 0);
@@ -190,11 +200,12 @@ test('status retains nonzero seconds in the single predicted time', async (t) =>
   const out = await s.render([makeTask({
     id: '80000000', cron, recurring: false, createdAt: Date.now(),
   })]);
-  assert.ok(out.includes(fmtFire(new Date(slot.getTime() - 45_000))), out);
+  assert.ok(out.includes(fmtMDHM(slot)), out);
+  assert.ok(!out.includes(fmtMDHM(new Date(slot.getTime() - 45_000))), out);
   assert.ok(!out.includes('→'), out);
 });
 
-test('maintained daily and weekly tasks show one time without a jitter arrow', async (t) => {
+test('maintained daily and weekly tasks show their cron slots', async (t) => {
   const s = await setup(t);
   const taskfile = writeTaskFile(s.WS, [
     makeTask({ id: '554e2879', cron: '0 5 * * *', prompt: '每日补报' }),
@@ -212,20 +223,19 @@ test('maintained daily and weekly tasks show one time without a jitter arrow', a
   assert.ok(out.includes('20:07'), out);
 });
 
-test('model tags show workspace defaults and per-task overrides', async (t) => {
+test('model tags show the same workspace default for every task', async (t) => {
   const s = await setup(t);
   writeJson(path.join(s.WS, '.claude', 'cron-up.json'), {
     model: 'claude-opus-5-5',
-    tasks: { '00000002': { model: 'sonnet' } },
   });
   const out = await s.render([
-    makeTask({ id: '00000001', prompt: '工作区默认模型' }),
-    makeTask({ id: '00000002', prompt: '任务覆盖模型' }),
+    makeTask({ id: '00000001', prompt: '任务甲' }),
+    makeTask({ id: '00000002', prompt: '任务乙' }),
   ]);
-  const defaultLine = s.lines.find((line) => line.includes('工作区默认模型'));
-  const overrideLine = s.lines.find((line) => line.includes('任务覆盖模型'));
-  assert.ok(defaultLine.includes('模型 claude-opus-5-5'), out);
-  assert.ok(overrideLine.includes('模型 sonnet'), out);
+  const first = s.lines.find((line) => line.includes('任务甲'));
+  const second = s.lines.find((line) => line.includes('任务乙'));
+  assert.ok(first.includes('模型 claude-opus-5-5'), out);
+  assert.ok(second.includes('模型 claude-opus-5-5'), out);
 });
 
 test('model and warm tags still respect the narrow terminal floor', async (t) => {

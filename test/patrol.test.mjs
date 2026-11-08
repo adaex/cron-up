@@ -259,42 +259,41 @@ test('two same-time dead-owner tasks get two separate warm sessions and stamps',
   assert.equal(st2.mtimeNs, st.mtimeNs);
 });
 
-test('workspace and task model config flow into each task spawn', async (t) => {
+test('workspace default model flows into every new task session', async (t) => {
   const m = await setupMachine(t);
   writeJson(path.join(m.WS, '.claude', 'cron-up.json'), {
     model: 'claude-opus-5-5',
-    tasks: { '00000002': { model: 'sonnet' } },
   });
   writeTaskFile(m.WS, [
-    makeTask({ id: '00000002', prompt: '任务级模型' }),
-    makeTask({ id: '00000004', prompt: '工作区模型' }),
+    makeTask({ id: '00000002', prompt: '任务甲' }),
+    makeTask({ id: '00000004', prompt: '任务乙' }),
   ]);
   await m.patrol();
-  assert.equal(m.byTask.get('00000002').model, 'sonnet');
+  assert.equal(m.byTask.get('00000002').model, 'claude-opus-5-5');
   assert.equal(m.byTask.get('00000004').model, 'claude-opus-5-5');
-  assert.equal(m.byTask.get('00000002').name, '任务级模型');
-  assert.equal(m.byTask.get('00000004').name, '工作区模型');
+  assert.equal(m.byTask.get('00000002').name, '任务甲');
+  assert.equal(m.byTask.get('00000004').name, '任务乙');
   assert.ok(m.patrolLogs.some((line) =>
-    line.includes('任务 00000002') && line.includes('模型 sonnet')));
+    line.includes('任务 00000002') && line.includes('模型 claude-opus-5-5')));
 
   // 改配置不热切换已有会话，也不借巡检重启它们。
-  writeJson(path.join(m.WS, '.claude', 'cron-up.json'), {
-    model: 'next-default',
-    tasks: { '00000002': { model: 'next-task' } },
-  });
+  writeJson(path.join(m.WS, '.claude', 'cron-up.json'), { model: 'next-default' });
   await m.patrol();
   assert.equal(m.spawns.length, 2);
-  assert.equal(m.byTask.get('00000002').model, 'sonnet');
+  assert.equal(m.byTask.get('00000002').model, 'claude-opus-5-5');
   assert.equal(m.byTask.get('00000004').model, 'claude-opus-5-5');
 });
 
-test('invalid workspace model config blocks new spawns without failure counts', async (t) => {
+test('invalid workspace model config blocks new spawns but not automatic maintenance', async (t) => {
   const m = await setupMachine(t);
   writeJson(path.join(m.WS, '.claude', 'cron-up.json'), { model: '' });
-  writeTaskFile(m.WS, [makeTask()]);
+  writeTaskFile(m.WS, [makeTask({ id: '554e2879', permanent: false })]);
   await m.patrol();
   assert.equal(m.spawns.length, 0);
   assert.equal(m.bucket['00000001'], undefined);
+  const maintained = fileTasks(m)[0];
+  assert.equal(maintained.id, '00000001');
+  assert.equal(maintained.permanent, true);
   assert.ok(m.patrolLogs.some((line) =>
     line.includes('工作区模型配置无效') && line.includes('不会启动新的预热会话')));
 });
@@ -343,6 +342,14 @@ test('large recurring ids migrate task state, pending keys and Herdr labels toge
     ['8c9d6c82', '00000002'],
     ['2e66e7dc', '00000003'],
   ]);
+  for (const [from, to, summary] of [
+    ['554e2879', '00000001', '每日补报'],
+    ['8c9d6c82', '00000002', '每周成本'],
+    ['2e66e7dc', '00000003', '双周周报'],
+  ]) {
+    assert.ok(m.patrolLogs.some((line) => line.includes('任务改号')
+      && line.includes(`${from} → ${to}`) && line.includes(summary)));
+  }
   const first = fs.statSync(m.taskfile, { bigint: true });
   await m.patrol();
   const second = fs.statSync(m.taskfile, { bigint: true });
@@ -797,19 +804,21 @@ test('orphan query failure blocks a replacement spawn', async (t) => {
   assert.equal(m.spawns.length, 0);
 });
 
-// ---- 病态重复任务键 ----
+// ---- 无有效任务 id ----
 
-test('duplicate anonymous task keys are skipped with an alert', async (t) => {
+test('tasks without ids are skipped without maintenance or anonymous state', async (t) => {
   const m = await setupMachine(t);
   const lines = [];
   m.deps.log = (msg) => lines.push(msg);
-  const a = makeTask({ prompt: '无 id 重复' });
+  const a = makeTask({ prompt: '无 id 任务', permanent: false });
   delete a.id;
   writeTaskFile(m.WS, [a, { ...a }]);
+  const before = fs.readFileSync(m.taskfile, 'utf-8');
   await m.patrol();
   assert.equal(m.spawns.length, 0);
   assert.deepEqual(m.bucket, {});
-  assert.ok(lines.some((l) => l.includes('任务键重复') && l.includes('anon:')));
+  assert.equal(fs.readFileSync(m.taskfile, 'utf-8'), before);
+  assert.ok(lines.some((l) => l.includes('任务缺少有效 id') && l.includes('2 条')));
 });
 
 // ---- 一次性错过补执行窗口 ----
@@ -855,7 +864,24 @@ test('cmdRun: passive death between rounds is reported with task id', async (t) 
   lines.length = 0;
   await m.patrol();
   assert.ok(lines.some((l) => l.includes('会话退出') && l.includes('00000001')
-    && l.includes(`pid=${pid}`)));
+    && l.includes(`pid=${pid}`) && l.includes('尚未完成登记')));
+});
+
+test('cmdRun: a claimed session exit is neutral rather than a startup failure', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  const lines = [];
+  m.deps.log = (msg) => lines.push(msg);
+  writeTaskFile(m.WS, [makeTask()]);
+  await m.patrol();
+  m.claim(m.spawns[0], 'sid-normal-exit');
+  await m.patrol();
+  m.kill(m.spawns[0]);
+  lines.length = 0;
+  await m.patrol();
+  const line = lines.find((l) => l.includes('会话退出') && l.includes('00000001'));
+  assert.ok(line.includes('此前已完成登记'));
+  assert.ok(line.includes('不代表任务成功或失败'));
+  assert.ok(!line.includes('排查启动过程'));
 });
 
 test('cmdRun: persistent-window skip diagnostics do not repeat every round', async (t) => {
@@ -998,7 +1024,7 @@ test('cmdRun: partial claim of identical-content tasks stamps only the claimed i
   assert.equal(st['00000004'].sessionId, undefined);
 });
 
-test('cmdRun ensures the naming anchor once and failure does not block spawning', async (t) => {
+test('cmdRun prepares the naming anchor once for new sessions and failure does not block them', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   writeTaskFile(m.WS, [
     makeTask({ id: '00000002' }),
@@ -1014,26 +1040,51 @@ test('cmdRun ensures the naming anchor once and failure does not block spawning'
   assert.equal(calls, 1);
   assert.equal(m.spawns.length, 2);
   assert.ok(m.patrolLogs.some((line) => line.includes('hc unavailable')
-    && line.includes('下轮巡检重试锚点')));
+    && line.includes('后续需要新会话时重试锚点')));
 });
 
-test('cmdRun checks the anchor each round and logs only an actual launch', async (t) => {
+test('cmdRun leaves the anchor alone until a Claude session is actually launched', async (t) => {
   const m = await setupMachine(t, { realDiscover: true });
   writeTaskFile(m.WS, []);
   let calls = 0;
   m.deps.ensureHerdrAnchor = () => {
     calls += 1;
-    return calls === 1
-      ? { pid: 4242, procStart: 'start', herdr: 'ta', titleError: 'send failed' } : null;
+    return { pid: 4242, procStart: 'start', herdr: 'ta', titleError: 'send failed' };
   };
   assert.equal(await m.patrol(), true);
   assert.equal(await m.patrol(), true);
-  assert.equal(calls, 2);
+  assert.equal(calls, 0, '平静巡检不查询、不补建锚点');
+
+  const creatorPid = m.addUser('creator-online');
+  writeTaskFile(m.WS, [makeTask({
+    id: '00000002', createdBySessionId: 'creator-online',
+  })]);
+  assert.equal(await m.patrol(), true);
+  assert.equal(calls, 0, '原创建者在线时不需要新会话，也不准备锚点');
+  assert.equal(m.spawns.length, 0);
+
+  m.alive.delete(creatorPid);
+  assert.equal(await m.patrol(), true);
+  assert.equal(calls, 1, '首个真正的新 Claude 会话启动前才准备锚点');
+  assert.equal(m.spawns.length, 1);
+  assert.equal(await m.patrol(), true);
+  assert.equal(calls, 1, '复用现有会话时不重新准备锚点');
   const starts = m.patrolLogs.filter((line) => line.includes('已启动 Herdr 命名锚点 ta'));
   assert.equal(starts.length, 1);
   assert.ok(starts[0].includes('cwd=/tmp/cron-tasks'));
   assert.ok(m.patrolLogs.some((line) => line.includes('标题设置失败')
     && line.includes('send failed') && line.includes('不影响任务预热')));
+});
+
+test('cmdRun does not prepare the anchor when adopting an existing Claude terminal', async (t) => {
+  const m = await setupMachine(t, { realDiscover: true });
+  writeTaskFile(m.WS, [makeTask({ id: '00000002' })]);
+  m.alive.add(777);
+  m.deps.findHerdrOrphan = () => ({ pid: 777, procStart: 'start-777', herdr: 't7' });
+  m.deps.ensureHerdrAnchor = () => assert.fail('认领既有终端不属于新启动 Claude');
+  assert.equal(await m.patrol(), true);
+  assert.equal(m.spawns.length, 0);
+  assert.equal(m.state()[m.WS]['00000002'].pid, 777);
 });
 
 test('cmdRun: no pending sessions means no extra scans or sleeps', async (t) => {
@@ -1160,6 +1211,34 @@ test('run lock gives a fresh empty file an initialization grace period', (t) => 
   const handle = acquireRunLock();
   assert.ok(handle, '超过初始化宽限的半成品才可清理');
   releaseRunLock(handle);
+});
+
+test('run lock does not unlink a fresh empty replacement with identical text', (t) => {
+  const { lockPath, writeLock } = lockFixture(t);
+  writeLock('');
+  const old = new Date(Date.now() - 11_000);
+  fs.utimesSync(lockPath, old, old);
+
+  // 初次读到 stale 空锁后、删除前，另一个持有者删掉它并创建了新的空锁。
+  // 新锁尚未写入 token，文本与旧锁相同；inode/mtime 必须阻止误删。
+  const originalRead = fs.readFileSync;
+  let reads = 0;
+  fs.readFileSync = function (file, ...args) {
+    if (file === lockPath && ++reads === 2) {
+      fs.unlinkSync(lockPath);
+      const fd = fs.openSync(lockPath, 'wx', 0o600);
+      fs.closeSync(fd);
+    }
+    return originalRead.call(this, file, ...args);
+  };
+  let handle;
+  try {
+    handle = acquireRunLock();
+  } finally {
+    fs.readFileSync = originalRead;
+  }
+  assert.equal(handle, null, '新空锁不是初次快照里的 stale 文件，本轮应放弃抢锁');
+  assert.equal(fs.readFileSync(lockPath, 'utf-8'), '');
 });
 
 test('run lock reclaims a dead holder', (t) => {

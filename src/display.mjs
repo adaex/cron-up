@@ -6,7 +6,7 @@ import {
   taskIsOneshot,
   wantedNow,
   wantedWithin,
-  nextDelivery,
+  displaySlot,
 } from './cron.mjs';
 
 // 等宽终端里的宽字符区间（CJK 文字、全角标点、谚文、常用 emoji）：启发式
@@ -99,21 +99,19 @@ export function taskView(task, now, leadMs) {
       summary: taskSummary(task),
       permanent: false,
       wanted: null,
-      fire: null,
     };
   }
   const oneshot = taskIsOneshot(task);
-  // nxt 按定义不晚于展示语境里的下一次投递，「已错过」完全由补执行判定
-  // 回答：只问此刻、不带前瞻，与巡检的错过/尾窗判定同一口径。
+  // nxt 是展示用设定落点；「已错过」完全由补执行判定回答：只问此刻、
+  // 不带前瞻，与巡检的错过/尾窗判定同一口径。
   const missed = oneshot && wantedNow(cron, task, now);
-  // 落点与投递由 nextDelivery 同源算出：尾窗内的周期任务即将到来的是上
-  // 一落点的这次延迟投递，而不是从明天的落点拐回来（2 月 29 日任务尾窗内
-  // nextAfter 甚至找不到下一落点）。list 只取 fire 显示一个时间。
-  const { slot, fire } = nextDelivery(cron, task, now);
+  // 展示只保留 cron 设定落点；尾窗内仍对应上一落点的待投递任务，不显示
+  // 下一个周期，也不提供秒级预计投递时间。
+  const slot = displaySlot(cron, task, now);
   return {
     valid: true,
-    // 已错过的一次性任务没有未来触发：nxt 置 null，否则「一年内无」的判
-    // 断和总览「最近」（fire ?? nxt）会把它当成明年同刻的安排。
+    // 已错过的一次性任务没有未来落点：nxt 置 null，否则「一年内无」的
+    // 判断和总览「最近」会把它当成明年同刻的安排。
     nxt: missed ? null : slot,
     missed,
     kind: oneshot ? '一次性' : '周期',
@@ -123,23 +121,7 @@ export function taskView(task, now, leadMs) {
     // wanted 恒为 null 或布尔：没传 leadMs（不问）与 cron 无效（问不了）
     // 都是 null，键的形状不随参数变化。
     wanted: leadMs !== undefined ? wantedWithin(cron, task, now, leadMs) : null,
-    // 计入 Claude Code 投递抖动后的预计投递时刻；已错过的一次性任务
-    // 没有未来触发，为 null；尾窗内的周期任务是即将到来的这次延迟投递。
-    // 与 nxt 同为 Date 或 null。
-    fire: missed ? null : fire,
   };
-}
-
-// MM-DD HH:MM 口径下是否同一天/同一分钟。
-function sameDay(a, b) {
-  return a.getFullYear() === b.getFullYear()
-    && a.getMonth() === b.getMonth()
-    && a.getDate() === b.getDate();
-}
-// 「同一分钟」的唯一判据，总览「设定」附注使用。
-export function sameMinute(a, b) {
-  return sameDay(a, b) && a.getHours() === b.getHours()
-    && a.getMinutes() === b.getMinutes();
 }
 
 // 两位数字补零：时间戳格式的公共零件，巡检日志的时间戳（patrol 的 log）
@@ -148,22 +130,10 @@ export function pad2(n) {
   return String(n).padStart(2, '0');
 }
 
-// 仅 HH:MM（总览「（设定 HH:MM）」附注用）。
-export function fmtHM(d) {
-  return `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
-
-// MM-DD HH:MM（任务触发点的统一展示格式）。
+// MM-DD HH:MM（cron 设定落点的统一展示格式）。
 export function fmtMDHM(d) {
   return `${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} `
     + `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
-}
-
-// list 的单一预计投递时间：调度器秒级轮询，非整秒不能悄悄截掉。保留秒数
-// 不等于恢复旧的「设定 → 预计」双时间展示。
-export function fmtFire(d) {
-  const r = new Date(Math.round(d.getTime() / 1000) * 1000);
-  return `${fmtMDHM(r)}${r.getSeconds() ? `:${pad2(r.getSeconds())}` : ''}`;
 }
 
 // 会话年龄的粗粒度中文：长驻按天计，否则按分钟。

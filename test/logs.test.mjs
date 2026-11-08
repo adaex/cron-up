@@ -6,6 +6,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 
 import { resolveLogPath, cmdLogs } from '../src/logs.mjs';
+import { getHerdrTerminal, listHerdrTerminals } from '../src/sessions.mjs';
 import { ExitError } from '../src/internals.mjs';
 import { mkTmp, mockDeps, tmpPaths } from '../test-support/helpers.mjs';
 
@@ -92,15 +93,31 @@ test('cmdLogs resolves an exact Herdr address without listing history', (t) => {
   });
 });
 
-test('cmdLogs reads Herdr history and only attaches to a live terminal', (t) => {
+test('cmdLogs finds current task and anchor titles through raw Herdr records', (t) => {
   const s = setup(t);
-  s.deps.listHerdrTerminals = (taskId, includeFinished) => {
-    assert.equal(taskId, null);
-    assert.equal(includeFinished, true);
-    return [{
-      address: 't7', taskId: '00000001', cwd: '/ws',
-      title: 'cron-up / ws / 每日汇总', state: 'finished',
-    }];
+  // 不 stub 已水合的 title：让 cmdLogs 经过真实 get/list/terminalRecord，
+  // 覆盖 Claude --name 与 OSC 0 当前写入的顶层 terminal.title。
+  s.deps.getHerdrTerminal = getHerdrTerminal;
+  s.deps.listHerdrTerminals = listHerdrTerminals;
+  s.deps.execFile = (file, args) => {
+    if (args[0] === 'get' && !['t7', 'ta'].includes(args[2])) {
+      return { status: 1, stdout: '', stderr: 'not an address' };
+    }
+    if (args[0] === 'ls') {
+      assert.deepEqual(args, ['ls', '--json', '--all']);
+      return { status: 0, stdout: JSON.stringify({ terminals: [
+        { address: 't7', state: 'finished' },
+        { address: 'ta', state: 'live' },
+      ] }) };
+    }
+    assert.equal(args[0], 'get');
+    return { status: 0, stdout: JSON.stringify(args[2] === 't7' ? {
+      pid: 4242, cwd: '/ws', state: 'finished', title: '每日 汇总',
+      labels: { 'cron-up': '00000001', where: '旧版汇总标题' },
+    } : {
+      pid: 4243, cwd: '/tmp/cron-tasks', state: 'live', title: 'cron-tasks-anchor',
+      labels: { 'cron-up-anchor': '1' },
+    }) };
   };
   let seen;
   s.deps.spawnSync = (file, args) => {
@@ -115,6 +132,14 @@ test('cmdLogs reads Herdr history and only attaches to a live terminal', (t) => 
   assert.deepEqual(seen, {
     file: '/mock/hc', args: ['read', '--lines', '100', 't7'],
   }, '已结束的终端只读历史，不 attach');
+  cmdLogs({ workspace: '旧版汇总', follow: false });
+  assert.deepEqual(seen, {
+    file: '/mock/hc', args: ['read', '--lines', '100', 't7'],
+  }, '旧 where 标题在 Core 已有其他标题时仍可检索');
+  cmdLogs({ workspace: 'cron-tasks-anchor', follow: false });
+  assert.deepEqual(seen, {
+    file: '/mock/hc', args: ['read', '--lines', '100', 'ta'],
+  }, '锚点也能按当前 Core 标题找到');
 });
 
 test('cmdLogs follow attaches to a live Herdr terminal', (t) => {

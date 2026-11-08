@@ -368,12 +368,38 @@ test('comma-separated roots are normalised and persisted', async (t) => {
   assert.deepEqual(s.cfg().roots, [a, b]);
 });
 
-test('corrupt existing config does not block install: falls back with a notice', async (t) => {
+test('corrupt existing config blocks implicit roots but allows explicit repair', async (t) => {
   const s = await setupInstall(t);
   fs.writeFileSync(s.deps.paths.configPath, '{ not json');
-  await s.install({ roots: undefined }); // 不带 --roots：读旧配置失败，回默认
-  assert.deepEqual(s.cfg().roots, normalizeRoots(DEFAULT_CONFIG.roots));
-  assert.ok(s.lines.some((l) => l.includes('现有配置无法解读')));
+  await assert.rejects(s.install({ roots: undefined }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('现有配置无法解读'));
+    assert.ok(e.message.includes('--roots'));
+    assert.ok(e.message.includes('未修改配置或安装服务'));
+    return true;
+  });
+  assert.equal(fs.readFileSync(s.deps.paths.configPath, 'utf-8'), '{ not json');
+  assert.equal(s.launchCalls.length, 0);
+  assert.equal(s.patrolCalls(), 0);
+
+  await s.install({ roots: s.tmp });
+  assert.deepEqual(s.cfg().roots, [s.tmp]);
+  assert.ok(s.launchCalls.some((c) => c[0] === 'bootstrap'));
+});
+
+test('dangling config symlink blocks implicit roots instead of triggering defaults', async (t) => {
+  const s = await setupInstall(t);
+  fs.symlinkSync(path.join(s.tmp, 'missing-config-target'), s.deps.paths.configPath);
+  await assert.rejects(s.install({ roots: undefined }), (e) => {
+    assert.ok(e instanceof ExitError);
+    assert.equal(e.code, 2);
+    assert.ok(e.message.includes('现有配置无法解读'));
+    return true;
+  });
+  assert.ok(fs.lstatSync(s.deps.paths.configPath).isSymbolicLink());
+  assert.equal(s.launchCalls.length, 0);
+  assert.equal(s.patrolCalls(), 0);
 });
 
 test('rerun without --roots keeps existing roots', async (t) => {

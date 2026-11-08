@@ -101,15 +101,27 @@ test('task inventory and soonest line', async (t) => {
   assert.ok(out.includes('最近：'));
 });
 
-test('soonest line uses predicted fire with the slot annotated', async (t) => {
+test('soonest line uses the cron slot without a predicted fire annotation', async (t) => {
   const s = await setup(t);
   const out = await s.render([{
     id: 'c1363d8b', cron: '0 13 * * *', recurring: true,
     prompt: 'Trae 成本刷新',
   }]);
   assert.ok(out.includes('最近：'), out);
-  assert.ok(out.includes('13:30'), out);
-  assert.ok(out.includes('设定 13:00'), out);
+  assert.ok(out.includes('13:00'), out);
+  assert.ok(!out.includes('13:30'), out);
+  assert.ok(!out.includes('设定 13:00'), out);
+});
+
+test('past tail slot says its set time has arrived without a delivery prediction', async (t) => {
+  const s = await setup(t);
+  const slot = new Date(Date.now() - 60_000);
+  const cron = `${slot.getMinutes()} ${slot.getHours()} ${slot.getDate()} `
+    + `${slot.getMonth() + 1} *`;
+  const out = await s.render([{
+    id: 'c1363d8b', cron, recurring: true, prompt: '等待延迟投递',
+  }]);
+  assert.ok(out.includes('设定时间已到，等待上游投递'), out);
 });
 
 test('wanted task without a warm entry is an alert', async (t) => {
@@ -160,6 +172,7 @@ test('pending task during cooldown gets one combined alert', async (t) => {
       cooldownUntil: Math.floor(Date.now() / 1000) + 900 } },
   });
   assert.ok(out.includes('正处冷却中'));
+  assert.ok(out.includes('分钟后自动重试'));
   assert.ok(!out.includes('下轮巡检会自动启动预热'));
 });
 
@@ -172,6 +185,17 @@ test('bad cron and per-task cooling become alerts', async (t) => {
       cooldownUntil: Math.floor(Date.now() / 1000) + 900 } } });
   assert.ok(out.includes('cron 无法解析'));
   assert.ok(out.includes('冷却 1 个'));
+});
+
+test('tasks without ids are visible as skipped instead of becoming anonymous work', async (t) => {
+  const s = await setup(t);
+  const task = soonOneshot({ prompt: '无 ID 手写任务' });
+  delete task.id;
+  const out = await s.render([task]);
+  assert.ok(out.includes('任务：1 个'), out);
+  assert.ok(out.includes('缺少有效 id'), out);
+  assert.ok(out.includes('CronCreate 重建'), out);
+  assert.ok(!out.includes('即将执行'), out);
 });
 
 test('unreadable task file is alerted, not ghosted', async (t) => {

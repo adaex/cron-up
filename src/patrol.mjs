@@ -44,6 +44,7 @@ import {
   TaskFileChanged,
   taskFileExists,
   groupTasksByKey,
+  taskKey,
   taskOwnedBy,
   taskSig,
   readWorkspaceConfig,
@@ -58,7 +59,7 @@ import { elapsedZh, pad2, taskSummary } from './display.mjs';
 const EVENT_LABELS = [
   ['spawn', '启动'],
   ['recycle', '回收'],
-  ['exit', '自行退出'],
+  ['exit', '会话退出'],
   ['stuck', '卡死退休'],
   ['adopt', '接管'],
   ['reown', '过户'],
@@ -97,7 +98,8 @@ function tryCreateLock(lockPath) {
 }
 
 // 文本与 stat 一起作为删除前的比对快照：除了内容，inode/mtime 也能识别
-// 「删掉旧锁后又恰好建了同样内容的新锁」。
+// 「删掉旧锁后又恰好建了同样内容的新锁」。随机 token 只能区分已写完记录的
+// 持有者，空锁初始化窗口里新旧文件的文本仍然相同。
 function readLockSnapshot(lockPath) {
   try {
     return {
@@ -382,6 +384,11 @@ export function patrolWorkspace(
   // 会话都无法唯一对应到条目：跳过这些组并告警，maintainWorkspace 也只
   // 处理单元素组。组的键集合同时就是后面的 currentKeys。
   const taskGroups = groupTasksByKey(tasks);
+  const missingId = tasks.filter((t) => taskKey(t) === null).length;
+  if (missingId > 0) {
+    note('warn', `任务缺少有效 id ${ws}：${missingId} 条记录无法唯一对应会话，`
+      + '本轮跳过这些条目的维护、预热与盖印；请通过 CronCreate 重建');
+  }
 
   // id 已在上一轮写盘、state 却未及落盘时，用稳定内容签名认回唯一任务。
   // herdrTaskId 保留终端最后确认的旧标签，后面的标签同步与停止前核验才能
@@ -589,7 +596,7 @@ export function patrolWorkspace(
     // 启动前都先按 Herdr 标签与工作区认领：state 可能丢失，也可能只有上次
     // “已创建终端但身份查询失败”留下的 pid=null 条目。查询失败会抛错并跳过
     // 本次启动，不能把证据不足当成没有孤儿。
-    const model = configuredModel(workspaceConfig, key);
+    const model = configuredModel(workspaceConfig);
     const adopted = deps.findHerdrOrphan(ws, key);
     const spawned = adopted ?? deps.spawnSession(ws, key, model, taskSummary(t));
     if (spawned?.pid == null) {
@@ -646,7 +653,7 @@ export function patrolWorkspace(
     });
   } catch (e) {
     if (e instanceof TaskFileChanged) {
-      note('warn', `维护暂缓 ${ws}：任务或模型配置文件刚被其他写者改动，`
+      note('warn', `维护暂缓 ${ws}：任务文件刚被其他写者改动，`
         + '本轮不覆盖，稍后重试');
       return pending;
     }
@@ -662,10 +669,11 @@ export function patrolWorkspace(
   if (result.minified) {
     deps.log(`已改小 id ${ws}：${result.minified} 个周期任务改用文件内空出的`
       + '小号，消除按 id 计算的投递延迟');
-  }
-  if (result.modelAliases) {
-    deps.log(`已同步模型配置 ${ws}：为 ${result.modelAliases} 个改号任务保留`
-      + '新 id 的同值配置键');
+    for (const { from, to } of result.idChanges) {
+      const original = taskGroups.get(from)?.[0];
+      deps.log(`任务改号 ${ws}：${from} → ${to}（${taskSummary(original)}）；`
+        + '后续列表、日志与状态使用新 id');
+    }
   }
 
   // 改号成功后同步迁移 state 和 pending；pending 不改会让轮内等待按旧键找
@@ -797,6 +805,7 @@ export async function cmdRun(args) {
   // 与「会话自行退出/被外部杀掉的」。hc 路径、同一 pid 的 lstart 在一轮内
   // 不变，分别缓存后避免重复解析 PATH 或重复 spawn ps。finally 全部还原。
   const prevStopSession = deps.stopSession;
+  const prevSpawnSession = deps.spawnSession;
   const prevFindHerdr = deps.findHerdr;
   deps.findHerdr = () => hc;
   const stoppedPids = new Set();
@@ -838,23 +847,34 @@ export async function cmdRun(args) {
         + '请检查配置文件或用 cron-up install --roots 指定');
     }
 
-    try {
-      const anchor = deps.ensureHerdrAnchor(hc);
-      if (anchor) {
-        bump(stats, 'spawn');
-        deps.log(`已启动 Herdr 命名锚点 ${anchor.herdr}：`
-          + `pid=${anchor.pid}，cwd=${HERDR_ANCHOR_CWD}`);
-        if (anchor.titleError) {
+    // 锚点只是新任务会话的命名辅助，不是常驻服务。准备挂在真实 spawn 边界上：
+    // 空轮、复用会话、原创建者在线与孤儿认领都不查询、不补建；一轮有多个新
+    // 会话也只在首次启动前尝试一次。准备失败仍启动 Claude Code，下次确实需要
+    // 新会话时再试。
+    let anchorAttempted = false;
+    deps.spawnSession = (...args) => {
+      if (!anchorAttempted) {
+        anchorAttempted = true;
+        try {
+          const anchor = deps.ensureHerdrAnchor(hc);
+          if (anchor) {
+            bump(stats, 'spawn');
+            deps.log(`已启动 Herdr 命名锚点 ${anchor.herdr}：`
+              + `pid=${anchor.pid}，cwd=${HERDR_ANCHOR_CWD}`);
+            if (anchor.titleError) {
+              bump(stats, 'warn');
+              deps.log(`Herdr 命名锚点 ${anchor.herdr} 标题设置失败：`
+                + `${anchor.titleError}；锚点继续复用，不影响任务预热`);
+            }
+          }
+        } catch (e) {
           bump(stats, 'warn');
-          deps.log(`Herdr 命名锚点 ${anchor.herdr} 标题设置失败：`
-            + `${anchor.titleError}；锚点继续复用，不影响任务预热`);
+          deps.log(`Herdr 命名锚点准备失败：${e?.message ?? e}；`
+            + '新会话仍带固定归组标签，后续需要新会话时重试锚点');
         }
       }
-    } catch (e) {
-      bump(stats, 'warn');
-      deps.log(`Herdr 命名锚点准备失败：${e?.message ?? e}；`
-        + '新会话仍带固定归组标签，下轮巡检重试锚点');
-    }
+      return prevSpawnSession(...args);
+    };
 
     // 登记轮初读一次（含祖先链快照）：认亲与活创建者判定都靠它。有新
     // spawn 时等待期会重扫，details 随之刷新到最新快照（轮末 kept 判定
@@ -887,10 +907,17 @@ export async function cmdRun(args) {
         }
       }
     }
-    const exitLine = (ws, taskId, old) => `会话退出 ${ws} 任务 ${taskId} `
-      + `pid=${old.pid}：非巡检主动结束（已存活 `
-      + `${elapsedZh(cur - (old.startedAt ?? cur))}），可能自行退出或被外部`
-      + `终止；若反复出现请用 ${sessionDebugCommand(old)} 排查启动过程`;
+    const exitLine = (ws, taskId, old) => {
+      const base = `会话退出 ${ws} 任务 ${taskId} pid=${old.pid}：`
+        + `非巡检主动结束（已存活 ${elapsedZh(cur - (old.startedAt ?? cur))}）`;
+      if (entryClaimed(old)) {
+        return `${base}；该会话此前已完成登记，退出本身不代表任务成功或失败；`
+          + '后续是否重新预热仍由任务窗口决定，历史可用 '
+          + `${sessionDebugCommand(old)} 查看`;
+      }
+      return `${base}；会话尚未完成登记，可能启动失败或被外部终止；`
+        + `请用 ${sessionDebugCommand(old)} 排查启动过程`;
+    };
     for (const [ws, taskId, old] of prevDead) {
       bump(stats, 'exit');
       deps.log(exitLine(ws, taskId, old));
@@ -998,6 +1025,7 @@ export async function cmdRun(args) {
     return true;
   } finally {
     deps.stopSession = prevStopSession;
+    deps.spawnSession = prevSpawnSession;
     deps.procStartedAt = prevProcStartedAt;
     deps.findHerdr = prevFindHerdr;
     deps.releaseRunLock(lock);

@@ -10,8 +10,10 @@ export const DEFAULT_CONFIG = {
 };
 
 // 所有预热会话共用固定 space ID。cron-up 只通过 hc 操作 Core，不调用 App
-// 能力。普通 zsh 锚点用于尽力获得 cron-tasks 默认显示名；不保证 tab 顺序，
-// 手动移位或关闭后名称变化属于可接受行为。
+// 能力。普通 zsh 锚点是 hc 不能直接创建、命名 space 并设置目录时的临时方案，
+// 用于尽力获得 cron-tasks 默认显示名；hc 原生支持后删除。锚点只在确实要新建
+// Claude Code 会话前按需准备，不在平静巡检中补建；不保证 tab 顺序，手动移位
+// 或关闭后名称变化属于可接受行为。
 export const HERDR_SPACE_ID = 'cron-tasks';
 export const HERDR_ANCHOR_CWD = '/tmp/cron-tasks';
 export const HERDR_ANCHOR_TAB_ID = 'cron-tasks-anchor';
@@ -73,22 +75,20 @@ export const PRUNE_DIRS = new Set([
   '.cache', '.npm', '.local', '.config',
 ]);
 
-// Claude Code 会话投递定时任务时的抖动参数，两处使用：list/总览预测
-// 「预计投递时间」；巡检把「落点之后、延迟投递点之前」这段投递尾窗
-// 也算作需要会话在场，避免在任务真正投递前把预热回收。逆向自
+// Claude Code 会话投递定时任务时的抖动参数，只用于巡检预热窗口、尾窗保活
+// 和自动改号，不向用户展示秒级预测。巡检把「落点之后、延迟投递点之前」
+// 这段投递尾窗也算作需要会话在场，避免在任务真正投递前回收预热。逆向自
 // Claude Code v2.1.285
 // （darwin-arm64 原生二进制，2026-09-30 安装）内部 createCronScheduler 的
 // gV 默认值：周期任务 fire = 落点 + min(hash(id)·recurringFrac·周期,
 // recurringCapMs)；一次性任务在 :00/:30 网格点提前 0~oneShotMaxMs。
 // 这些值没有稳定性承诺——版本升级可能改，运行时还可能被远程配置键
-// tengu_kairos_cron_config（60 秒刷新，校验失败回退默认）覆盖。预测与
-// 实际系统性对不上时，按 docs/internals.md 的版本证据与复核步骤核对新版本。
+// tengu_kairos_cron_config（60 秒刷新，校验失败回退默认）覆盖。实际行为与
+// 当前窗口规则对不上时，按 docs/internals.md 的版本证据与复核步骤核对。
 export const CC_JITTER = {
   recurringFrac: 0.5,
   recurringCapMs: 30 * 60 * 1000,
   oneShotMaxMs: 90 * 1000,
-  oneShotFloorMs: 0,
-  oneShotMinuteMod: 30,
 };
 
 // 自动改小周期任务 id 的目标延迟上界。按尾窗覆盖的最长周期间隔反解 id
@@ -96,7 +96,7 @@ export const CC_JITTER = {
 // 的延迟都落在同一分钟内。改号只消除上游按 id 计算的偏移，不改动 cron。
 export const AUTO_MIN_ID_TARGET_DELAY_MS = 60 * 1000;
 
-// 投递尾窗判定的回看/前探窗口（wanted 与 nextDelivery 共用，见
+// 投递尾窗判定的回看/前探窗口（wanted 与 displaySlot 共用，见
 // src/cron.mjs 的 recurringTailWindow）：找上一落点用 prevAtOrBefore、算
 // 周期用 nextAfter，两个方向都要罩住月/年任务之外的 2 月 29 日——相邻落
 // 点隔 4 年，世纪非闰年（2100）隔 8 年；窗口小了尾窗会塌缩成零：落点已
@@ -106,6 +106,6 @@ export const TAIL_WINDOW_DAYS = 366 * 10 + 1;
 // 定时任务 7 天过期（周期任务被调度器删除，一次性任务早就触发过），巡检
 // 不需要看得更远。展示页另算。
 export const SEARCH_DAYS = 7;
-// list/总览回答「下次何时触发」，要看到一年后：年度任务必须显示真实日期，
+// list/总览回答「下一个设定落点何时到来」，要看到一年后：年度任务必须显示真实日期，
 // 不能误报成「无安排」。nextAfter 的日历快进让长窗口依然便宜。
 export const DISPLAY_SEARCH_DAYS = 366;

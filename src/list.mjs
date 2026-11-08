@@ -1,5 +1,5 @@
-// `cron-up list`：逐工作区列出任务的下次触发、节奏、类型、摘要与该任务
-// 的预热状态。
+// `cron-up list`：逐工作区列出任务的 cron 设定落点、节奏、类型、摘要与
+// 预热状态。
 
 import { deps, getOwn } from './internals.mjs';
 import { LEAD_SECONDS } from './constants.mjs';
@@ -11,7 +11,7 @@ import {
   dispWidth,
   displayPath,
   taskView,
-  fmtFire,
+  fmtMDHM,
 } from './display.mjs';
 
 function rank(v) {
@@ -20,13 +20,12 @@ function rank(v) {
   return v.nxt ? 1 : 2;
 }
 
-// 状态列只显示一个预计投递时间。周期任务经巡检改小 id 后通常就是 cron
-// 设定分钟；一次性任务仍计入上游可能的网格提前量。
+// 状态列只显示 cron 设定落点；上游可能提前或延后，实际预热看后面的标签。
 function statusText(v) {
   if (!v.valid) return 'cron 无效';
   if (v.missed) return '已错过';
   if (!v.nxt) return '一年内无';
-  return fmtFire(v.fire ?? v.nxt);
+  return fmtMDHM(v.nxt);
 }
 
 // 单个任务的预热状态标签。创建者会话还开着时返回空串——任务原生投进创
@@ -74,15 +73,15 @@ export async function cmdList(args) {
       return {
         v,
         t,
-        model: configuredModel(workspaceConfig, key),
-        tag: warmTag(t, v, getOwn(state[ws], key), liveSids, ws, cur),
+        tag: key === null ? '无ID不调度'
+          : warmTag(t, v, getOwn(state[ws], key), liveSids, ws, cur),
       };
     });
     // 错过待补执行排最前，然后按下次时间升序，一年内无安排的垫底，无效
     // 的最后。
     views.sort((a, b) => rank(a.v) - rank(b.v)
       || ((a.v.nxt?.getTime() ?? Infinity) - (b.v.nxt?.getTime() ?? Infinity)));
-    blocks.push([ws, views, workspaceConfig.error]);
+    blocks.push([ws, views, workspaceConfig]);
     total += tasks.length;
   }
 
@@ -112,13 +111,15 @@ export async function cmdList(args) {
   const cadW = 16;
   // 固定列："  " status "  " kind "  " cadence "  " summary ["  " tag]。
   const fixedW = 2 + statusW + 2 + kindW + 2 + cadW;
-  for (const [ws, views, configError] of blocks) {
+  for (const [ws, views, workspaceConfig] of blocks) {
+    const configError = workspaceConfig.error;
+    const model = configuredModel(workspaceConfig);
     deps.print('');
     deps.print(clip(displayPath(ws), cols));
     if (configError) {
       deps.print(clip(`  配置告警：修复前不会启动新的预热会话；${configError}`, cols));
     }
-    for (const { v, tag, model } of views) {
+    for (const { v, tag } of views) {
       let kind;
       let cadence;
       let summary;

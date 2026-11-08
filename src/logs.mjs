@@ -37,7 +37,7 @@ export function resolveHerdrTerminal(workspace, announce) {
   }
   const matches = deps.listHerdrTerminals(null, true).filter((t) =>
     absolute !== null ? t.cwd === absolute
-      : [t.address, t.taskId, t.cwd, t.title]
+      : [t.address, t.taskId, t.cwd, t.title, t.legacyTitle]
         .some((value) => String(value ?? '').includes(workspace)));
   if (matches.length === 0) return null;
   if (matches.length === 1) return matches[0];

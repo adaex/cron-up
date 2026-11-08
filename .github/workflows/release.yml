@@ -47,21 +47,6 @@ jobs:
               "不一致：先改版本号再发版" >&2
             exit 1
           fi
-      # 版本序号规则：序号 = 含本次在内的历史发布总次数（v* tag 计数）。
-      # 数错（该发 21 发成 22）在这里当场拦下；发布失败的 tag 重跑本工作流
-      # 即可，序号不消耗。ls-remote 直接数远端：--refs 必须带，否则 annotated
-      # tag 的 ^{} 剥壳行会把计数翻倍；也比本地 clone 数更贴近触发时的真相。
-      - name: Verify tag serial equals total release count
-        run: |
-          total=$(git ls-remote --refs --tags origin 'v*' | wc -l | tr -d '[:space:]')
-          serial=${GITHUB_REF_NAME#v}
-          serial=${serial##*.}
-          if [ "$serial" != "$total" ]; then
-            echo "tag 序号（$serial）与远端 v* tag 总数（$total，含本 tag）不一致：" \
-              "序号应为 git fetch --prune --prune-tags --tags 后 " \
-              "git tag -l 'v*' | wc -l 的结果加一" >&2
-            exit 1
-          fi
       - name: npm pack dry run (sanity check)
         run: npm pack --dry-run
       - name: Publish to npm

@@ -7,17 +7,9 @@
 格式为 `YY.MM.serial`，例如 `26.10.33`：
 
 - `YY` 是两位年份，`MM` 是两位月份
-- `serial` 是累计序号，包含 0.x 时代，跨月份不归零
-- 工程上的最终校验口径是**远端 `v*` tag 数量**，不是 npm 成功发布次数；下一序号等于发布前该数量加一
+- `serial` 在当前 `package.json` 的基础上递增，跨月份不归零；发布失败且需要重跑同一个 tag 时不递增
 
-发布前同步并计算：
-
-```bash
-git fetch --prune --prune-tags --tags
-git tag -l 'v*' | wc -l
-```
-
-计数结果加一就是下一序号。release 工作流会重新直接统计远端 tag，防止本地状态与远端不一致；被删除的远端 tag 不再计数。已推送但尚未 publish、且 tag 内容无需改变的失败运行，优先重跑同一工作流，而不是递增序号；需要修复 tag 内容时按下文处理
+release 工作流只校验 package 版本与 tag 一致，不再把版本号绑定到远端 tag 总数
 
 ## 发布步骤
 
@@ -33,14 +25,13 @@ git tag -l 'v*' | wc -l
 4. 等待 `.github/workflows/release.yml` 完成。工作流会：
    - 在 macOS 上用 Node 22、24 运行测试
    - 校验 `package.json` 版本与 tag 完全一致
-   - 校验 tag 序号与远端 `v*` tag 总数一致
    - 执行 `npm pack --dry-run`
    - 通过 `npm publish --provenance` 发布
 
 发布失败时先确认失败发生在 publish 之前，并区分两种情况：
 
-- **tag 内容无需改变**：例如 runner 或 registry 的临时故障，可以直接对同一个 tag 重跑 release 工作流，不消耗新序号
-- **必须修改仓库内容**：例如测试、版本号或工作流本身有误，只修复 main 后重跑旧 tag 仍会检出旧内容。应先把修复提交合入 main，再将同名签名 tag 重新签在修复提交上，并按仓库 tag 保护规则替换远端同名 tag，使新运行检出修复后的内容；同名 tag 不增加远端计数，因此不消耗新序号
+- **tag 内容无需改变**：例如 runner 或 registry 的临时故障，可以直接对同一个 tag 重跑 release 工作流
+- **必须修改仓库内容**：例如测试、版本号或工作流本身有误，只修复 main 后重跑旧 tag 仍会检出旧内容。应先把修复提交合入 main，再将同名签名 tag 重新签在修复提交上，并按仓库 tag 保护规则替换远端同名 tag，使新运行检出修复后的内容
 
 只有尚未成功 publish 的版本才能按后一种方式替换 tag。已经成功 publish 的版本不要再移动 tag，后续问题通过新的发布修复
 

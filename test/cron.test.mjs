@@ -12,7 +12,7 @@ import {
   wantedNow,
   wantedWithin,
   taskIdHash,
-  nextDelivery,
+  displaySlot,
 } from '../src/cron.mjs';
 import { taskView } from '../src/display.mjs';
 import { DISPLAY_SEARCH_DAYS } from '../src/constants.mjs';
@@ -20,10 +20,9 @@ import { DISPLAY_SEARCH_DAYS } from '../src/constants.mjs';
 const NOW = new Date(2026, 8, 20, 15, 47); // Sunday
 const LEAD_MS = 6 * 60_000;
 
-// 直接测 nextDelivery 的 fire：它是 taskView nxt/fire 的唯一来源，生产侧
-// 已无第二入口（原 predictedFire 薄封装已删）。
-function fireOf(task, now = NOW) {
-  return nextDelivery(new Cron(task.cron), task, now).fire;
+// 展示只取 cron 落点；尾窗中仍取当前待投递的上一落点。
+function slotOf(task, now = NOW) {
+  return displaySlot(new Cron(task.cron), task, now);
 }
 
 function dt(y, m, d, h = 0, min = 0) {
@@ -348,7 +347,7 @@ test('wantedNow/wantedWithin are exported for the display view', () => {
     'boolean');
 });
 
-// ---- Claude Code 投递抖动预测 ----
+// ---- Claude Code 投递抖动与内部预热窗口 ----
 // 固定参考 NOW=2026-09-20 15:47（文件头）；hash 容差覆盖双精度表达差异。
 test('taskIdHash mirrors the upstream M(id) hash', () => {
   assert.ok(Math.abs(taskIdHash('0ff0d1b5') - 0.062268) < 1e-6);
@@ -364,55 +363,17 @@ test('taskIdHash mirrors the upstream M(id) hash', () => {
   assert.equal(taskIdHash('zzzzzzzz'), 0);
 });
 
-test('recurring fire is the slot plus the deterministic jitter', () => {
-  // 从固定时刻算：daily cron '0 13' 的下一落点是 09-21 13:00（NOW 当天
-  // 13:00 已过），再下一个 09-22 13:00，周期 1 天。
-  const slot = new Date(2026, 8, 21, 13, 0, 0);
-  const day = 86400_000;
-  for (const [id, expectedDelayS] of [
-    ['c1363d8b', 1800],    // hash 0.7547 → min(…, cap) 顶格 30 分钟
-    ['058e0149', 937.4],   // hash 0.02170 → 约 15:37.4，不顶格
-    [undefined, 0],        // 无 id → hash 0，无抖动
-    ['zzzzzzzz', 0],       // 坏 id 同 0
-  ]) {
-    const fire = fireOf(
-      { id, cron: '0 13 * * *', recurring: true });
-    assert.ok(fire instanceof Date, `id=${id} 应返回 Date`);
-    const delayS = (fire.getTime() - slot.getTime()) / 1000;
-    assert.ok(Math.abs(delayS - expectedDelayS) < 1.5,
-      `id=${id} 延迟 ${delayS}s 与预期 ${expectedDelayS}s 不符`);
-  }
-});
-
-test('jitter cap also binds for long-period crons', () => {
+test('jitter cap also bounds the tail for long-period crons', () => {
   // 周期 7 天不设顶会是 hash·0.5·7 天（数小时），顶格后只有 30 分钟。
-  const fire = fireOf(
-    { id: 'c1363d8b', cron: '0 10 * * 0', recurring: true });
-  // 下一落点：09-27 10:00（见 day of week 测试），顶格 → 10:30。
-  assert.equal(fire.getTime(), new Date(2026, 8, 27, 10, 30, 0).getTime());
+  const task = { id: 'c1363d8b', cron: '0 10 * * 0', recurring: true };
+  assert.equal(taskWanted(task, new Date(2026, 8, 20, 10, 15), 0), true);
+  assert.equal(taskWanted(task, new Date(2026, 8, 20, 10, 31), 0), false);
 });
 
-test('one-shot grid slots fire early, other minutes do not', () => {
-  // 09-25 14:00（:00 网格）：提前 hash·90s，但不早于 NOW。
-  const grid = fireOf(
-    { id: 'c1363d8b', cron: '0 14 25 9 *', recurring: false,
-      createdAt: NOW.getTime() - 86400_000 });
-  const slot = new Date(2026, 8, 25, 14, 0, 0);
-  assert.ok(slot.getTime() - grid.getTime() > 0);
-  assert.ok(slot.getTime() - grid.getTime() <= 90_000);
-
-  // 09-25 14:07（非网格）：不抖。
-  const plain = fireOf(
-    { id: 'c1363d8b', cron: '7 14 25 9 *', recurring: false,
-      createdAt: NOW.getTime() - 86400_000 });
-  assert.equal(plain.getTime(), new Date(2026, 8, 25, 14, 7, 0).getTime());
-});
-
-test('nextDelivery yields no fire for an unsatisfiable cron', () => {
+test('displaySlot yields no slot for an unsatisfiable cron', () => {
   // 2 月 30 日：解析成功但任何分钟都不匹配，展示读作「无安排」。
-  const fire = nextDelivery(
-    new Cron('0 0 30 2 *'), { recurring: true }, NOW).fire;
-  assert.equal(fire, null);
+  const slot = displaySlot(new Cron('0 0 30 2 *'), { recurring: true }, NOW);
+  assert.equal(slot, null);
 });
 
 // ---- prevAtOrBefore 与投递尾窗 ----
@@ -473,34 +434,31 @@ test('wanted tail window is bounded by the actual delay, not the 30m cap', () =>
     { id: '058e0149', recurring: true }, at(15, 46)), false);
 });
 
-test('nextDelivery answers the pending tail delivery, not the next slot', () => {
-  // NOW 15:47：落点 15:30 已过、顶格 id 的投递点 16:00 未到——预计触发是
-  // 今天 16:00，而不是明天的落点 + 抖动。落点与预计同刻的任务文件里
-  // list 会画出「15:30 → 16:00」（见 display 测试的落点对齐）。
+test('displaySlot answers the pending tail slot without predicting delivery', () => {
+  // NOW 15:47：落点 15:30 已过、顶格 id 的投递点 16:00 未到，展示仍停留
+  // 在这次任务的设定落点，而不是跳到明天或编造秒级预计时间。
   const task = { id: 'c1363d8b', cron: '30 15 * * *', recurring: true };
-  assert.equal(fireOf(task, NOW).getTime(),
-    new Date(2026, 8, 20, 16, 0, 0).getTime());
-  // 尾窗一过（16:30），回到下一落点 + 抖动：明天 15:30 → 16:00。
+  assert.equal(slotOf(task, NOW).getTime(),
+    new Date(2026, 8, 20, 15, 30, 0).getTime());
   const after = new Date(2026, 8, 20, 16, 30, 0);
-  assert.equal(fireOf(task, after).getTime(),
-    new Date(2026, 8, 21, 16, 0, 0).getTime());
+  assert.equal(slotOf(task, after).getTime(),
+    new Date(2026, 8, 21, 15, 30, 0).getTime());
 });
 
 test('tail window survives multi-year slot gaps (Feb 29)', () => {
   // 2028-02-29 09:15：上一落点在 1461 天前（2024-02-29），任何 366 天窗口
-  // 都找不到它，尾窗会塌缩成零——wanted 仍须答 true、nextDelivery 仍须答
-  // 今天 09:30（顶格 30 分钟）；且下一落点（2032 年）在展示窗口之外，
-  // nextDelivery 不能先死在窗口检查上。
+  // 都找不到它，尾窗会塌缩成零——wanted 仍须答 true、displaySlot 仍须答
+  // 今天 09:00；且下一落点（2032 年）在展示窗口之外，不能先死在窗口检查上。
   const now = new Date(2028, 1, 29, 9, 15, 0);
   const task = { id: 'c1363d8b', cron: '0 9 29 2 *', recurring: true };
   assert.equal(taskWanted(task, now, 0), true);
-  assert.equal(fireOf(task, now).getTime(),
-    new Date(2028, 1, 29, 9, 30, 0).getTime());
+  assert.equal(slotOf(task, now).getTime(),
+    new Date(2028, 1, 29, 9, 0, 0).getTime());
   // 投递一过，回正常的「下一落点」口径：2032-02-29 超出 366 天展示窗
-  // 口，nextDelivery 如实答 null（「一年内无」）——但尾窗判定不受影响，
+  // 口，displaySlot 如实答 null（「一年内无」）——但尾窗判定不受影响，
   // 明年同日再次进入尾窗时仍能保住会话。
   const after = new Date(2028, 1, 29, 10, 0, 0);
-  assert.equal(fireOf(task, after), null);
+  assert.equal(slotOf(task, after), null);
   const nextYear = new Date(2029, 1, 28, 9, 15, 0);
   assert.equal(taskWanted(task, nextYear, 0), false);
 });

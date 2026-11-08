@@ -35,8 +35,6 @@ import {
   sessionAgeZh,
   elapsedZh,
   fmtMDHM,
-  fmtHM,
-  sameMinute,
 } from './display.mjs';
 
 // entry 此刻是否算「正在承接任务」：根进程活着（启动中或已认亲），或用户
@@ -81,22 +79,26 @@ function overviewTasks(cfg, cols, details, state) {
     }
     const liveSids = deps.liveSessionIds(details, ws);
     let bad = 0;
+    let missingId = 0;
     for (const t of tasks) {
+      const key = taskKey(t);
+      if (key === null) {
+        missingId += 1;
+        continue;
+      }
       const v = taskView(t, now, leadMs);
       if (!v.valid) {
         bad += 1;
         continue;
       }
-      // 「最近」按计入抖动后的预计投递时间排，而非 cron 落点。
-      const fire = v.fire ?? v.nxt;
-      if (fire && (!soonest || fire.getTime() < soonest[0].getTime())) {
-        soonest = [fire, ws, v.summary, v.nxt];
+      // 「最近」只按 cron 设定落点排序，不包装成实际投递承诺。
+      if (v.nxt && (!soonest || v.nxt.getTime() < soonest[0].getTime())) {
+        soonest = [v.nxt, ws, v.summary];
       }
       if (!v.wanted) continue;
       // 窗口内任务：创建者会话还开着（任务铁定投进它）或我们的预热已在
       // 承接，都不是异常；否则按 entry 的冷却/失败状态给一条可执行的告
       // 警。
-      const key = taskKey(t);
       const ent = getOwn(state[ws], key);
       if (deps.creatorSessionAlive(t, liveSids) || entryHolds(ent, details, ws)) {
         continue;
@@ -106,7 +108,7 @@ function overviewTasks(cfg, cols, details, state) {
         const eta = cooldownEtaMinutes(ent, cur);
         alerts.push(
           `${ws} 任务 ${key} 即将执行（或错过待补执行），但预热连续失败 `
-          + `${ent.fails ?? '?'} 次正处冷却中，约 ${eta} 分钟后才会重试；`
+          + `${ent.fails ?? '?'} 次正处冷却中，约 ${eta} 分钟后自动重试；`
           + `请运行 ${sessionDebugCommand(ent)} 排查`);
         coolingWarned.add(`${ws}\0${key}`);
       } else if (!workspaceConfig.error) {
@@ -120,18 +122,20 @@ function overviewTasks(cfg, cols, details, state) {
       alerts.push(`${ws} 有 ${bad} 个任务的 cron 无法解析，`
         + `巡检会跳过${bad > 1 ? '它们' : '它'}`);
     }
+    if (missingId > 0) {
+      alerts.push(`${ws} 有 ${missingId} 条任务缺少有效 id，`
+        + '巡检会跳过；请通过 CronCreate 重建');
+    }
   }
 
   deps.print(nTasks > 0
     ? `任务：${nTasks} 个，分布在 ${nWs} 个工作区`
     : '任务：暂无');
   if (soonest) {
-    const [fire, ws, summary, nxt] = soonest;
-    // 预计与设定不在同一分钟时，附注 cron 落点，解释两个时间的差。
-    const setTag = (nxt && !sameMinute(fire, nxt))
-      ? `，设定 ${fmtHM(nxt)}` : '';
-    const line = `最近：${fmtMDHM(fire)}（${humanDelta(fire.getTime() - now.getTime())}`
-      + `${setTag}） ${path.basename(ws)} · ${summary}`;
+    const [slot, ws, summary] = soonest;
+    const delta = slot.getTime() - now.getTime();
+    const timing = delta >= 0 ? humanDelta(delta) : '设定时间已到，等待上游投递';
+    const line = `最近：${fmtMDHM(slot)}（${timing}） ${path.basename(ws)} · ${summary}`;
     deps.print(clip(line, cols));
   }
   return [alerts, coolingWarned, discovered];
@@ -183,7 +187,7 @@ function overviewSessions(cols, state, details, suppressCooling, discovered) {
     if (suppressCooling.has(`${ws}\0${taskId}`)) continue;
     const eta = cooldownEtaMinutes(ent, cur);
     alerts.push(`${ws} 任务 ${taskId} 预热连续失败 ${ent.fails ?? '?'} 次，`
-      + `冷却中，约 ${eta} 分钟后重试`);
+      + `冷却中，约 ${eta} 分钟后自动重试`);
   }
   if (discovered !== null) {
     for (const [ws, taskId, ent] of live) {
@@ -288,6 +292,6 @@ export async function cmdOverview(args) {
     deps.print(`  cron-up ${pad(name, nameW)}  ${desc}`);
   }
   deps.print('');
-  deps.print('模型：工作区 .claude/cron-up.json；顶层 model 为默认，tasks.<任务 id>.model 覆盖');
+  deps.print('模型：工作区 .claude/cron-up.json 的顶层 model，统一用于该工作区新会话');
   deps.print('      只影响之后新启动的预热会话');
 }

@@ -237,7 +237,7 @@ function wantedNow(cron, task, now) {
 // leadMs 前瞻窗口内（含此刻）是否需要会话。leadMs 必须为正的前瞻量；
 // 传 0 时等价 wantedNow（「此刻」没有窗口，网格提前量也不成立），问此
 // 刻口径请直接用 wantedNow。一次性任务在 :00/:30 网格落点最多提前
-// oneShotMaxMs 投递（见 nextDelivery 的 Wsn 复刻）：前瞻窗口的前沿罩到
+// oneShotMaxMs 投递：前瞻窗口的前沿罩到
 // 最早投递时刻，否则约一成相位带在提前量内没有任何巡检点；非网格落点
 // 本不提前，保守同口径只是多等 90 秒，无损。周期任务的抖动在落点之
 // 后，未来子句不前推，尾窗交给 wantedNow。
@@ -276,7 +276,7 @@ export function nextWarmupAfterMs(
 // 两个口径供展示视图复用（同一个已解析 cron 顺带回答巡检问题）。
 export { wantedNow, wantedWithin };
 
-// ---- Claude Code 投递抖动（预计投递时间）----
+// ---- Claude Code 投递抖动（仅用于内部预热窗口）----
 // 复刻 v2.1.285 内部的 M()：任务 id 前 8 位十六进制除以 2^32，得 [0,1) 的
 // 固定哈希——同一任务每次触发的抖动完全相同，不是随机数。id 缺失或前 8
 // 位都不是十六进制时 parseInt 得 NaN，上游回退 0；任务文件由别的程序书
@@ -296,45 +296,15 @@ export function minTaskIdMaxN() {
       / (CC_JITTER.recurringFrac * TAIL_WINDOW_DAYS * MS_DAY) * 2 ** 32);
 }
 
-// 任务在展示语境里的设定落点与预计投递：一次性任务是落点加网格提前量；
-// 周期任务在投递尾窗内属于上一落点（即将到来的这次延迟投递，
-// 不是 nextAfter 给出的下个落点——后者严格在未来，会把展示拐到明天），
-// 否则是下一落点 + 按 id 的抖动。先于窗口检查尾窗：2 月 29 日这类长周期
-// 任务的下一落点可能在展示窗口之外，正在等待的投递却依然成立。taskView
-// 的 nxt/fire 与 wanted 都以这里的落点为单一来源，两边不会各说各话。返回
-// {slot, fire}，均为 Date 或 null（窗口内没有落点时双双为 null）。cron 须
-// 已解析且 satisfiable。
-export function nextDelivery(cron, task, now, withinDays = DISPLAY_SEARCH_DAYS) {
-  if (taskIsOneshot(task)) {
-    const slot = cron.nextAfter(now, withinDays);
-    if (slot === null) return { slot: null, fire: null };
-    // 复刻 Wsn()：只有落点分钟落在 :00/:30 网格上才提前一个按哈希缩放的
-    // 小量（0~90 秒），其余分钟整点不抖；提前量不越过 now。
-    if (slot.getMinutes() % CC_JITTER.oneShotMinuteMod !== 0) {
-      return { slot, fire: slot };
-    }
-    const h = taskIdHash(task?.id);
-    const ahead = CC_JITTER.oneShotFloorMs
-      + h * (CC_JITTER.oneShotMaxMs - CC_JITTER.oneShotFloorMs);
-    return { slot, fire: new Date(Math.max(slot.getTime() - ahead, now.getTime())) };
+// 用户展示只看 cron 设定落点，不展示不可靠的秒级预测。周期任务若正处延迟
+// 投递尾窗，仍显示这次待投递的上一落点，避免把界面跳到下一个周期；一次性
+// 任务直接显示下一落点。cron 须已解析且 satisfiable。
+export function displaySlot(cron, task, now, withinDays = DISPLAY_SEARCH_DAYS) {
+  if (!taskIsOneshot(task)) {
+    const tail = recurringTailWindow(cron, task?.id, now);
+    if (tail !== null) return tail[0];
   }
-
-  const tail = recurringTailWindow(cron, task?.id, now);
-  if (tail !== null) return { slot: tail[0], fire: new Date(tail[1]) };
-
-  const slot = cron.nextAfter(now, withinDays);
-  if (slot === null) return { slot: null, fire: null };
-  // 复刻 bOt()：抖动按「本落点到下一落点」的周期比例缩放并封顶。nextAfter
-  // 语义是严格晚于入参（内部进位一分钟），传 slot 本身即取下一落点；窗口
-  // 边缘取不到时与上游一致：视为无后续，不抖动。
-  return {
-    slot,
-    fire: new Date(slot.getTime() + recurringDelayMs(cron, slot, task?.id, withinDays)),
-  };
-  // 注：上游 bOt 另有一个 cacheLeadMs 分支——仅当相邻落点间隔落在
-  // [300000, 315000)ms（约 5 分钟周期的高频 cron，如 */5）且表达式匹配
-  // 其内部步进正则时，调度时刻提前 15 秒。日/周/月任务周期远大于此，不
-  // 经过该分支，故不予复刻。
+  return cron.nextAfter(now, withinDays);
 }
 
 // 周期任务从某个落点起的投递延迟（ms）：hash(id)·frac·周期，封顶 30 分。
@@ -351,7 +321,7 @@ function recurringDelayMs(cron, slot, taskId, withinDays) {
 
 // 周期任务的「投递尾窗」判定：上一落点已过、按 id 算的延迟投递时刻未
 // 到。返回 [落点, 投递时刻 ms]；不在尾窗、找不到上一或下一落点返回
-// null。wanted（会话需求判定）与 nextDelivery（展示）共用这一口径，两边不会
+// null。wanted（会话需求判定）与 displaySlot（展示落点）共用这一口径，两边不会
 // 各说各话；窗口取 TAIL_WINDOW_DAYS，理由见 constants。
 function recurringTailWindow(cron, taskId, now) {
   const prev = cron.prevAtOrBefore(now, TAIL_WINDOW_DAYS);

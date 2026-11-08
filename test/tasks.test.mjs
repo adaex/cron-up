@@ -2,7 +2,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 
 import {
   readTasks,
@@ -227,12 +226,6 @@ test('minTaskIdMaxN keeps even the longest cron period within the target', () =>
   const delayOf = (n) => n / 2 ** 32 * 0.5 * longestPeriodMs;
   assert.ok(delayOf(maxN) <= 60_000);
   assert.ok(delayOf(maxN + 1) > 60_000);
-
-  const id = maxN.toString(16).padStart(8, '0');
-  for (const cron of ['0 9 * * 1', '0 9 1 * *']) {
-    const v = taskView({ id, cron, recurring: true }, NOW);
-    assert.ok(v.fire.getTime() - v.nxt.getTime() <= 60_000, cron);
-  }
 });
 
 test('parseTaskIdN accepts only strict 8-hex ids', () => {
@@ -298,14 +291,14 @@ test('minifyIds leaves a large id alone when all qualifying ids are occupied', (
   assert.equal(tasks.at(-1).id, 'c1363d8b');
 });
 
-test('minifyIds gives a unique anonymous task a real id', () => {
+test('minifyIds leaves tasks without ids untouched', () => {
   const original = { cron: '0 5 * * *', prompt: 'x', createdAt: 1,
     recurring: true };
   const tasks = [{ ...original }];
   const r = minifyIds(tasks);
-  assert.equal(r.changed, 1);
-  assert.deepEqual(r.idChanges, [{ from: taskKey(original), to: '00000001' }]);
-  assert.equal(tasks[0].id, '00000001');
+  assert.equal(r.changed, 0);
+  assert.deepEqual(r.idChanges, []);
+  assert.equal(tasks[0].id, undefined);
 });
 
 test('minifyIds skips duplicate original keys instead of hiding ambiguity', () => {
@@ -464,16 +457,16 @@ test('reown ignores non-plain task entries', (t) => {
   assert.deepEqual(readJson(file).tasks.slice(0, 3), ['junk', null, 7]);
 });
 
-test('reown skips every entry of a duplicate anonymous task key', (t) => {
+test('maintenance leaves every task without an id untouched', (t) => {
   const { file } = taskDir(t);
-  const a = { cron: '0 5 * * *', prompt: '无 id 重复', createdAt: 1,
-    recurring: true, permanent: true };
+  const a = { cron: '0 5 * * *', prompt: '无 id 任务', createdAt: 1,
+    recurring: true, permanent: false };
   fs.writeFileSync(file, JSON.stringify({ tasks: [a, { ...a }], extra: 7 }));
   const before = fs.readFileSync(file, 'utf-8');
   const r = maintain(file, { reown: new Map([[taskKey(a), WARM_A]]) });
   assert.deepEqual(r, { renewed: 0, minified: 0, reowned: 0, idChanges: [] });
   assert.equal(fs.readFileSync(file, 'utf-8'), before,
-    '同键多条不能一起盖，也不应触发写文件');
+    '无 id 条目不续期、不改号、不盖印，也不触发写文件');
 });
 
 test('renew, minify and reown merge into the same atomic round-trip', (t) => {
@@ -503,18 +496,12 @@ test('taskKey prefers a non-empty string id', () => {
   assert.equal(taskKey({ id: 'c1363d8b' }), 'c1363d8b');
 });
 
-test('taskKey falls back to anon: + 16 hex chars of the signature', () => {
+test('taskKey rejects missing or malformed ids instead of inventing anonymous keys', () => {
   const t = { cron: '0 5 * * *', prompt: 'x', createdAt: 1, recurring: true };
-  const key = taskKey(t);
-  const expectHash = createHash('sha1').update(taskSig(t)).digest('hex')
-    .slice(0, 16);
-  assert.equal(key, `anon:${expectHash}`);
-  assert.match(key, /^anon:[0-9a-f]{16}$/);
-  // 空字符串 id 等同缺失。
-  assert.equal(taskKey({ ...t, id: '' }), key);
-  assert.equal(taskKey({ ...t, id: 5 }), key);
-  assert.equal(taskKey(null), `anon:${createHash('sha1')
-    .update(taskSig(null)).digest('hex').slice(0, 16)}`);
+  assert.equal(taskKey(t), null);
+  assert.equal(taskKey({ ...t, id: '' }), null);
+  assert.equal(taskKey({ ...t, id: 5 }), null);
+  assert.equal(taskKey(null), null);
 });
 
 test('taskSig is stable across id/owner/lastFired/permanent changes', () => {

@@ -4,13 +4,10 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { createHash } from 'node:crypto';
 
 import {
   deps,
   isPlainObject,
-  getOwn,
-  setOwn,
 } from './internals.mjs';
 import { TASK_REL, WORKSPACE_CONFIG_REL } from './paths.mjs';
 import {
@@ -137,23 +134,16 @@ export function readTasks(ws) {
   return doc === null ? null : doc.tasks.filter(isPlainObject);
 }
 
-// 已解析配置的形状校验与文件读取分开：改号路径可以直接校验自己的快照，
-// 不必为了复用规则再读一次文件。此函数不修改 doc，调用方自行决定是否 trim。
+// 工作区配置只保留统一的默认模型。旧 tasks 覆盖不能静默忽略，否则升级后
+// 可能用错模型；明确报错并暂停新启动，删除该字段后恢复。
 function workspaceConfigError(config) {
   if (!isPlainObject(config)) return '顶层应是 JSON 对象';
   if (config.model !== undefined
       && (typeof config.model !== 'string' || !config.model.trim())) {
     return '的 model 应是非空字符串';
   }
-  if (config.tasks !== undefined && !isPlainObject(config.tasks)) {
-    return '的 tasks 应是按任务键索引的对象';
-  }
-  for (const [key, entry] of Object.entries(config.tasks ?? {})) {
-    if (!isPlainObject(entry)) return `的 tasks.${key} 应是 JSON 对象`;
-    if (entry.model !== undefined
-        && (typeof entry.model !== 'string' || !entry.model.trim())) {
-      return `的 tasks.${key}.model 应是非空字符串`;
-    }
+  if (Object.hasOwn(config, 'tasks')) {
+    return '不再支持 tasks.<任务id>.model，请删除 tasks，只保留顶层 model';
   }
   return null;
 }
@@ -168,7 +158,7 @@ export function readWorkspaceConfig(ws) {
   try {
     config = JSON.parse(fs.readFileSync(file, 'utf-8'));
   } catch (e) {
-    if (e.code === 'ENOENT') return { config: { tasks: {} }, error: null };
+    if (e.code === 'ENOENT') return { config: {}, error: null };
     const reason = e instanceof SyntaxError
       ? `不是合法 JSON：${e.message}`
       : `读取失败：${e.message}`;
@@ -177,30 +167,24 @@ export function readWorkspaceConfig(ws) {
   const shapeError = workspaceConfigError(config);
   if (shapeError) return invalid(shapeError);
   if (config.model !== undefined) config.model = config.model.trim();
-  for (const entry of Object.values(config.tasks ?? {})) {
-    if (entry.model !== undefined) entry.model = entry.model.trim();
-  }
   return { config, error: null };
 }
 
-// 任务级覆盖优先于工作区默认；都没有时返回 undefined，启动层因此不传
-// --model。配置无效时同样没有可用模型，但巡检会在到达启动前停下。
-export function configuredModel(workspaceConfig, key) {
-  const cfg = workspaceConfig.config;
-  if (cfg === null) return undefined;
-  return getOwn(cfg.tasks, key)?.model ?? cfg.model;
+// 只返回工作区统一模型；没有配置时返回 undefined，启动层因此不传 --model。
+// 配置无效时同样没有可用模型，但巡检会在到达启动前停下。
+export function configuredModel(workspaceConfig) {
+  return workspaceConfig.config?.model;
 }
 
-// 任务在 state 与盖印映射里的身份键：CronCreate 的任务总有唯一 8 位十六
-// 进制 id，直接用它；手写无 id 任务退化为内容摘要键。
+// 只支持具有非空字符串 id 的任务。缺少有效 id 的条目由调用方展示并跳过，
+// 不再生成匿名内容键或为其启动会话。
 export function taskKey(t) {
-  if (typeof t?.id === 'string' && t.id !== '') return t.id;
-  return `anon:${createHash('sha1').update(taskSig(t)).digest('hex').slice(0, 16)}`;
+  return typeof t?.id === 'string' && t.id !== '' ? t.id : null;
 }
 
 // 任务的稳定内容签名：只含不会被我们与调度器改动的字段。改小 id、盖印改
-// createdBy*、执行改 lastFiredAt、续期加 permanent 都不改变签名；无 id
-// 任务的 taskKey 用它生成内容摘要键。
+// createdBy*、执行改 lastFiredAt、续期加 permanent 都不改变签名，用于认回
+// 任务文件已改号而 state 尚未落盘的崩溃窗口。
 export function taskSig(t) {
   return JSON.stringify([
     t?.cron ?? null,
@@ -218,6 +202,7 @@ export function groupTasksByKey(tasks) {
   for (const t of tasks) {
     if (!isPlainObject(t)) continue;
     const key = taskKey(t);
+    if (key === null) continue;
     const group = groups.get(key) ?? [];
     group.push(t);
     groups.set(key, group);
@@ -295,51 +280,6 @@ export function atomicWriteJson(file, doc, expectedMtimeNs) {
   fs.renameSync(tmp, file);
 }
 
-// 改号前读取任务级模型配置。配置无效时先不改号，避免旧任务键失效后模型覆盖
-// 悄悄脱钩；readWorkspaceConfig 已在巡检里给出对应告警。原始 doc 不做 trim，
-// 只有确实需要新增别名时才会写回。
-function modelConfigForMinify(taskfile) {
-  const ws = path.join(path.dirname(taskfile), '..');
-  const file = path.join(ws, WORKSPACE_CONFIG_REL);
-  let mtimeNs;
-  let text;
-  try {
-    mtimeNs = fs.statSync(file, { bigint: true }).mtimeNs;
-    text = fs.readFileSync(file, 'utf-8');
-  } catch (e) {
-    if (e.code === 'ENOENT') return { file, doc: null, mtimeNs: null };
-    return { invalid: true };
-  }
-  let doc;
-  try {
-    doc = JSON.parse(text);
-  } catch {
-    return { invalid: true };
-  }
-  if (workspaceConfigError(doc)) return { invalid: true };
-  return { file, doc, mtimeNs };
-}
-
-// 任务级模型配置以 id 为键。改号前把旧值复制到新键，同时保留旧键：配置先写、
-// 任务文件后写，即使两步之间退出，任意一边的新旧 ID 都仍能取到模型覆盖。
-// 旧键只是一条兼容别名，不参与任务发现，也不会再分配给其他现存任务。
-function preserveModelAliases(modelConfig, idChanges) {
-  if (!modelConfig.doc) return 0;
-  const tasks = getOwn(modelConfig.doc, 'tasks');
-  if (!isPlainObject(tasks)) return 0;
-  let count = 0;
-  for (const { from, to } of idChanges) {
-    const previous = getOwn(tasks, from);
-    if (!isPlainObject(previous) || getOwn(tasks, to) !== undefined) continue;
-    setOwn(tasks, to, previous);
-    count += 1;
-  }
-  if (count > 0) {
-    atomicWriteJson(modelConfig.file, modelConfig.doc, modelConfig.mtimeNs);
-  }
-  return count;
-}
-
 // 任务归属是否已完全等于盖印目标。巡检预判与实际写入共用同一判据，
 // 避免一层只看 sessionId、另一层比较三字段而逐渐漂移。
 export function taskOwnedBy(t, target) {
@@ -355,16 +295,16 @@ export function parseTaskIdN(id) {
 }
 
 function taskNeedsMinify(t, maxN) {
-  if (!isPlainObject(t) || !t.recurring) return false;
+  if (!isPlainObject(t) || !t.recurring || taskKey(t) === null) return false;
   const n = parseTaskIdN(t.id);
   return n === null || n > maxN;
 }
 
-// 无条件把显式周期任务的大 id 改成未占用的小号，消除上游按 id 计算的投递
-// 偏移。只原地修改 tasks，返回 {changed,idChanges} 供巡检同步 state、pending
-// 与 Herdr 标签；写盘仍由 maintainWorkspace 合并完成。reservedIds 把不在当前
-// 任务文件里的 state 键和模型配置键也排除，避免新任务继承旧会话或旧模型。
-// - 一次性任务和没有 recurring 标志的手写条目不碰；
+// 无条件把具有有效 id 的显式周期任务的大 id 改成未占用的小号，消除上游按
+// id 计算的投递偏移。只原地修改 tasks，返回 {changed,idChanges} 供巡检同步
+// state、pending 与 Herdr 标签；写盘仍由 maintainWorkspace 合并完成。
+// reservedIds 排除不在当前任务文件里的 state 键，避免新任务继承旧会话。
+// - 一次性任务、无有效 id 和没有 recurring 标志的手写条目不碰；
 // - 已达标的小号（含 00000000）原样保留，第二轮起字节级不动；
 // - 空号分配考虑文件内全部任务，包括一次性任务；
 // - 原始任务键重复时无法唯一对应 state 和会话，整组跳过，不靠改号掩盖异常。
@@ -409,9 +349,8 @@ export function minifyIds(tasks, reservedIds = []) {
 // id 改小）与 reown（归属盖给各自预热会话）合并为同一次带 mtime 乐观检测
 // 的原子写。先取 mtimeNs、清残留 .cron-up-tmp、loadTaskDoc round-trip 整
 // 文档；三项都为 0 时字节级不动。返回 {renewed,minified,reowned,idChanges}，
-// 有实际盖印时另附 reownedTasks=[{taskId,target}]，为任务级模型配置补过新键
-// 时另附 modelAliases；null 表示文件缺失/损坏；读到写间被改抛
-// TaskFileChanged。
+// 有实际盖印时另附 reownedTasks=[{taskId,target}]；null 表示文件缺失/损坏；
+// 读到写间被改抛 TaskFileChanged。
 //
 // reown 形状：Map<taskKey, {sessionId, pid, procStart}>，键是调用方读到的
 // 改号前任务键。minify 后先翻译成新键再盖印，返回的 reownedTasks 也使用新键。
@@ -439,7 +378,7 @@ export function maintainWorkspace(
   if (doc === null) return null;
   let renewed = 0;
   for (const t of doc.tasks) {
-    if (!isPlainObject(t)) continue;
+    if (!isPlainObject(t) || taskKey(t) === null) continue;
     // truthy 而非 === true：与 Claude Code 自己的加载器一致
     // （...o.permanent && {permanent:true}），它已认作永久的任何值都算，
     // 不再重写。只有显式周期任务有资格——绝不从 cron 形状推断周期性，
@@ -452,14 +391,9 @@ export function maintainWorkspace(
   const minIdMaxN = minTaskIdMaxN();
   const mayMinify = minify
     && doc.tasks.some((t) => taskNeedsMinify(t, minIdMaxN));
-  const modelConfig = mayMinify
-    ? modelConfigForMinify(taskfile) : { doc: null };
-  const configuredTasks = getOwn(modelConfig.doc, 'tasks');
-  const configuredIds = isPlainObject(configuredTasks)
-    ? Object.keys(configuredTasks) : [];
-  const { changed: minified, idChanges } = !mayMinify || modelConfig.invalid
-    ? { changed: 0, idChanges: [] }
-    : minifyIds(doc.tasks, [...reservedIds, ...configuredIds]);
+  const { changed: minified, idChanges } = mayMinify
+    ? minifyIds(doc.tasks, reservedIds)
+    : { changed: 0, idChanges: [] };
   const renamed = new Map(idChanges.map((c) => [c.from, c.to]));
   const effectiveReown = new Map();
   if (reown instanceof Map) {
@@ -487,12 +421,10 @@ export function maintainWorkspace(
   if (renewed === 0 && minified === 0 && reownedTasks.length === 0) {
     return { renewed: 0, minified: 0, reowned: 0, idChanges: [] };
   }
-  const modelAliases = preserveModelAliases(modelConfig, idChanges);
   atomicWriteJson(taskfile, doc, mtimeNs);
   const result = {
     renewed, minified, reowned: reownedTasks.length, idChanges,
   };
-  if (modelAliases > 0) result.modelAliases = modelAliases;
   if (reownedTasks.length > 0) result.reownedTasks = reownedTasks;
   return result;
 }

@@ -116,10 +116,12 @@ function nameHerdrAnchor(hc, address) {
   }
 }
 
-// 每轮按独立标签检查锚点：任一存活锚点存在就复用，绝不重复启动；确认
-// 缺失后才创建目录并启动普通 zsh。查询失败直接抛出，避免把证据不足当成
-// 缺失。返回 null 表示复用，启动成功返回终端身份；命名失败附带 titleError，
-// 由巡检单独告警。这里不查询或调整 tab 顺序，默认显示名只是尽力效果。
+// 临时命名方案：仅在确实要新建任务会话时由巡检调用，hc 原生支持所需 space
+// 能力后删除。按独立标签检查锚点，任一存活锚点存在就复用，绝不重复启动；
+// 确认缺失后才创建目录并启动普通 zsh。查询失败
+// 直接抛出，避免把证据不足当成缺失。返回 null 表示复用，启动成功返回终端
+// 身份；命名失败附带 titleError，由巡检单独告警。这里不查询或调整 tab
+// 顺序，默认显示名只是尽力效果。
 export function ensureHerdrAnchor(hc, cwd = HERDR_ANCHOR_CWD) {
   const existing = queryHerdrTerminals(hc, `${HERDR_ANCHOR_KEY}=1`)
     .find((t) => t.kind === 'anchor' && deps.alive(t.pid));
@@ -299,6 +301,12 @@ function terminalRecord(address, terminal) {
   const taskId = labels?.['cron-up'];
   if ((!anchor && typeof taskId !== 'string')
       || !Number.isSafeInteger(terminal?.pid) || terminal.pid <= 1) return null;
+  // 当前任务由 Claude --name、锚点由 OSC 0 写 Core 的顶层 title；where 是
+  // 旧版 cron-up 的显示标签。Core 标题优先展示，旧标题同时保留给日志检索：
+  // 旧终端可能已有默认 Core 标题，不能因此让原有 where 查询失效。
+  const legacyTitle = typeof labels?.where === 'string' ? labels.where : '';
+  const title = typeof terminal?.title === 'string' && terminal.title !== ''
+    ? terminal.title : legacyTitle;
   return {
     address,
     cwd: terminal.cwd,
@@ -306,7 +314,8 @@ function terminalRecord(address, terminal) {
     kind: anchor ? 'anchor' : 'task',
     ...(anchor ? {} : { taskId }),
     state: terminal.state,
-    title: labels?.where ?? '',
+    title,
+    ...(legacyTitle && legacyTitle !== title ? { legacyTitle } : {}),
   };
 }
 

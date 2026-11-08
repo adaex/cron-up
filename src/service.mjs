@@ -290,8 +290,8 @@ export function launcherHealth() {
 
 // ---- install / uninstall ----
 
-// roots 三选一：命令行显式值 > 现有配置 > 默认。现有配置损坏不阻断安
-// 装——install 本身就是最自然的修复动作，回退默认并当面说明。
+// roots 三选一：命令行显式值 > 可解读的现有配置 > 仅首次安装可用的默认值。
+// 已有配置损坏时绝不回退默认并扩大任务文件写入范围；必须修复文件或显式 roots。
 function resolveRoots(args) {
   if (args.roots !== undefined) {
     const roots = normalizeRoots(args.roots.split(','));
@@ -301,12 +301,15 @@ function resolveRoots(args) {
     }
     return roots;
   }
-  if (fs.existsSync(deps.paths.configPath)) {
+  // lstat 把悬空符号链接也算作已有配置；existsSync 会把它误当首次安装，
+  // 随后用默认 roots 替换链接并扩大自动写入范围。
+  if (fs.lstatSync(deps.paths.configPath, { throwIfNoEntry: false }) !== undefined) {
     try {
       return loadConfig(deps.paths.configPath).roots;
     } catch (e) {
-      deps.print(`提示：现有配置无法解读（${e.message}），本次按默认扫描目录`
-        + '重写；如需其他范围用 cron-up install --roots 指定');
+      throw new ExitError(2, `现有配置无法解读（${e.message}）。为避免把扫描和`
+        + `自动写入范围扩大到默认目录，本次未修改配置或安装服务；请直接修复 `
+        + `${deps.paths.configPath}，或显式运行 cron-up install --roots <完整目录列表>`);
     }
   }
   return normalizeRoots(DEFAULT_CONFIG.roots);

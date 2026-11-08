@@ -419,27 +419,32 @@ test('Herdr orphan without a process fingerprint is not adopted', (t) => {
   assert.throws(() => findHerdrOrphan('/ws', '00000001'), /启动指纹/);
 });
 
-test('exact Herdr lookup returns only a labelled terminal', (t) => {
+test('exact Herdr lookup prefers Core titles and keeps legacy fallback', (t) => {
   const deps = mockDeps(t);
   deps.execFile = (file, args) => {
     assert.deepEqual(args, ['get', '--json', 't7']);
     return { status: 0, stdout: JSON.stringify({
-      pid: 4242, cwd: '/ws', state: 'finished',
-      labels: { 'cron-up': '00000001', where: 'title' },
+      pid: 4242, cwd: '/ws', state: 'finished', title: '每日 汇总',
+      labels: { 'cron-up': '00000001', where: '旧标题' },
     }) };
   };
   assert.deepEqual(getHerdrTerminal('t7'), {
     address: 't7', pid: 4242, cwd: '/ws', kind: 'task', taskId: '00000001',
-    state: 'finished', title: 'title',
+    state: 'finished', title: '每日 汇总', legacyTitle: '旧标题',
   });
   deps.execFile = () => ({ status: 0, stdout: JSON.stringify({
-    pid: 4243, cwd: '/tmp/cron-tasks', state: 'live',
+    pid: 4243, cwd: '/tmp/cron-tasks', state: 'live', title: 'cron-tasks-anchor',
     labels: { 'cron-up-anchor': '1' },
   }) });
   assert.deepEqual(getHerdrTerminal('ta'), {
     address: 'ta', pid: 4243, cwd: '/tmp/cron-tasks', kind: 'anchor',
-    state: 'live', title: '',
+    state: 'live', title: 'cron-tasks-anchor',
   });
+  deps.execFile = () => ({ status: 0, stdout: JSON.stringify({
+    pid: 4244, cwd: '/ws', state: 'finished',
+    labels: { 'cron-up': '00000001', where: '旧标题' },
+  }) });
+  assert.equal(getHerdrTerminal('legacy')?.title, '旧标题');
   deps.execFile = () => ({ status: 0, stdout: '{"pid":4242,"labels":{}}' });
   assert.equal(getHerdrTerminal('t7'), null);
 });
@@ -470,13 +475,13 @@ test('Herdr terminal listing can include finished history for logs', (t) => {
     }
     assert.deepEqual(args, ['get', '--json', 't7']);
     return { status: 0, stdout: JSON.stringify({
-      pid: 4242, cwd: '/ws', state: 'finished',
-      labels: { 'cron-up': '00000001', where: 'title' },
+      pid: 4242, cwd: '/ws', state: 'finished', title: '每日 汇总',
+      labels: { 'cron-up': '00000001', where: '旧标题' },
     }) };
   };
   assert.deepEqual(listHerdrTerminals(null, true), [{
     address: 't7', pid: 4242, cwd: '/ws', kind: 'task', taskId: '00000001',
-    state: 'finished', title: 'title',
+    state: 'finished', title: '每日 汇总', legacyTitle: '旧标题',
   }]);
 });
 
